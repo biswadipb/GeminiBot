@@ -199,6 +199,52 @@ async def refund(keys):
             log.exception("Could not refund %s", key)
 
 
+power_off = None  # cached on/off switch; None = not loaded from Redis yet
+
+
+async def is_powered_off():
+    global power_off
+    if power_off is None:
+        power_off = False
+        if use_redis:
+            try:
+                power_off = await redis("GET", "bot:power_off") == "1"
+            except Exception:
+                log.exception("Could not read power switch")
+    return power_off
+
+
+async def ignored_while_off(update: Update) -> bool:
+    """While switched off with /off, stay silent for everyone except admins."""
+    return await is_powered_off() and update.effective_user.id not in ADMIN_USERS
+
+
+async def set_power(update: Update, off: bool):
+    global power_off
+    if update.effective_user.id not in ADMIN_USERS:
+        await update.message.reply_text("Only admins can do that.", do_quote=is_group(update))
+        return
+    power_off = off
+    if use_redis:
+        try:
+            await redis("SET", "bot:power_off", "1" if off else "0")
+        except Exception:
+            log.exception("Could not save power switch")
+    log.info("Bot switched %s by %s", "OFF" if off else "ON", update.effective_user.id)
+    await update.message.reply_text(
+        "Switched off. I'll stay quiet until an admin sends /on." if off else "I'm back on! 👋",
+        do_quote=is_group(update),
+    )
+
+
+async def power_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_power(update, off=False)
+
+
+async def power_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_power(update, off=True)
+
+
 def is_allowed(update: Update) -> bool:
     if not ALLOWED_CHATS and not ALLOWED_USERS:
         return True
@@ -333,6 +379,8 @@ async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
     if not is_allowed(update):
         return
     await clear_history(update.effective_chat.id)
@@ -343,6 +391,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = is_group(update)
     if group and not addressed_to_bot(update, context.bot.username):
         return  # ordinary group chatter, not for us
+    if await ignored_while_off(update):
+        return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
@@ -411,6 +461,8 @@ async def web_search(query):
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
@@ -497,6 +549,8 @@ def image_providers():
 
 
 async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
@@ -569,6 +623,8 @@ async def download_photo(url):
 
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
@@ -613,6 +669,8 @@ def main():
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(CommandHandler("photo", photo))
+    app.add_handler(CommandHandler("on", power_on))
+    app.add_handler(CommandHandler("off", power_off_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))

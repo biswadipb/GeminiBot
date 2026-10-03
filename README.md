@@ -73,6 +73,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/photo <search>` – find a real photo on the web (with source link)
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
+- `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
 
