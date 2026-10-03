@@ -43,6 +43,7 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
+MAX_QUOTE = 2000  # max characters taken from a replied-to message
 RETRYABLE = {429, 500, 502, 503, 504}  # rate limited / overloaded / server hiccup
 SKIP_MODEL = {404}  # model not available for this key -> go straight to the next one
 
@@ -179,6 +180,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     text = update.message.text.replace(f"@{context.bot.username}", "").strip()
+    quoted = update.message.reply_to_message
+    if quoted and quoted.from_user.id != context.bot.id:
+        # Bot's own messages are already in history; anyone else's we pass along as context
+        quoted_text = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
+        if quoted_text:
+            text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
     if group:
         # Shared group conversation: tell Gemini who is speaking
         text = f"{update.effective_user.first_name}: {text}"
