@@ -38,8 +38,8 @@ RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
 ALLOWED_CHATS = {int(c) for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 ALLOWED_USERS = {int(u) for u in os.getenv("ALLOWED_USER_IDS", "").split(",") if u.strip()}
 # Optional: Upstash Redis (free) so conversation memory survives restarts. Without it, memory is RAM-only.
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'")  # tolerate pasted quotes
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
