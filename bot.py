@@ -1171,7 +1171,6 @@ async def register_commands(app):
         ("mock", "Reply to a message to mOcK iT"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
         ("stopimitate", "Stop copying"),
-        ("lore", "Group lore (admins: /lore Name: text)"),
         ("usage", "See your daily allowance"),
         ("reset", "Forget the conversation"),
         ("noring", "Never get married off by /ring"),
@@ -1188,11 +1187,10 @@ lore = None  # name -> description; cached copy of the Redis hash "lore"
 
 
 LORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lore.json")
-lore_overrides = {}  # what /lore changed in Redis; "" hides a built-in entry
 
 
 async def load_lore():
-    """Built-in lore from lore.json, with any /lore changes (stored in Redis) layered on top."""
+    """Group lore from lore.json (name -> description); edit that file to change it."""
     global lore
     if lore is None:
         try:
@@ -1203,17 +1201,6 @@ async def load_lore():
         except Exception:
             log.exception("Could not read lore.json")
             lore = {}
-        if use_redis:
-            try:
-                flat = await redis("HGETALL", "lore") or []
-                lore_overrides.update(zip(flat[::2], flat[1::2]))
-            except Exception:
-                log.exception("Could not load lore")
-        for name, text in lore_overrides.items():
-            if text:
-                lore[name] = text
-            else:
-                lore.pop(name, None)
     return lore
 
 
@@ -1273,45 +1260,6 @@ async def unserious(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_serious(update, False)
 
 
-async def lore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/lore lists entries; admins add with "/lore Name: text" and remove with "/lore -Name"."""
-    if await ignored_while_off(update) or not is_allowed(update):
-        return
-    group = is_group(update)
-    entries = await load_lore()
-    arg = update.message.text.split(maxsplit=1)[1].strip() if len(update.message.text.split(maxsplit=1)) > 1 else ""
-    if not arg:
-        listing = "\n".join(f"• <b>{html.escape(n)}</b>: {html.escape(t)}" for n, t in sorted(entries.items()))
-        await update.message.reply_text(listing or "No lore yet. Admins can add some with /lore Name: description",
-                                        parse_mode=ParseMode.HTML, do_quote=group)
-        return
-    if update.effective_user.id not in ADMIN_USERS:
-        await update.message.reply_text("Only admins can change the lore.", do_quote=group)
-        return
-    if arg.startswith("-"):
-        name = arg[1:].strip()
-        match = next((n for n in entries if n.lower() == name.lower()), None)
-        if not match:
-            await update.message.reply_text(f"No lore about {name}.", do_quote=group)
-            return
-        entries.pop(match)
-        if use_redis:
-            await redis("HSET", "lore", match, "")  # "" also hides entries that come from lore.json
-        await update.message.reply_text(f"Forgot the lore about {match}.", do_quote=group)
-        return
-    if ":" not in arg:
-        await update.message.reply_text("Format: /lore Name: description  (or /lore -Name to remove)", do_quote=group)
-        return
-    name, text = (part.strip() for part in arg.split(":", 1))
-    if not name or not text:
-        await update.message.reply_text("Format: /lore Name: description", do_quote=group)
-        return
-    entries[name] = text[:1000]
-    if use_redis:
-        await redis("HSET", "lore", name, entries[name])
-    await update.message.reply_text(f"Noted. I now know about {name}. 🕵️", do_quote=group)
-
-
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(register_commands).build()
     app.add_handler(CommandHandler("start", start))
@@ -1338,7 +1286,6 @@ def main():
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
-    app.add_handler(CommandHandler("lore", lore_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
