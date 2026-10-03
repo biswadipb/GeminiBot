@@ -1,6 +1,7 @@
 """Telegram bot that forwards messages to Google Gemini and replies with the answer."""
 
 import asyncio
+import hashlib
 import logging
 import os
 
@@ -134,7 +135,22 @@ def main():
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
-    app.run_polling()
+
+    # On hosts like Render, Telegram pushes updates to us (webhook), which also wakes a sleeping
+    # free instance. Locally, with no public URL, we poll Telegram instead.
+    public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if public_url:
+        log.info("Webhook mode: %s", public_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8443")),
+            url_path="telegram",
+            webhook_url=f"{public_url.rstrip('/')}/telegram",
+            # Telegram sends this back on every request so strangers can't post fake updates
+            secret_token=hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest(),
+        )
+    else:
+        app.run_polling()
 
 
 if __name__ == "__main__":

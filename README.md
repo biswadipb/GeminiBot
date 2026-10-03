@@ -43,9 +43,27 @@ All settings live in `.env`:
 - `/start`, `/help` – intro
 - `/reset` – forget the conversation
 
-## Hosting 24/7 (free, Oracle Cloud)
+## Hosting for free on Render (no credit card)
 
-On any Ubuntu server (e.g. an Oracle Cloud *Always Free* VM):
+1. Sign up at <https://render.com> with GitHub.
+2. **New → Web Service**, pick this repo.
+3. Settings:
+   - Runtime: **Python**
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `python bot.py`
+   - Instance type: **Free**
+4. Under **Environment**, add `TELEGRAM_BOT_TOKEN` and `GEMINI_API_KEY` (plus any optional settings).
+5. Deploy.
+
+On Render the bot switches to webhook mode automatically (it reads `RENDER_EXTERNAL_URL`), so Telegram
+delivers messages to it. The free instance sleeps after ~15 minutes idle; the next message wakes it,
+so the first reply after a quiet spell can take up to a minute. Conversation memory resets when it sleeps.
+
+To use webhooks on another host, set `WEBHOOK_URL` to the bot's public `https://` address.
+
+## Hosting on your own Linux server
+
+On any Ubuntu server:
 
 ```bash
 git clone https://github.com/biswadipb/GeminiBot.git
