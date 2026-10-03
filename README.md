@@ -12,7 +12,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Reply to anyone's message and mention the bot, and it reads that message too
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
-- `/photo` finds real photos on the web (DuckDuckGo images, Tavily fallback)
+- `/fetch` finds real pictures and GIFs on the web (DuckDuckGo images, Tavily fallback)
 - A wholesome `ship` matchmaking game with opt-out
 - Optional allowlist of groups and/or users
 - Per-person daily/monthly limits, with admin exemption
@@ -59,7 +59,8 @@ All settings live in `.env`:
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
 | `LIMIT_SEARCH_MONTHLY` | no | `100` | `/search` uses per person per month |
 | `LIMIT_IMAGINE_DAILY` | no | `20` | `/imagine` uses per person per day |
-| `LIMIT_PHOTO_DAILY` | no | `20` | `/photo` uses per person per day |
+| `LIMIT_FETCH_DAILY` | no | `20` | `/fetch` and keyword-picture uses per person per day |
+| `LIMIT_CRITICIZE_DAILY` | no | `5` | `/criticize` uses per person per day |
 | `LIMIT_SHIP_DAILY` | no | `10` | `/ship` uses per person per day |
 | `LIMIT_NICK_DAILY` | no | `10` | `/nick` uses per person per day |
 
@@ -73,13 +74,15 @@ If both allowlists are empty, anyone can use the bot.
 - `/reset` – forget the conversation
 - `/search <question>` – answer from a web search, with sources
 - `/imagine <description>` – generate a picture
-- `/photo <search>` – find a real photo on the web (with source link)
+- `/fetch <search>` – a real picture from the web (with source link); add `gif` for an animated GIF, e.g. `/fetch happy dance gif`
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
 - `ship` or `/ship` – pair two people active this week who score well (falls back to anyone seen and the group admins); `/ship @a @b` ships specific people; `/noship` / `/yesship` to opt out / back in
 - `/nick [name]` – fun nickname ideas, incl. portmanteaus (for you, a name/@mention, or reply to someone)
 - `kittypic`, `foodporn`, `carporn` – send just the word for a random cat, food (with a tasty description) or car photo
 - `/lore` – list group lore; admins add with `/lore Name: description` and remove with `/lore -Name`. Lore lives in Upstash (not in the repo) and Laden plays along with it.
+- `/serious` – toggle serious mode for the chat: critical, logical, less agreeable answers with reasoning
+- `/criticize` – a mildly hostile roast of today's behaviour (yours, a replied-to person's, or an @mention's). Uses today's group messages, kept in Upstash for up to 2 days.
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.

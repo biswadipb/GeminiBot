@@ -73,11 +73,12 @@ LIMITS = {  # (kind, period) -> max uses
     ("search", "day"): int(os.getenv("LIMIT_SEARCH_DAILY", "10")),
     ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "100")),
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
-    ("photo", "day"): int(os.getenv("LIMIT_PHOTO_DAILY", "20")),
+    ("photo", "day"): int(os.getenv("LIMIT_FETCH_DAILY", os.getenv("LIMIT_PHOTO_DAILY", "20"))),
     ("ship", "day"): int(os.getenv("LIMIT_SHIP_DAILY", "10")),
     ("nick", "day"): int(os.getenv("LIMIT_NICK_DAILY", "10")),
+    ("criticize", "day"): int(os.getenv("LIMIT_CRITICIZE_DAILY", "5")),
 }
-LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos", "ship": "ships", "nick": "nicknames"}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "fetches", "ship": "ships", "nick": "nicknames", "criticize": "criticisms"}
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
@@ -90,7 +91,18 @@ LORE_INSTRUCTIONS = (
 SYSTEM_PROMPT = (
     f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
     "In group chats, messages are prefixed with the sender's name; never start your own reply with a name label. "
-    "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail."
+    "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail. "
+    "Sprinkle in Islamic exclamations where they genuinely fit the moment, used naturally and respectfully: "
+    "Mashallah (praise or admiration), Inshallah (hopes and future plans), Subhanallah (amazement or wonder), "
+    "Astaghfirullah (something outrageous, shameful or sinful), Alhamdulillah (relief or good news). "
+    "Don't force one into every reply."
+)
+SERIOUS_PROMPT = (
+    "SERIOUS MODE is on. Prioritise accuracy and critical thinking over being agreeable: don't flatter, don't "
+    "simply go along with the user, and challenge weak claims, faulty logic or missing evidence directly. "
+    "Give the logical basis for your conclusions when it matters (premises, evidence, step-by-step reasoning), "
+    "note uncertainty and the strongest counterarguments, and say plainly when something is wrong. "
+    "Minimise jokes and roleplay; keep exclamations rare."
 )
 
 TELEGRAM_LIMIT = 4096
@@ -102,6 +114,7 @@ SEARCH_RESULTS = 5
 ACTIVE_DAYS = 7  # /ship picks from people who spoke in the last week
 SEEN_SAVE_EVERY = 3600  # save a member's "last seen" at most hourly, to keep Redis traffic low
 SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets shipped
+LOG_MAX = 400  # today's messages kept per group for /criticize
 PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
 PHOTO_MAX_BYTES = 15 * 1024 * 1024
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
@@ -326,7 +339,7 @@ def split_message(text, limit=TELEGRAM_LIMIT):
     return chunks
 
 
-async def ask_gemini(history):
+async def ask_gemini(history, chat_id=None):
     """Send the conversation to Gemini, retrying busy models and falling back to others."""
     contents = [types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in history]
     last_error = None
@@ -334,7 +347,7 @@ async def ask_gemini(history):
         for attempt in range(RETRIES_PER_MODEL):
             try:
                 response = await client.aio.models.generate_content(
-                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=await system_prompt())
+                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=await system_prompt(chat_id))
                 )
                 return response.text, model
             except errors.APIError as e:
@@ -356,7 +369,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi! {how} and I'll ask Gemini.\n\n"
         "/search <question> – answer from the web, with sources\n"
         "/imagine <description> – generate a picture\n"
-        "/photo <search> – find a real photo on the web\n"
+        "/fetch <search> – a picture from the web (add \"gif\" for a GIF)\n"
+        "/serious – toggle critical, logical mode\n"
+        "/criticize [@someone] – a roast of today's behaviour\n"
         "ship or /ship [@a @b] – play matchmaker 💘 (/noship to opt out)\n"
         "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
         "kittypic · foodporn · carporn – instant pictures\n"
@@ -443,7 +458,7 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
     """
     history = await load_history(chat_id)
     try:
-        answer, model = await ask_gemini(history + [{"role": "user", "text": gemini_text or text}])
+        answer, model = await ask_gemini(history + [{"role": "user", "text": gemini_text or text}], chat_id)
         answer = answer or "(Gemini returned an empty response.)"
         speaker_name = re.match(r"(\w+): ", text)
         if speaker_name:  # Gemini sometimes echoes the "Name:" prefix group messages carry
@@ -602,9 +617,13 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(image, caption=prompt[:1024], do_quote=group)
 
 
-async def find_web_images(query):
+async def find_web_images(query, gif=False):
     """Return [(image_url, title, page_url)] from DuckDuckGo images, falling back to Tavily."""
     try:
+        if gif:  # DuckDuckGo's GIF filter doesn't work; searching "... gif" and keeping .gif URLs does
+            results = await asyncio.to_thread(lambda: DDGS().images(f"{query} gif", max_results=20, safesearch="moderate"))
+            return [(r["image"], r.get("title", ""), r.get("url", "")) for r in results
+                    if r["image"].lower().split("?")[0].endswith(".gif")][:PHOTO_CANDIDATES]
         results = await asyncio.to_thread(
             lambda: DDGS().images(query, max_results=PHOTO_CANDIDATES, safesearch="moderate")
         )
@@ -615,7 +634,7 @@ async def find_web_images(query):
             return found
     except Exception as e:
         log.warning("DuckDuckGo image search failed: %s", e)
-    if TAVILY_API_KEY:
+    if TAVILY_API_KEY and not gif:
         r = await http.post(
             "https://api.tavily.com/search",
             headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
@@ -626,12 +645,17 @@ async def find_web_images(query):
     return []
 
 
-async def download_photo(url):
-    """Fetch an image and re-encode it as a JPEG Telegram will accept (also proves it's a real image)."""
+async def download_photo(url, gif=False):
+    """Fetch an image and re-encode it as a JPEG Telegram will accept (also proves it's a real image).
+    GIFs are checked and passed through untouched so they stay animated."""
     r = await http.get(url, headers=BROWSER_HEADERS, follow_redirects=True, timeout=20)
     r.raise_for_status()
     if not r.headers.get("content-type", "").startswith("image/") or len(r.content) > PHOTO_MAX_BYTES:
         raise ValueError(f"not a usable image ({r.headers.get('content-type')}, {len(r.content)} bytes)")
+    if gif:
+        if not r.content.startswith((b"GIF87a", b"GIF89a")):
+            raise ValueError("not actually a GIF")
+        return r.content
 
     def to_jpeg(data):
         image = Image.open(io.BytesIO(data))
@@ -643,8 +667,8 @@ async def download_photo(url):
     return await asyncio.to_thread(to_jpeg, r.content)
 
 
-async def send_web_photo(update: Update, context, query, caption_head=None, shuffle=False):
-    """Search the web for `query` and post the first image that downloads. Counts against the photo limit."""
+async def send_web_photo(update: Update, context, query, caption_head=None, shuffle=False, gif=False):
+    """Search the web for `query` and post the first image (or GIF) that downloads. Counts against the fetch limit."""
     group = is_group(update)
     quota, refusal = await use_quota(update.effective_user.id, "photo")
     if refusal:
@@ -652,7 +676,7 @@ async def send_web_photo(update: Update, context, query, caption_head=None, shuf
         return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
     try:
-        candidates = await find_web_images(query)
+        candidates = await find_web_images(query, gif=gif)
     except Exception:
         log.exception("Image search failed")
         candidates = []
@@ -663,34 +687,39 @@ async def send_web_photo(update: Update, context, query, caption_head=None, shuf
 
     for image_url, title, page_url in candidates:
         try:
-            image = await download_photo(image_url)
+            image = await download_photo(image_url, gif=gif)
         except Exception as e:
             log.info("Skipping image %s: %s", image_url[:80], e)
             continue
+        send = update.message.reply_animation if gif else update.message.reply_photo
         head = caption_head if caption_head is not None else html.escape(title[:200])
         source = html.escape(page_url or image_url)
         caption = "\n".join(part for part in (head, f'<a href="{source}">Source</a>') if part)
         try:
-            await update.message.reply_photo(image, caption=caption[:1024], parse_mode=ParseMode.HTML, do_quote=group)
+            await send(image, caption=caption[:1024], parse_mode=ParseMode.HTML, do_quote=group)
         except BadRequest:
-            await update.message.reply_photo(image, caption=f"Source: {page_url or image_url}"[:1024], do_quote=group)
+            await send(image, caption=f"Source: {page_url or image_url}"[:1024], do_quote=group)
         return
 
     await refund(quota)
-    await update.message.reply_text("Couldn't find a usable photo for that, try different words.", do_quote=group)
+    kind = "GIF" if gif else "picture"
+    await update.message.reply_text(f"Couldn't find a usable {kind} for that, try different words.", do_quote=group)
 
 
-async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fetch <query> posts a web picture; include the word "gif" to get an animated GIF instead."""
     if await ignored_while_off(update):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
         return
-    query = " ".join(context.args)
+    words = context.args
+    gif = any(w.lower() in ("gif", "gifs") for w in words)
+    query = " ".join(w for w in words if w.lower() not in ("gif", "gifs"))
     if not query:
-        await update.message.reply_text("Usage: /photo <what to look for>")
+        await update.message.reply_text("Usage: /fetch <what to look for>  (add \"gif\" for a GIF, e.g. /fetch happy dance gif)")
         return
-    await send_web_photo(update, context, query)
+    await send_web_photo(update, context, query, gif=gif, shuffle=gif)
 
 
 # Keyword triggers: a message that is just the word posts a fitting web photo
@@ -737,6 +766,8 @@ async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, chat = update.effective_user, update.effective_chat
     if not user or user.is_bot or not chat or chat.type not in ("group", "supergroup"):
         return
+    if update.message and update.message.text:
+        await log_message(chat.id, user, update.message.text)
     group_members = await load_members(chat.id)
     old = group_members.get(user.id)
     now = int(time.time())
@@ -748,6 +779,88 @@ async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await redis("HSET", f"members:{chat.id}", str(user.id), json.dumps(group_members[user.id]))
         except Exception:
             log.exception("Could not save member activity")
+
+
+chat_logs = {}  # (chat_id, date) -> [{"uid", "name", "text"}]; today's messages, for /criticize
+
+
+def log_key(chat_id):
+    return f"log:{chat_id}:{period_key('day')}"
+
+
+async def log_message(chat_id, user, text):
+    """Keep today's group messages (last LOG_MAX, deleted after 2 days) so /criticize has material."""
+    entry = {"uid": user.id, "name": user.first_name, "text": text[:500]}
+    key = log_key(chat_id)
+    entries = chat_logs.setdefault(key, [])
+    entries.append(entry)
+    del entries[:-LOG_MAX]
+    if use_redis:
+        try:
+            if await redis("RPUSH", key, json.dumps(entry)) == 1:
+                await redis("EXPIRE", key, 2 * 86400)
+            await redis("LTRIM", key, -LOG_MAX, -1)
+        except Exception:
+            log.exception("Could not log message")
+
+
+async def todays_log(chat_id):
+    key = log_key(chat_id)
+    if use_redis:
+        try:
+            return [json.loads(e) for e in await redis("LRANGE", key, 0, -1) or []]
+        except Exception:
+            log.exception("Could not read message log")
+    return chat_logs.get(key, [])
+
+
+async def criticize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A mildly hostile critique of someone's behaviour in the chat today (the sender, a reply target or @mention)."""
+    if await ignored_while_off(update):
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    group = is_group(update)
+    if not group:
+        await update.message.reply_text("I can only judge people's behaviour in a group. Add me to one! 😈")
+        return
+    msg = update.message
+    target_id, target = update.effective_user.id, update.effective_user.first_name
+    if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
+        target_id, target = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
+    elif context.args:
+        mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id))
+        if mentioned:
+            target_id, target = mentioned[0]
+
+    quota, refusal = await use_quota(update.effective_user.id, "criticize")
+    if refusal:
+        await msg.reply_text(refusal, do_quote=True)
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    today = await todays_log(update.effective_chat.id)
+    theirs = [e["text"] for e in today if e["uid"] == target_id or (not isinstance(target_id, int) and e["name"].lower() == str(target).lower())]
+    theirs = [t for t in theirs if not t.startswith("/criticize") and not t.startswith("/criticise")]
+    evidence = "\n".join(f"- {t}" for t in theirs[-40:]) or "(they haven't said anything in the chat today)"
+    prompt = (
+        f"Criticize {target}'s behaviour in this group chat today, with mild hostility: a sharp, sarcastic "
+        "dressing-down like a disappointed, slightly irritated friend. 3-5 sentences. Base it on what they actually "
+        "said today (quote or reference specifics); if they said nothing, mock their lurking. Use an exclamation like "
+        "Astaghfirullah if it fits. Keep it a roast between friends: no slurs, nothing about race, religion, gender, "
+        "body or disability, no threats, nothing genuinely cruel, and don't guess their gender.\n\n"
+        f"Their {len(theirs)} messages today (out of {len(today)} in the chat):\n{evidence}"
+    )
+    try:
+        answer, _ = await ask_gemini([{"role": "user", "text": prompt}])
+    except Exception:
+        log.exception("Criticism failed")
+        answer = None
+    if not answer:
+        await refund(quota)
+        await msg.reply_text("I'm too tired to judge anyone right now. Try again in a minute.", do_quote=True)
+        return
+    await send_formatted(msg, f"😤 **{target}, a word.**\n\n{answer.strip()}", do_quote=True)
 
 
 async def load_members(chat_id):
@@ -946,7 +1059,9 @@ async def register_commands(app):
         ("help", "What I can do"),
         ("search", "Answer from the web, with sources"),
         ("imagine", "Generate a picture"),
-        ("photo", "Find a real photo on the web"),
+        ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
+        ("serious", "Toggle serious mode: critical, logical answers"),
+        ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ship", "Play matchmaker 💘 (or @ two people)"),
         ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
         ("lore", "Group lore (admins: /lore Name: text)"),
@@ -978,12 +1093,51 @@ async def load_lore():
     return lore
 
 
-async def system_prompt():
+async def system_prompt(chat_id=None):
+    prompt = SYSTEM_PROMPT
     entries = await load_lore()
-    if not entries:
-        return SYSTEM_PROMPT
-    facts = "\n".join(f"- {name}: {text}" for name, text in sorted(entries.items()))
-    return f"{SYSTEM_PROMPT}\n\n{LORE_INSTRUCTIONS}\n{facts}"
+    if entries:
+        facts = "\n".join(f"- {name}: {text}" for name, text in sorted(entries.items()))
+        prompt += f"\n\n{LORE_INSTRUCTIONS}\n{facts}"
+    if chat_id is not None and chat_id in await load_serious():
+        prompt += f"\n\n{SERIOUS_PROMPT}"
+    return prompt
+
+
+serious_chats = None  # chat ids with serious mode on; cached copy of the Redis set "serious"
+
+
+async def load_serious():
+    global serious_chats
+    if serious_chats is None:
+        serious_chats = set()
+        if use_redis:
+            try:
+                serious_chats = {int(c) for c in await redis("SMEMBERS", "serious") or []}
+            except Exception:
+                log.exception("Could not load serious mode")
+    return serious_chats
+
+
+async def serious(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/serious toggles critical, logical, less agreeable answers for this chat (/serious on|off also work)."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    chats = await load_serious()
+    chat_id = update.effective_chat.id
+    arg = (context.args[0].lower() if context.args else "")
+    turn_on = arg == "on" if arg in ("on", "off") else chat_id not in chats
+    (chats.add if turn_on else chats.discard)(chat_id)
+    if use_redis:
+        try:
+            await redis("SADD" if turn_on else "SREM", "serious", str(chat_id))
+        except Exception:
+            log.exception("Could not save serious mode")
+    await update.message.reply_text(
+        "🧐 Serious mode ON: expect critical, logical answers with reasoning, and less agreeing. /serious to turn off."
+        if turn_on else "😄 Serious mode OFF: back to the usual Laden.",
+        do_quote=is_group(update),
+    )
 
 
 async def lore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1034,7 +1188,10 @@ def main():
     app.add_handler(CommandHandler("usage", usage))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("imagine", imagine))
-    app.add_handler(CommandHandler("photo", photo))
+    app.add_handler(CommandHandler("fetch", fetch))
+    app.add_handler(CommandHandler("serious", serious))
+    app.add_handler(CommandHandler("criticize", criticize))
+    app.add_handler(CommandHandler("criticise", criticize))
     app.add_handler(CommandHandler("on", power_on))
     app.add_handler(CommandHandler("off", power_off_cmd))
     app.add_handler(CommandHandler("ship", ship))
