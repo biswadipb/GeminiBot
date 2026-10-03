@@ -121,6 +121,8 @@ SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets married
 LOG_MAX = 400  # today's messages kept per group for /criticize
 REACTION_RATE = min(float(os.getenv("REACTION_RATE", "0.25")), 0.3)  # share of group messages Laden reacts to (max 30%)
 REACTION_MODEL = os.getenv("REACTION_MODEL", "gemini-3.5-flash-lite")  # separate free quota from the chat models
+EMOJI_REPLY_RATE = min(float(os.getenv("EMOJI_REPLY_RATE", "0.05")), 0.3)  # share of messages answered with 1-3 emojis
+EMOJI_PALETTE = "😂 🤣 💀 😭 😴 🥱 🤡 💦 🌭 🍆 🍑 🍌 🗿 👀 🙈 🫠 🤨 😏 😳 🔥 💯 🤝 🙏 🫡 😈 🤓 🧐 🥲 😬 🤌 👑 🐐 🧢 🚩 💅 🤯 🥶 🤮 🍿 ☕ 🐸 🦍 🫣".split()
 REACTIONS = "👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 🥴 😍 🐳 🌚 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 😨 🤝 🤗 🫡 💅 🤪 🗿 🆒 🙉 🦄 🙊 😎 🤷 😡".split()
 REACTION_RULES = [  # cheap fallback when the model is unavailable: (pattern, choices)
     (r"\b(lol|lmao|haha+|😂|🤣|rofl|dead)\b", ["🤣", "😁", "🗿"]),
@@ -1152,6 +1154,39 @@ async def pick_reaction(text):
     return random.choice(["👍", "👀", "🔥", "😁", "🗿", "🤔", "💯", "🫡"])
 
 
+def only_emoji(text):
+    """True if text is a short run of emojis (no letters, digits or words)."""
+    text = text.replace(" ", "")
+    return 0 < len(text) <= 16 and not re.search(r"[A-Za-z0-9\u0400-\u04FF\u0900-\u097F]", text)
+
+
+async def emoji_reply_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Answer a random ~5% of group messages with one to three fitting (often cheeky) emojis."""
+    msg, user = update.message, update.effective_user
+    if (not msg or not msg.text or not user or user.is_bot or msg.text.startswith("/") or not is_group(update)
+            or random.random() >= EMOJI_REPLY_RATE):
+        return
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    emojis = ""
+    try:
+        response = await client.aio.models.generate_content(
+            model=REACTION_MODEL,
+            contents=("Reply to this group-chat message with ONE to THREE emojis only, like a cheeky friend would: "
+                      "laughing, sleepy, clown, skull, side-eye, or suggestive food emojis for innuendo, whatever fits best. "
+                      f"Ideas: {' '.join(EMOJI_PALETTE)}. Reply with just the emojis, no words.\n\nMessage: {msg.text[:500]}"),
+        )
+        emojis = (response.text or "").strip()
+    except Exception as e:
+        log.info("Emoji reply model unavailable (%s)", str(e)[:80])
+    if not only_emoji(emojis):
+        emojis = "".join(random.sample(EMOJI_PALETTE, random.randint(1, 3)))
+    try:
+        await msg.reply_text(emojis, do_quote=True)
+    except Exception:
+        log.exception("Could not send emoji reply")
+
+
 async def react_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """React to a random ~25% of group messages (never more than 30%) with a fitting, sometimes funny emoji."""
     msg, user = update.message, update.effective_user
@@ -1369,6 +1404,7 @@ def main():
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, react_randomly), group=2)  # occasional emoji reactions
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_reply_randomly), group=3)  # rarer emoji replies
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
