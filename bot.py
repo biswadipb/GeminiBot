@@ -115,6 +115,8 @@ ACTIVE_DAYS = 7  # /ring picks from people who spoke in the last week
 SEEN_SAVE_EVERY = 3600  # save a member's "last seen" at most hourly, to keep Redis traffic low
 SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets married
 LOG_MAX = 400  # today's messages kept per group for /criticize
+IMITATE_SECONDS = 600  # imitation mode switches itself off after 10 minutes...
+IMITATE_MAX = 30  # ...or this many copied messages, to stay polite and within Telegram's rate limits
 PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
 PHOTO_MAX_BYTES = 15 * 1024 * 1024
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
@@ -374,6 +376,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/criticize [@someone] – a roast of today's behaviour\n"
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
+        "/mock – reply to a message to mOcK iT\n"
+        "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kittypic · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
@@ -1060,6 +1064,80 @@ async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_formatted(msg, f"🏷️ **Nickname ideas for {target}:**\n\n{answer.strip()}", do_quote=group)
 
 
+def mocking_case(text):
+    """i DiD nOt Do ThAt – alternate the case of letters, skipping spaces and punctuation."""
+    out, upper = [], False
+    for ch in text:
+        if ch.isalpha():
+            out.append(ch.upper() if upper else ch.lower())
+            upper = not upper
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+async def mock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply to a message with /mock (or /mock <text>) to get it back in SpOnGeBoB case."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    msg = update.message
+    quoted = msg.reply_to_message
+    text = (quoted.text or quoted.caption) if quoted else " ".join(context.args)
+    if not text:
+        await msg.reply_text("Reply to a message with /mock (or /mock some text) 🧽", do_quote=True)
+        return
+    target = quoted if quoted else msg  # answer under the mocked message itself
+    await target.reply_text(f"{mocking_case(text)} 🧽", do_quote=True)
+
+
+imitating = {}  # chat_id -> {"user": user id or None for everyone, "until": timestamp, "left": messages}
+
+
+async def imitate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/imitate <text> repeats it; /imitate alone copies everyone; as a reply, copies that person only."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    msg, chat_id = update.message, update.effective_chat.id
+    if context.args and not msg.reply_to_message:
+        await context.bot.send_message(chat_id, " ".join(msg.text.split()[1:]))
+        return
+    quoted = msg.reply_to_message
+    who = quoted.from_user if quoted and quoted.from_user and not quoted.from_user.is_bot else None
+    imitating[chat_id] = {"user": who.id if who else None, "until": time.time() + IMITATE_SECONDS, "left": IMITATE_MAX}
+    whom = who.first_name if who else "everyone"
+    await msg.reply_text(f"🦜 Copying {whom} for the next {IMITATE_SECONDS // 60} minutes. /stopimitate to make me stop.",
+                         do_quote=is_group(update))
+
+
+async def stop_imitate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    if imitating.pop(update.effective_chat.id, None):
+        await update.message.reply_text("🦜 Fine, I'll stop copying.", do_quote=is_group(update))
+    else:
+        await update.message.reply_text("I wasn't copying anyone.", do_quote=is_group(update))
+
+
+async def imitate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """While imitation mode is on, repeat the target's messages word for word."""
+    msg, user = update.message, update.effective_user
+    state = imitating.get(update.effective_chat.id) if msg else None
+    if not state or not user or user.is_bot or (msg.text or "").startswith("/"):
+        return
+    if time.time() > state["until"] or state["left"] <= 0:
+        imitating.pop(update.effective_chat.id, None)
+        return
+    if state["user"] is not None and user.id != state["user"]:
+        return
+    if await ignored_while_off(update):
+        return
+    state["left"] -= 1
+    try:
+        await msg.copy(update.effective_chat.id)  # copies text, stickers, photos... exactly
+    except Exception:
+        log.exception("Could not imitate message")
+
+
 async def register_commands(app):
     """Show Laden's commands in Telegram's "/" menu."""
     commands = [
@@ -1072,6 +1150,9 @@ async def register_commands(app):
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
+        ("mock", "Reply to a message to mOcK iT"),
+        ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
+        ("stopimitate", "Stop copying"),
         ("lore", "Group lore (admins: /lore Name: text)"),
         ("usage", "See your daily allowance"),
         ("reset", "Forget the conversation"),
@@ -1215,6 +1296,10 @@ def main():
     app.add_handler(CommandHandler("ring", ring))
     app.add_handler(CommandHandler("noring", noring))
     app.add_handler(CommandHandler("nick", nick))
+    app.add_handler(CommandHandler("mock", mock))
+    app.add_handler(CommandHandler("imitate", imitate))
+    app.add_handler(CommandHandler("stopimitate", stop_imitate))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
