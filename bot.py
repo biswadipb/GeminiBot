@@ -671,7 +671,7 @@ async def download_photo(url, gif=False):
     return await asyncio.to_thread(to_jpeg, r.content)
 
 
-async def send_web_photo(update: Update, context, query, caption_head=None, shuffle=False, gif=False):
+async def send_web_photo(update: Update, context, query, caption_head=None, shuffle=False, gif=False, candidates=None):
     """Search the web for `query` and post the first image (or GIF) that downloads. Counts against the fetch limit."""
     group = is_group(update)
     quota, refusal = await use_quota(update.effective_user.id, "photo")
@@ -679,11 +679,12 @@ async def send_web_photo(update: Update, context, query, caption_head=None, shuf
         await update.message.reply_text(refusal, do_quote=group)
         return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
-    try:
-        candidates = await find_web_images(query, gif=gif)
-    except Exception:
-        log.exception("Image search failed")
-        candidates = []
+    if candidates is None:
+        try:
+            candidates = await find_web_images(query, gif=gif)
+        except Exception:
+            log.exception("Image search failed")
+            candidates = []
     if shuffle:  # variety for repeat triggers like "kittypic"; keep small thumbnails as the last resort
         full, thumbs = candidates[:PHOTO_CANDIDATES], candidates[PHOTO_CANDIDATES:]
         random.shuffle(full)
@@ -737,6 +738,23 @@ KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "c
 KEYWORD_PATTERN = r"(?i)^\s*(kittypic|foodporn|carporn)\s*[!.]*\s*$"
 
 
+async def cat_photos():
+    """Guaranteed cats: TheCatAPI, then cataas.com, then web search as a last resort."""
+    found = []
+    try:
+        r = await http.get("https://api.thecatapi.com/v1/images/search", params={"limit": 3, "mime_types": "jpg,png"}, timeout=15)
+        r.raise_for_status()
+        found += [(c["url"], "", "https://thecatapi.com") for c in r.json()]
+    except Exception as e:
+        log.warning("TheCatAPI failed: %s", e)
+    found.append((f"https://cataas.com/cat?t={random.randint(0, 10**9)}", "", "https://cataas.com"))
+    try:
+        found += (await find_web_images(random.choice(KITTY_QUERIES)))[:3]
+    except Exception:
+        pass
+    return found
+
+
 async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await ignored_while_off(update):
         return
@@ -744,7 +762,7 @@ async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # stay quiet for one-word triggers outside allowed chats
     keyword = context.matches[0].group(1).lower()
     if keyword == "kittypic":
-        await send_web_photo(update, context, random.choice(KITTY_QUERIES), caption_head="🐱", shuffle=True)
+        await send_web_photo(update, context, "", caption_head="🐱", candidates=await cat_photos())
     elif keyword == "carporn":
         car = random.choice(CARS)
         await send_web_photo(update, context, f"{car} car photo", caption_head=f"🏎️ <b>{car}</b>", shuffle=True)
@@ -1169,16 +1187,33 @@ async def register_commands(app):
 lore = None  # name -> description; cached copy of the Redis hash "lore"
 
 
+LORE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lore.json")
+lore_overrides = {}  # what /lore changed in Redis; "" hides a built-in entry
+
+
 async def load_lore():
+    """Built-in lore from lore.json, with any /lore changes (stored in Redis) layered on top."""
     global lore
     if lore is None:
-        lore = {}
+        try:
+            with open(LORE_FILE) as f:
+                lore = json.load(f)
+        except FileNotFoundError:
+            lore = {}
+        except Exception:
+            log.exception("Could not read lore.json")
+            lore = {}
         if use_redis:
             try:
                 flat = await redis("HGETALL", "lore") or []
-                lore = dict(zip(flat[::2], flat[1::2]))
+                lore_overrides.update(zip(flat[::2], flat[1::2]))
             except Exception:
                 log.exception("Could not load lore")
+        for name, text in lore_overrides.items():
+            if text:
+                lore[name] = text
+            else:
+                lore.pop(name, None)
     return lore
 
 
@@ -1261,7 +1296,7 @@ async def lore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         entries.pop(match)
         if use_redis:
-            await redis("HDEL", "lore", match)
+            await redis("HSET", "lore", match, "")  # "" also hides entries that come from lore.json
         await update.message.reply_text(f"Forgot the lore about {match}.", do_quote=group)
         return
     if ":" not in arg:
