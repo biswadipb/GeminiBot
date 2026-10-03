@@ -1167,7 +1167,9 @@ MIXED_EMOJI_SHARE = 0.15  # most emoji replies repeat one emoji; only sometimes 
 def repeat_count(emoji):
     """Laughs come in bursts (sometimes long ones); anything else appears once or a few times."""
     if emoji in LAUGHS:
-        return random.choices([random.randint(2, 3), random.randint(4, 8), random.randint(9, 15)], weights=[50, 35, 15])[0]
+        # usually 2-3, sometimes 4-5, rarely a long burst of 6-7 or 8+
+        return random.choices([random.randint(2, 3), random.randint(4, 5), random.randint(6, 7), random.randint(8, 15)],
+                              weights=[62, 28, 6, 4])[0]
     return random.choices([1, random.randint(2, 3)], weights=[60, 40])[0]
 
 
