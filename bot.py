@@ -45,6 +45,10 @@ UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'")  # to
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'")
 # Optional: Tavily key for /search (free at tavily.com). Without it, /search uses DuckDuckGo.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip().strip("\"'")
+# Optional: Pollinations secret key (sk_...) from enter.pollinations.ai for /imagine. Without it, the
+# anonymous endpoint is used (watermarked, stricter rate limits).
+POLLINATIONS_KEY = os.getenv("POLLINATIONS_KEY", "").strip().strip("\"'")
+POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "black-forest-labs/flux.1-schnell")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
@@ -293,11 +297,19 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = is_group(update)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
     try:
-        # Pollinations.ai: free, no key. A random seed gives a new picture for repeated prompts.
-        r = await http.get(
-            f"https://image.pollinations.ai/prompt/{quote(prompt)}",
-            params={"width": 1024, "height": 1024, "nologo": "true", "seed": int.from_bytes(os.urandom(3))},
-        )
+        # A random seed gives a new picture each time, even for a repeated prompt
+        params = {"width": 1024, "height": 1024, "seed": int.from_bytes(os.urandom(3))}
+        if POLLINATIONS_KEY:
+            r = await http.get(
+                f"https://gen.pollinations.ai/image/{quote(prompt)}",
+                params={**params, "model": POLLINATIONS_MODEL},
+                headers={"Authorization": f"Bearer {POLLINATIONS_KEY}"},
+            )
+        else:
+            r = await http.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}", params={**params, "nologo": "true"})
+        if r.status_code == 402:
+            await update.message.reply_text("Image credits are used up for now (Pollinations budget).", do_quote=group)
+            return
         r.raise_for_status()
         if not r.headers.get("content-type", "").startswith("image/"):
             raise ValueError(f"unexpected response type {r.headers.get('content-type')}")
@@ -318,6 +330,7 @@ def main():
     app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
+    log.info("Images: %s", f"Pollinations key ({POLLINATIONS_MODEL})" if POLLINATIONS_KEY else "Pollinations anonymous")
     log.info("Search: %s", "Tavily" if TAVILY_API_KEY else "DuckDuckGo")
     log.info("Memory: %s", "Upstash Redis (persistent)" if use_redis else "in RAM (lost on restart)")
 

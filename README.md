@@ -45,6 +45,8 @@ All settings live in `.env`:
 | `UPSTASH_REDIS_REST_URL` | no | – | Upstash Redis REST URL, for memory that survives restarts |
 | `UPSTASH_REDIS_REST_TOKEN` | no | – | Upstash Redis REST token |
 | `TAVILY_API_KEY` | no | – | Tavily key for better `/search` results; without it DuckDuckGo is used |
+| `POLLINATIONS_KEY` | no | – | Pollinations secret key (`sk_…`) for `/imagine`; without it the anonymous, watermarked endpoint is used |
+| `POLLINATIONS_MODEL` | no | `black-forest-labs/flux.1-schnell` | Image model used with a Pollinations key |
 
 If both allowlists are empty, anyone can use the bot.
 
