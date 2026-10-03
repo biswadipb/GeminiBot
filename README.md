@@ -8,7 +8,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Remembers the conversation per chat (`/reset` to clear it)
 - Retries when Gemini is busy, then falls back to backup models — context carries over
 - Splits long answers to fit Telegram's 4096-character limit
-- Works in groups: answers when @mentioned or replied to
+- Works in groups: answers when called by name ("Laden, ..."), @mentioned, or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
@@ -51,6 +51,7 @@ All settings live in `.env`:
 | `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
+| `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word) |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
 | `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
@@ -70,7 +71,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
 
-In groups, mention the bot (`@YourBot question`) or reply to one of its messages.
+In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
 
 ## Hosting for free on Render (no credit card)
 

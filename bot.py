@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import re
 from urllib.parse import quote
 
 import httpx
@@ -68,6 +69,14 @@ LIMITS = {  # (kind, period) -> max uses
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
 }
 LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures"}
+
+# Names the bot answers to in groups (whole word, any case), besides @mentions and replies
+BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
+NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, BOT_NAMES)) + r")\b", re.IGNORECASE) if BOT_NAMES else None
+SYSTEM_PROMPT = (
+    f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
+    "In group chats, messages are prefixed with the sender's name. Keep answers concise unless asked for detail."
+)
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
@@ -194,11 +203,13 @@ def is_group(update: Update) -> bool:
 
 
 def addressed_to_bot(update: Update, bot_username: str) -> bool:
-    """In groups, only respond when @mentioned or when someone replies to the bot."""
+    """In groups, only respond when @mentioned, called by name (e.g. "Laden, ..."), or replied to."""
     msg = update.message
     if msg.reply_to_message and msg.reply_to_message.from_user.username == bot_username:
         return True
-    return f"@{bot_username}".lower() in msg.text.lower()
+    if f"@{bot_username}".lower() in msg.text.lower():
+        return True
+    return bool(NAME_PATTERN and NAME_PATTERN.search(msg.text))
 
 
 def split_message(text, limit=TELEGRAM_LIMIT):
@@ -222,7 +233,9 @@ async def ask_gemini(history):
     for model in [GEMINI_MODEL, *FALLBACK_MODELS]:
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                response = await client.aio.models.generate_content(model=model, contents=contents)
+                response = await client.aio.models.generate_content(
+                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+                )
                 return response.text, model
             except errors.APIError as e:
                 last_error = e
@@ -238,7 +251,7 @@ async def ask_gemini(history):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    how = f"Mention me (@{context.bot.username}) or reply to one of my messages" if is_group(update) else "Send me any message"
+    how = f"Say my name ({BOT_NAMES[0] if BOT_NAMES else '@' + context.bot.username}), mention me, or reply to one of my messages" if is_group(update) else "Send me any message"
     await update.message.reply_text(
         f"Hi! {how} and I'll ask Gemini.\n\n"
         "/search <question> – answer from the web, with sources\n"
