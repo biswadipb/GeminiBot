@@ -43,6 +43,24 @@ All settings live in `.env`:
 - `/start`, `/help` – intro
 - `/reset` – forget the conversation
 
+## Hosting 24/7 (free, Oracle Cloud)
+
+On any Ubuntu server (e.g. an Oracle Cloud *Always Free* VM):
+
+```bash
+git clone https://github.com/biswadipb/GeminiBot.git
+cd GeminiBot
+bash deploy/install.sh      # first run creates .env
+nano .env                   # add your token and key
+bash deploy/install.sh      # installs and starts the service
+```
+
+The bot then starts on boot and restarts automatically if it crashes.
+
+- Logs: `journalctl -u geminibot -f`
+- Restart: `sudo systemctl restart geminibot`
+- Update: `git pull && sudo systemctl restart geminibot`
+
 ## Notes
 
 - Conversation history is kept in memory and is lost on restart.
