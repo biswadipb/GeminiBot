@@ -75,8 +75,9 @@ LIMITS = {  # (kind, period) -> max uses
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
     ("photo", "day"): int(os.getenv("LIMIT_PHOTO_DAILY", "20")),
     ("ship", "day"): int(os.getenv("LIMIT_SHIP_DAILY", "10")),
+    ("nick", "day"): int(os.getenv("LIMIT_NICK_DAILY", "10")),
 }
-LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos", "ship": "ships"}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos", "ship": "ships", "nick": "nicknames"}
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
@@ -351,6 +352,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/imagine <description> – generate a picture\n"
         "/photo <search> – find a real photo on the web\n"
         "ship or /ship [@a @b] – play matchmaker 💘 (/noship to opt out)\n"
+        "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -732,6 +734,21 @@ async def yesship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_noship(update, False)
 
 
+async def ship_pool(chat_id, group_members, context):
+    """People to ship at random: active this week; else anyone ever seen here plus the group's admins."""
+    cutoff = time.time() - ACTIVE_DAYS * 86400
+    pool = {uid: m["name"] for uid, m in group_members.items() if m["seen"] >= cutoff}
+    if len(pool) < 2:
+        pool = {uid: m["name"] for uid, m in group_members.items()}
+        try:
+            for admin in await context.bot.get_chat_administrators(chat_id):
+                if not admin.user.is_bot:
+                    pool.setdefault(admin.user.id, admin.user.first_name)
+        except Exception:
+            log.exception("Could not list group admins")
+    return [(uid, name) for uid, name in pool.items() if not await opted_out(uid)]
+
+
 def ship_score(a, b):
     """Stable 0-100 compatibility for a pair, so re-rolling the same couple can't change it."""
     key = "|".join(sorted([str(a).lower(), str(b).lower()]))
@@ -787,13 +804,11 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"{name} has opted out of shipping 🚫💘", do_quote=True)
                 return
     else:
-        cutoff = time.time() - ACTIVE_DAYS * 86400
-        pool = [(uid, m["name"]) for uid, m in group_members.items() if m["seen"] >= cutoff]
-        pool = [p for p in pool if not await opted_out(p[0])]
+        pool = await ship_pool(update.effective_chat.id, group_members, context)
         if len(pool) < 2:
             await update.message.reply_text(
-                "I don't know enough active people here yet – I need at least two who've chatted this week "
-                "(and haven't used /noship).",
+                "I don't know enough people here yet – once a couple more people chat, I can ship them! "
+                "(Or try /ship @someone @someone_else)",
                 do_quote=True,
             )
             return
@@ -810,9 +825,10 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         line, _ = await ask_gemini([{"role": "user", "text": (
             f"Write ONE short, funny, wholesome line (max 25 words) for a group-chat 'ship' game about why "
-            f"{a} and {b} would be a {score}% match. Playful and kind; nothing sexual, nothing mean, no hashtags."
+            f"{a} and {b} would be a {score}% match. Playful and kind; nothing sexual, nothing mean, no hashtags. Don't guess anyone's gender: use their "
+            "names or they/them. Reply with only the line itself."
         )}])
-        line = (line or "").strip()
+        line = re.sub(r"^\s*\w+:\s*", "", (line or "").strip())  # drop a stray "Name:" prefix
     except Exception:
         log.exception("Ship line failed")
         line = ""
@@ -826,8 +842,68 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, do_quote=True)
 
 
+async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Suggest fun nicknames for someone (or the sender), including portmanteaus of their name."""
+    if await ignored_while_off(update):
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    group = is_group(update)
+    msg = update.message
+    target = None
+    if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
+        target = msg.reply_to_message.from_user.first_name  # /nick as a reply -> nickname that person
+    if not target and context.args:
+        mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id)) if group else []
+        target = mentioned[0][1] if mentioned else " ".join(context.args)
+    target = target or update.effective_user.first_name
+
+    quota, refusal = await use_quota(update.effective_user.id, "nick")
+    if refusal:
+        await msg.reply_text(refusal, do_quote=group)
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    try:
+        answer, _ = await ask_gemini([{"role": "user", "text": (
+            f"Suggest 5 fun nicknames for {target} in a friendly group chat. Mix styles: one-word, two or three "
+            f"words, and at least two portmanteaus that blend '{target}' with another word. Playful and kind, "
+            "never insulting or sexual. Don't guess their gender: use their name or they/them. Format: a numbered list, each nickname in bold followed by a short reason "
+            "(max 10 words). No intro or outro."
+        )}])
+    except Exception:
+        log.exception("Nickname generation failed")
+        answer = None
+    if not answer:
+        await refund(quota)
+        await msg.reply_text("My nickname generator is napping, try again in a minute.", do_quote=group)
+        return
+    await send_formatted(msg, f"🏷️ **Nickname ideas for {target}:**\n\n{answer.strip()}", do_quote=group)
+
+
+async def register_commands(app):
+    """Show Laden's commands in Telegram's "/" menu."""
+    commands = [
+        ("help", "What I can do"),
+        ("search", "Answer from the web, with sources"),
+        ("imagine", "Generate a picture"),
+        ("photo", "Find a real photo on the web"),
+        ("ship", "Play matchmaker 💘 (or @ two people)"),
+        ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
+        ("usage", "See your daily allowance"),
+        ("reset", "Forget the conversation"),
+        ("noship", "Never get shipped"),
+        ("yesship", "Join the shipping pool again"),
+        ("chatid", "Show chat and user IDs"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception:
+        log.exception("Could not register the command menu")
+
+
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(register_commands).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
@@ -840,6 +916,7 @@ def main():
     app.add_handler(CommandHandler("off", power_off_cmd))
     app.add_handler(CommandHandler("ship", ship))
     app.add_handler(CommandHandler("noship", noship))
+    app.add_handler(CommandHandler("nick", nick))
     app.add_handler(CommandHandler("yesship", yesship))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ship\s*[!.]*\s*$"), ship))  # plain "ship"
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

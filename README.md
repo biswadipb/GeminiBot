@@ -61,6 +61,7 @@ All settings live in `.env`:
 | `LIMIT_IMAGINE_DAILY` | no | `20` | `/imagine` uses per person per day |
 | `LIMIT_PHOTO_DAILY` | no | `20` | `/photo` uses per person per day |
 | `LIMIT_SHIP_DAILY` | no | `10` | `/ship` uses per person per day |
+| `LIMIT_NICK_DAILY` | no | `10` | `/nick` uses per person per day |
 
 Limits reset at midnight UTC (daily) and on the 1st (monthly). Counters live in Upstash when configured, otherwise in RAM. Failed requests don't count.
 
@@ -75,7 +76,8 @@ If both allowlists are empty, anyone can use the bot.
 - `/photo <search>` – find a real photo on the web (with source link)
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
-- `ship` or `/ship` – pair two people active this week who score well; `/ship @a @b` ships specific people; `/noship` / `/yesship` to opt out / back in
+- `ship` or `/ship` – pair two people active this week who score well (falls back to anyone seen and the group admins); `/ship @a @b` ships specific people; `/noship` / `/yesship` to opt out / back in
+- `/nick [name]` – fun nickname ideas, incl. portmanteaus (for you, a name/@mention, or reply to someone)
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
