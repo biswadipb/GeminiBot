@@ -396,7 +396,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/mock – reply to a message to mOcK iT\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
-        "kittypic · foodporn · carporn – instant pictures\n"
+        "kitty · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -703,7 +703,7 @@ async def send_web_photo(update: Update, context, query, caption_head=None, shuf
         except Exception:
             log.exception("Image search failed")
             candidates = []
-    if shuffle:  # variety for repeat triggers like "kittypic"; keep small thumbnails as the last resort
+    if shuffle:  # variety for repeat triggers like "kitty"; keep small thumbnails as the last resort
         full, thumbs = candidates[:PHOTO_CANDIDATES], candidates[PHOTO_CANDIDATES:]
         random.shuffle(full)
         candidates = full + thumbs
@@ -753,10 +753,10 @@ CARS = ["Porsche 911", "Lamborghini Huracan", "Ferrari SF90", "Nissan GT-R", "BM
         "Toyota Supra", "McLaren 720S", "Audi R8", "Mercedes-AMG GT", "Bugatti Chiron", "Aston Martin DB11",
         "Chevrolet Corvette", "Koenigsegg Jesko", "Mazda RX-7", "Rolls-Royce Phantom"]
 KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "cat close up portrait", "tabby kitten"]
-KEYWORD_PATTERN = r"(?i)^\s*(kittypic|foodporn|carporn)\s*[!.]*\s*$"
+KEYWORD_PATTERN = r"(?i)^\s*(kitty|foodporn|carporn)\s*[!.]*\s*$"
 
 
-recent_memes = []  # recently posted meme URLs, so kittypic doesn't repeat itself
+recent_memes = []  # recently posted meme URLs, so kitty doesn't repeat itself
 
 
 async def cat_photos():
@@ -796,7 +796,7 @@ async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return  # stay quiet for one-word triggers outside allowed chats
     keyword = context.matches[0].group(1).lower()
-    if keyword == "kittypic":
+    if keyword == "kitty":
         await send_web_photo(update, context, "", candidates=await cat_photos())  # caption = 🐱 or meme title
     elif keyword == "carporn":
         car = random.choice(CARS)
@@ -1433,7 +1433,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_reply_randomly), group=3)  # rarer emoji replies
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
-    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
+    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
