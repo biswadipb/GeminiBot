@@ -11,7 +11,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Works in groups: answers when @mentioned or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
-- `/imagine` generates pictures (free, via Pollinations.ai, with optional Cloudflare and Hugging Face fallbacks)
+- `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
 - Optional allowlist of groups and/or users
 
 ## Setup
@@ -47,9 +47,9 @@ All settings live in `.env`:
 | `TAVILY_API_KEY` | no | – | Tavily key for better `/search` results; without it DuckDuckGo is used |
 | `POLLINATIONS_KEY` | no | – | Pollinations secret key (`sk_…`) for `/imagine`; without it the anonymous, watermarked endpoint is used |
 | `POLLINATIONS_MODEL` | no | `black-forest-labs/flux.1-schnell` | Image model used with a Pollinations key |
-| `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID, for the first `/imagine` fallback |
+| `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
-| `HF_TOKEN` | no | – | Hugging Face access token, for the second `/imagine` fallback |
+| `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
 
 If both allowlists are empty, anyone can use the bot.
 
