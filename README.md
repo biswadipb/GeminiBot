@@ -12,6 +12,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Reply to anyone's message and mention the bot, and it reads that message too
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
+- `/photo` finds real photos on the web (DuckDuckGo images, Tavily fallback)
 - Optional allowlist of groups and/or users
 - Per-person daily/monthly limits, with admin exemption
 
@@ -57,6 +58,7 @@ All settings live in `.env`:
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
 | `LIMIT_SEARCH_MONTHLY` | no | `100` | `/search` uses per person per month |
 | `LIMIT_IMAGINE_DAILY` | no | `20` | `/imagine` uses per person per day |
+| `LIMIT_PHOTO_DAILY` | no | `20` | `/photo` uses per person per day |
 
 Limits reset at midnight UTC (daily) and on the 1st (monthly). Counters live in Upstash when configured, otherwise in RAM. Failed requests don't count.
 
@@ -68,6 +70,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/reset` – forget the conversation
 - `/search <question>` – answer from a web search, with sources
 - `/imagine <description>` – generate a picture
+- `/photo <search>` – find a real photo on the web (with source link)
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
 

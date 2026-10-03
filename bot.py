@@ -17,6 +17,7 @@ from ddgs import DDGS
 from dotenv import load_dotenv
 from google import genai
 from huggingface_hub import AsyncInferenceClient
+from PIL import Image
 from google.genai import errors, types
 from telegram import LinkPreviewOptions, Update
 from telegram.constants import ChatAction, ParseMode
@@ -69,8 +70,9 @@ LIMITS = {  # (kind, period) -> max uses
     ("search", "day"): int(os.getenv("LIMIT_SEARCH_DAILY", "10")),
     ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "100")),
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
+    ("photo", "day"): int(os.getenv("LIMIT_PHOTO_DAILY", "20")),
 }
-LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures"}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos"}
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
@@ -86,6 +88,9 @@ MAX_QUOTE = 2000  # max characters taken from a replied-to message
 RETRYABLE = {429, 500, 502, 503, 504}  # rate limited / overloaded / server hiccup
 SKIP_MODEL = {404}  # model not available for this key -> go straight to the next one
 SEARCH_RESULTS = 5
+PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
+PHOTO_MAX_BYTES = 15 * 1024 * 1024
+BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)  # keep search answers from showing a big link card
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -291,6 +296,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi! {how} and I'll ask Gemini.\n\n"
         "/search <question> – answer from the web, with sources\n"
         "/imagine <description> – generate a picture\n"
+        "/photo <search> – find a real photo on the web\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -521,6 +527,82 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(image, caption=prompt[:1024], do_quote=group)
 
 
+async def find_web_images(query):
+    """Return [(image_url, title, page_url)] from DuckDuckGo images, falling back to Tavily."""
+    try:
+        results = await asyncio.to_thread(
+            lambda: DDGS().images(query, max_results=PHOTO_CANDIDATES, safesearch="moderate")
+        )
+        # Full-size images first; Bing thumbnails (small but reliable) as a last resort
+        found = [(r["image"], r.get("title", ""), r.get("url", "")) for r in results]
+        found += [(r["thumbnail"], r.get("title", ""), r.get("url", "")) for r in results if r.get("thumbnail")]
+        if found:
+            return found
+    except Exception as e:
+        log.warning("DuckDuckGo image search failed: %s", e)
+    if TAVILY_API_KEY:
+        r = await http.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+            json={"query": query, "include_images": True, "max_results": 3},
+        )
+        r.raise_for_status()
+        return [(img if isinstance(img, str) else img["url"], "", "") for img in r.json().get("images", [])]
+    return []
+
+
+async def download_photo(url):
+    """Fetch an image and re-encode it as a JPEG Telegram will accept (also proves it's a real image)."""
+    r = await http.get(url, headers=BROWSER_HEADERS, follow_redirects=True, timeout=20)
+    r.raise_for_status()
+    if not r.headers.get("content-type", "").startswith("image/") or len(r.content) > PHOTO_MAX_BYTES:
+        raise ValueError(f"not a usable image ({r.headers.get('content-type')}, {len(r.content)} bytes)")
+
+    def to_jpeg(data):
+        image = Image.open(io.BytesIO(data))
+        image.thumbnail((2560, 2560))  # Telegram photo limits
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="JPEG", quality=90)
+        return buf.getvalue()
+
+    return await asyncio.to_thread(to_jpeg, r.content)
+
+
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /photo <what to look for>")
+        return
+
+    group = is_group(update)
+    quota, refusal = await use_quota(update.effective_user.id, "photo")
+    if refusal:
+        await update.message.reply_text(refusal, do_quote=group)
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    try:
+        candidates = await find_web_images(query)
+    except Exception:
+        log.exception("Image search failed")
+        candidates = []
+
+    for image_url, title, page_url in candidates:
+        try:
+            image = await download_photo(image_url)
+        except Exception as e:
+            log.info("Skipping image %s: %s", image_url[:80], e)
+            continue
+        caption = "\n".join(part for part in (title[:200], f"Source: {page_url or image_url}") if part)
+        await update.message.reply_photo(image, caption=caption[:1024], do_quote=group)
+        return
+
+    await refund(quota)
+    await update.message.reply_text("Couldn't find a usable photo for that, try different words.", do_quote=group)
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -530,6 +612,7 @@ def main():
     app.add_handler(CommandHandler("usage", usage))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("imagine", imagine))
+    app.add_handler(CommandHandler("photo", photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
