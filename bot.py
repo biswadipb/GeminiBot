@@ -59,6 +59,16 @@ CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/black-forest-labs/flux-1-s
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip().strip("\"'")
 HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 
+# Per-person usage limits (0 = unlimited). Counted per UTC day / month; admins are exempt.
+ADMIN_USERS = {int(u) for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
+LIMITS = {  # (kind, period) -> max uses
+    ("chat", "day"): int(os.getenv("LIMIT_CHAT_DAILY", "50")),
+    ("search", "day"): int(os.getenv("LIMIT_SEARCH_DAILY", "5")),
+    ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "60")),
+    ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "10")),
+}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures"}
+
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
 MAX_QUOTE = 2000  # max characters taken from a replied-to message
@@ -74,6 +84,7 @@ logging.getLogger("httpx2").setLevel(logging.WARNING)  # Hugging Face client
 log = logging.getLogger("gemini-bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+usage_ram = {}  # usage counters when Redis isn't configured (reset on restart)
 histories = {}  # telegram chat_id -> [{"role": "user"|"model", "text": ...}]; cache of what's in Redis
 use_redis = bool(UPSTASH_URL and UPSTASH_TOKEN)
 http = httpx.AsyncClient(timeout=120)  # shared by Redis, Tavily and image generation
@@ -114,6 +125,62 @@ async def clear_history(chat_id):
             await redis("DEL", f"history:{chat_id}")
         except Exception:
             log.exception("Could not clear history for %s", chat_id)
+
+
+def period_key(period):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%d") if period == "day" else now.strftime("%Y-%m")
+
+
+def time_until_reset(period):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if period == "day":
+        reset = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        left = reset - now
+        return f"resets at midnight UTC, in {left.seconds // 3600}h {left.seconds % 3600 // 60}m"
+    return "resets on the 1st of next month (UTC)"
+
+
+async def counter(op, key, ttl=None):
+    """INCR/DECR/GET a usage counter in Redis, or in RAM if Redis isn't configured."""
+    if not use_redis:
+        if op == "GET":
+            return usage_ram.get(key, 0)
+        usage_ram[key] = usage_ram.get(key, 0) + (1 if op == "INCR" else -1)
+        return usage_ram[key]
+    value = int(await redis(op, key) or 0)
+    if op == "INCR" and value == 1 and ttl:
+        await redis("EXPIRE", key, ttl)
+    return value
+
+
+async def use_quota(user_id, kind):
+    """Count one use of `kind`. Returns (keys_to_refund, None) if allowed, or (None, refusal_message)."""
+    if user_id in ADMIN_USERS:
+        return [], None
+    taken = []
+    try:
+        for (k, period), limit in LIMITS.items():
+            if k != kind or limit <= 0:
+                continue
+            key = f"usage:{kind}:{period_key(period)}:{user_id}"
+            taken.append(key)
+            if await counter("INCR", key, ttl=2 * 86400 if period == "day" else 32 * 86400) > limit:
+                await refund(taken)
+                when = "today" if period == "day" else "this month"
+                return None, f"You've used your {limit} {LIMIT_NOUNS[kind]} for {when}. It {time_until_reset(period)}."
+    except Exception:
+        log.exception("Usage counter failed; allowing request")  # fail open rather than block everyone
+    return taken, None
+
+
+async def refund(keys):
+    """Give back a use when the request failed on our side."""
+    for key in keys:
+        try:
+            await counter("DECR", key)
+        except Exception:
+            log.exception("Could not refund %s", key)
 
 
 def is_allowed(update: Update) -> bool:
@@ -176,6 +243,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi! {how} and I'll ask Gemini.\n\n"
         "/search <question> – answer from the web, with sources\n"
         "/imagine <description> – generate a picture\n"
+        "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
     )
@@ -186,6 +254,28 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Chat ID: {update.effective_chat.id}\nYour user ID: {update.effective_user.id}"
     )
+
+
+async def usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    user_id = update.effective_user.id
+    if user_id in ADMIN_USERS:
+        await update.message.reply_text("You're an admin: no limits.", do_quote=is_group(update))
+        return
+    lines = []
+    for (kind, period), limit in LIMITS.items():
+        label = f"{LIMIT_NOUNS[kind].capitalize()} {'today' if period == 'day' else 'this month'}"
+        if limit <= 0:
+            lines.append(f"{label}: unlimited")
+            continue
+        try:
+            used = await counter("GET", f"usage:{kind}:{period_key(period)}:{user_id}")
+        except Exception:
+            used = "?"
+        lines.append(f"{label}: {used}/{limit}")
+    await update.message.reply_text("Your usage:\n" + "\n".join(lines) + "\n\nDaily limits reset at midnight UTC.",
+                                    do_quote=is_group(update))
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,6 +293,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, this bot is private.")
         return
 
+    quota, refusal = await use_quota(update.effective_user.id, "chat")
+    if refusal:
+        await update.message.reply_text(refusal, do_quote=group)
+        return
+
     chat_id = update.effective_chat.id
     text = update.message.text.replace(f"@{context.bot.username}", "").strip()
     quoted = update.message.reply_to_message
@@ -213,13 +308,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
     text = speaker(update, text)
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    answer = await chat_turn(chat_id, text)
+    answer, ok = await chat_turn(chat_id, text)
+    if not ok:
+        await refund(quota)
     for chunk in split_message(answer):
         await update.message.reply_text(chunk, do_quote=group)
 
 
 async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
-    """Ask Gemini with the chat's history and remember the exchange. Returns the reply to send.
+    """Ask Gemini with the chat's history and remember the exchange. Returns (reply, succeeded).
 
     gemini_text: what Gemini actually sees for this turn (e.g. the question plus search results),
     while only `text` is stored in history to keep it small.
@@ -233,12 +330,12 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
         await save_history(chat_id)
         if model != GEMINI_MODEL:
             log.info("Answered with fallback model %s", model)
-        return answer
+        return answer, True
     except Exception as e:
         log.exception("Gemini request failed")
         if isinstance(e, errors.APIError) and e.code in RETRYABLE:
-            return "Gemini is busy right now, please try again in a minute."
-        return f"Error talking to Gemini: {e}"
+            return "Gemini is busy right now, please try again in a minute.", False
+        return f"Error talking to Gemini: {e}", False
 
 
 def speaker(update: Update, text):
@@ -270,12 +367,17 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     group = is_group(update)
+    quota, refusal = await use_quota(update.effective_user.id, "search")
+    if refusal:
+        await update.message.reply_text(refusal, do_quote=group)
+        return
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
         results = await web_search(query)
     except Exception:
         log.exception("Web search failed")
+        await refund(quota)
         await update.message.reply_text("Web search failed, please try again in a bit.", do_quote=group)
         return
     if not results:
@@ -290,7 +392,9 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Search results:\n{numbered}\n\nQuestion: {speaker(update, query)}"
     )
     sources = "\n\nSources:\n" + "\n".join(f"[{i}] {r['title']} – {r['url']}" for i, r in enumerate(results, 1))
-    answer = await chat_turn(chat_id, speaker(update, f"(web search) {query}"), gemini_text, sources)
+    answer, ok = await chat_turn(chat_id, speaker(update, f"(web search) {query}"), gemini_text, sources)
+    if not ok:
+        await refund(quota)  # the Tavily search was spent, but don't penalise the user for Gemini being busy
     for chunk in split_message(answer):
         await update.message.reply_text(chunk, do_quote=group, link_preview_options=NO_PREVIEW)
 
@@ -350,6 +454,10 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     group = is_group(update)
+    quota, refusal = await use_quota(update.effective_user.id, "imagine")
+    if refusal:
+        await update.message.reply_text(refusal, do_quote=group)
+        return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
     seed = int.from_bytes(os.urandom(3))  # new picture each time, even for a repeated prompt
     for name, generate in image_providers():
@@ -359,6 +467,7 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning("%s image generation failed: %s", name, e)
     else:
+        await refund(quota)
         await update.message.reply_text("The image services are busy, please try again in a minute.", do_quote=group)
         return
     if name != image_providers()[0][0]:
@@ -372,11 +481,13 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("usage", usage))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
+    log.info("Limits: %s (admins: %d)", ", ".join(f"{k}/{p}={v or 'unlimited'}" for (k, p), v in LIMITS.items()), len(ADMIN_USERS))
     log.info("Search: %s", "Tavily" if TAVILY_API_KEY else "DuckDuckGo")
     log.info("Memory: %s", "Upstash Redis (persistent)" if use_redis else "in RAM (lost on restart)")
 

@@ -13,6 +13,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
 - Optional allowlist of groups and/or users
+- Per-person daily/monthly limits, with admin exemption
 
 ## Setup
 
@@ -50,6 +51,13 @@ All settings live in `.env`:
 | `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
+| `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
+| `LIMIT_CHAT_DAILY` | no | `50` | Messages per person per day (`0` = unlimited) |
+| `LIMIT_SEARCH_DAILY` | no | `5` | `/search` uses per person per day |
+| `LIMIT_SEARCH_MONTHLY` | no | `60` | `/search` uses per person per month |
+| `LIMIT_IMAGINE_DAILY` | no | `10` | `/imagine` uses per person per day |
+
+Limits reset at midnight UTC (daily) and on the 1st (monthly). Counters live in Upstash when configured, otherwise in RAM. Failed requests don't count.
 
 If both allowlists are empty, anyone can use the bot.
 
@@ -59,6 +67,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/reset` – forget the conversation
 - `/search <question>` – answer from a web search, with sources
 - `/imagine <description>` – generate a picture
+- `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
 
 In groups, mention the bot (`@YourBot question`) or reply to one of its messages.
