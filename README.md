@@ -39,6 +39,8 @@ All settings live in `.env`:
 | `GEMINI_RETRIES` | no | `3` | Attempts per model before falling back |
 | `ALLOWED_CHAT_IDS` | no | – | Comma-separated group IDs whose members may use the bot (get it with `/chatid`) |
 | `ALLOWED_USER_IDS` | no | – | Comma-separated user IDs allowed anywhere, including private chat |
+| `UPSTASH_REDIS_REST_URL` | no | – | Upstash Redis REST URL, for memory that survives restarts |
+| `UPSTASH_REDIS_REST_TOKEN` | no | – | Upstash Redis REST token |
 
 If both allowlists are empty, anyone can use the bot.
 
@@ -64,7 +66,17 @@ In groups, mention the bot (`@YourBot question`) or reply to one of its messages
 
 On Render the bot switches to webhook mode automatically (it reads `RENDER_EXTERNAL_URL`), so Telegram
 delivers messages to it. The free instance sleeps after ~15 minutes idle; the next message wakes it,
-so the first reply after a quiet spell can take up to a minute. Conversation memory resets when it sleeps.
+so the first reply after a quiet spell can take up to a minute.
+
+### Keeping memory across restarts
+
+Render's free instance loses everything in RAM when it sleeps. To keep conversations:
+
+1. Sign up at <https://upstash.com> (GitHub login works) and create a **Redis** database (free tier).
+2. On the database page, open the **REST API** section and copy `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+3. Add both as environment variables on Render.
+
+The bot logs `Memory: Upstash Redis (persistent)` on startup when this is set up.
 
 To use webhooks on another host, set `WEBHOOK_URL` to the bot's public `https://` address.
 

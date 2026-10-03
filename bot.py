@@ -2,9 +2,11 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
@@ -35,6 +37,9 @@ RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
 # ALLOWED_USER_IDS: individual users who may use it anywhere, including private chat.
 ALLOWED_CHATS = {int(c) for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 ALLOWED_USERS = {int(u) for u in os.getenv("ALLOWED_USER_IDS", "").split(",") if u.strip()}
+# Optional: Upstash Redis (free) so conversation memory survives restarts. Without it, memory is RAM-only.
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
@@ -46,7 +51,45 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("gemini-bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-histories = {}  # telegram chat_id -> list[types.Content]; model-agnostic so fallbacks keep context
+histories = {}  # telegram chat_id -> [{"role": "user"|"model", "text": ...}]; cache of what's in Redis
+redis_http = httpx.AsyncClient(timeout=10) if UPSTASH_URL and UPSTASH_TOKEN else None
+
+
+async def redis(*command):
+    """Run one Redis command via Upstash's REST API, e.g. redis("GET", "key")."""
+    r = await redis_http.post(UPSTASH_URL, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, json=list(command))
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+async def load_history(chat_id):
+    if chat_id not in histories:
+        history = []
+        if redis_http:
+            try:
+                raw = await redis("GET", f"history:{chat_id}")
+                history = json.loads(raw) if raw else []
+            except Exception:
+                log.exception("Could not load history for %s", chat_id)
+        histories[chat_id] = history
+    return histories[chat_id]
+
+
+async def save_history(chat_id):
+    if redis_http:
+        try:
+            await redis("SET", f"history:{chat_id}", json.dumps(histories.get(chat_id, [])))
+        except Exception:
+            log.exception("Could not save history for %s", chat_id)
+
+
+async def clear_history(chat_id):
+    histories.pop(chat_id, None)
+    if redis_http:
+        try:
+            await redis("DEL", f"history:{chat_id}")
+        except Exception:
+            log.exception("Could not clear history for %s", chat_id)
 
 
 def is_allowed(update: Update) -> bool:
@@ -83,11 +126,12 @@ def split_message(text, limit=TELEGRAM_LIMIT):
 
 async def ask_gemini(history):
     """Send the conversation to Gemini, retrying busy models and falling back to others."""
+    contents = [types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in history]
     last_error = None
     for model in [GEMINI_MODEL, *FALLBACK_MODELS]:
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                response = await client.aio.models.generate_content(model=model, contents=history)
+                response = await client.aio.models.generate_content(model=model, contents=contents)
                 return response.text, model
             except errors.APIError as e:
                 last_error = e
@@ -121,7 +165,7 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    histories.pop(update.effective_chat.id, None)
+    await clear_history(update.effective_chat.id)
     await update.message.reply_text("Conversation cleared.")
 
 
@@ -138,15 +182,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if group:
         # Shared group conversation: tell Gemini who is speaking
         text = f"{update.effective_user.first_name}: {text}"
-    history = histories.setdefault(chat_id, [])
-    history.append(types.Content(role="user", parts=[types.Part(text=text)]))
+    history = await load_history(chat_id)
+    history.append({"role": "user", "text": text})
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
         answer, model = await ask_gemini(history)
         answer = answer or "(Gemini returned an empty response.)"
-        history.append(types.Content(role="model", parts=[types.Part(text=answer)]))
+        history.append({"role": "model", "text": answer})
         del history[:-MAX_HISTORY]
+        await save_history(chat_id)
         if model != GEMINI_MODEL:
             log.info("Answered with fallback model %s", model)
     except Exception as e:
@@ -170,6 +215,7 @@ def main():
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
+    log.info("Memory: %s", "Upstash Redis (persistent)" if redis_http else "in RAM (lost on restart)")
 
     # On hosts like Render, Telegram pushes updates to us (webhook), which also wakes a sleeping
     # free instance. Locally, with no public URL, we poll Telegram instead.
