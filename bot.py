@@ -741,21 +741,38 @@ KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "c
 KEYWORD_PATTERN = r"(?i)^\s*(kittypic|foodporn|carporn)\s*[!.]*\s*$"
 
 
+recent_memes = []  # recently posted meme URLs, so kittypic doesn't repeat itself
+
+
 async def cat_photos():
-    """Guaranteed cats: TheCatAPI, then cataas.com, then web search as a last resort."""
-    found = []
+    """About half the time a funny cat meme (Reddit r/catmemes), otherwise a real cat photo (TheCatAPI,
+    cataas.com). Web search is the last resort. Returns [(image_url, caption_title, source_url)]."""
+    photos, memes = [], []
     try:
         r = await http.get("https://api.thecatapi.com/v1/images/search", params={"limit": 3, "mime_types": "jpg,png"}, timeout=15)
         r.raise_for_status()
-        found += [(c["url"], "", "https://thecatapi.com") for c in r.json()]
+        photos += [(c["url"], "🐱", "https://thecatapi.com") for c in r.json()]
     except Exception as e:
         log.warning("TheCatAPI failed: %s", e)
-    found.append((f"https://cataas.com/cat?t={random.randint(0, 10**9)}", "", "https://cataas.com"))
+    photos.append((f"https://cataas.com/cat?t={random.randint(0, 10**9)}", "🐱", "https://cataas.com"))
+    if random.random() < 0.5:
+        try:
+            r = await http.get(f"https://meme-api.com/gimme/{random.choice(['catmemes', 'Catmemes'])}/10", timeout=15)
+            r.raise_for_status()
+            memes = [(m["url"], f"😹 {m['title']}", m["postLink"]) for m in r.json().get("memes", [])
+                     if not m.get("nsfw") and not m.get("spoiler") and not m["url"].lower().endswith(".gif")
+                     and m["url"] not in recent_memes]
+            random.shuffle(memes)
+            if memes:  # the first one is what gets posted, so remember it
+                recent_memes.append(memes[0][0])
+                del recent_memes[:-100]
+        except Exception as e:
+            log.warning("Cat meme API failed: %s", e)
     try:
-        found += (await find_web_images(random.choice(KITTY_QUERIES)))[:3]
+        web = [(u, "🐱", p) for u, _, p in (await find_web_images(random.choice(KITTY_QUERIES)))[:3]]
     except Exception:
-        pass
-    return found
+        web = []
+    return memes[:4] + photos + web
 
 
 async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -765,7 +782,7 @@ async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # stay quiet for one-word triggers outside allowed chats
     keyword = context.matches[0].group(1).lower()
     if keyword == "kittypic":
-        await send_web_photo(update, context, "", caption_head="🐱", candidates=await cat_photos())
+        await send_web_photo(update, context, "", candidates=await cat_photos())  # caption = 🐱 or meme title
     elif keyword == "carporn":
         car = random.choice(CARS)
         await send_web_photo(update, context, f"{car} car photo", caption_head=f"🏎️ <b>{car}</b>", shuffle=True)
