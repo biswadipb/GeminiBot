@@ -74,11 +74,11 @@ LIMITS = {  # (kind, period) -> max uses
     ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "100")),
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
     ("photo", "day"): int(os.getenv("LIMIT_FETCH_DAILY", os.getenv("LIMIT_PHOTO_DAILY", "20"))),
-    ("ship", "day"): int(os.getenv("LIMIT_SHIP_DAILY", "10")),
+    ("ring", "day"): int(os.getenv("LIMIT_RING_DAILY", os.getenv("LIMIT_SHIP_DAILY", "10"))),
     ("nick", "day"): int(os.getenv("LIMIT_NICK_DAILY", "10")),
     ("criticize", "day"): int(os.getenv("LIMIT_CRITICIZE_DAILY", "5")),
 }
-LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "fetches", "ship": "ships", "nick": "nicknames", "criticize": "criticisms"}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "fetches", "ring": "rings", "nick": "nicknames", "criticize": "criticisms"}
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
@@ -111,9 +111,9 @@ MAX_QUOTE = 2000  # max characters taken from a replied-to message
 RETRYABLE = {429, 500, 502, 503, 504}  # rate limited / overloaded / server hiccup
 SKIP_MODEL = {404}  # model not available for this key -> go straight to the next one
 SEARCH_RESULTS = 5
-ACTIVE_DAYS = 7  # /ship picks from people who spoke in the last week
+ACTIVE_DAYS = 7  # /ring picks from people who spoke in the last week
 SEEN_SAVE_EVERY = 3600  # save a member's "last seen" at most hourly, to keep Redis traffic low
-SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets shipped
+SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets married
 LOG_MAX = 400  # today's messages kept per group for /criticize
 PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
 PHOTO_MAX_BYTES = 15 * 1024 * 1024
@@ -372,7 +372,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/fetch <search> – a picture from the web (add \"gif\" for a GIF)\n"
         "/serious – toggle critical, logical mode\n"
         "/criticize [@someone] – a roast of today's behaviour\n"
-        "ship or /ship [@a @b] – play matchmaker 💘 (/noship to opt out)\n"
+        "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
         "kittypic · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
@@ -762,7 +762,7 @@ noship_ram = set()
 
 
 async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remember who's active in each group, so /ship can pick from real, recent members."""
+    """Remember who's active in each group, so /ring can pick from real, recent members."""
     user, chat = update.effective_user, update.effective_chat
     if not user or user.is_bot or not chat or chat.type not in ("group", "supergroup"):
         return
@@ -878,7 +878,7 @@ async def load_members(chat_id):
 async def opted_out(user_id):
     if use_redis:
         try:
-            return bool(await redis("SISMEMBER", "noship", str(user_id)))
+            return bool(await redis("SISMEMBER", "noship", str(user_id)))  # key kept from when /ring was /ship
         except Exception:
             log.exception("Could not read opt-outs")
     return user_id in noship_ram
@@ -893,21 +893,21 @@ async def set_noship(update: Update, out: bool):
         except Exception:
             log.exception("Could not save opt-out")
     await update.message.reply_text(
-        "Got it, I'll never ship you. Send /yesship to opt back in." if out else "You're back in the shipping pool! 💘",
+        "Got it, nobody's putting a ring on you. Send /yesring to opt back in." if out else "You're back on the market! 💍",
         do_quote=is_group(update),
     )
 
 
-async def noship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def noring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_noship(update, True)
 
 
-async def yesship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def yesring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_noship(update, False)
 
 
 async def ship_pool(chat_id, group_members, context):
-    """People to ship at random: active this week; else anyone ever seen here plus the group's admins."""
+    """People to marry off at random: active this week; else anyone ever seen here plus the group's admins."""
     cutoff = time.time() - ACTIVE_DAYS * 86400
     pool = {uid: m["name"] for uid, m in group_members.items() if m["seen"] >= cutoff}
     if len(pool) < 2:
@@ -932,7 +932,7 @@ def couple_name(a, b):
 
 
 async def resolve_ship_targets(update: Update, group_members):
-    """Turn /ship arguments (@usernames, tagged users, or plain names) into [(key, name)]."""
+    """Turn /ring arguments (@usernames, tagged users, or plain names) into [(key, name)]."""
     msg = update.message
     by_username = {m["username"].lower(): (uid, m["name"]) for uid, m in group_members.items() if m["username"]}
     targets = []
@@ -942,13 +942,14 @@ async def resolve_ship_targets(update: Update, group_members):
         else:
             uid, name = by_username.get(text.lstrip("@").lower(), (text.lstrip("@"), text.lstrip("@")))
             targets.append((uid, name))
-    if not targets:  # plain names: /ship Rahul Priya
+    if not targets:  # plain names: /ring Rahul Priya
         words = msg.text.split()[1:]
         targets = [(w, w) for w in words if not w.startswith("/")]
     return targets[:2]
 
 
-async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ring(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Laden "gifts the ring" and marries off two people: named ones, or a well-matched random pair."""
     if await ignored_while_off(update):
         return
     if not is_allowed(update):
@@ -956,7 +957,7 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     group = is_group(update)
     if not group:
-        await update.message.reply_text("Shipping works in groups – add me to one! 💘")
+        await update.message.reply_text("Weddings happen in groups – add me to one! 💍")
         return
 
     group_members = await load_members(update.effective_chat.id)
@@ -964,30 +965,30 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     targets = await resolve_ship_targets(update, group_members) if is_command else []
 
     if len(targets) == 1:
-        await update.message.reply_text("I need two people to ship! Try /ship @someone @someone_else", do_quote=True)
+        await update.message.reply_text("A wedding needs two people! Try /ring @someone @someone_else", do_quote=True)
         return
     if targets:
         (a_id, a), (b_id, b) = targets
         if a_id == b_id:
-            await update.message.reply_text("Self-love is important, but I need two different people 😄", do_quote=True)
+            await update.message.reply_text("Marrying yourself? Self-love is important, but I need two different people 😄", do_quote=True)
             return
         for uid, name in targets:
             if isinstance(uid, int) and await opted_out(uid):
-                await update.message.reply_text(f"{name} has opted out of shipping 🚫💘", do_quote=True)
+                await update.message.reply_text(f"{name} has opted out of weddings 🚫💍", do_quote=True)
                 return
     else:
         pool = await ship_pool(update.effective_chat.id, group_members, context)
         if len(pool) < 2:
             await update.message.reply_text(
-                "I don't know enough people here yet – once a couple more people chat, I can ship them! "
-                "(Or try /ship @someone @someone_else)",
+                "I don't know enough people here yet – once a couple more people chat, I can marry them off! "
+                "(Or try /ring @someone @someone_else)",
                 do_quote=True,
             )
             return
         pairs = [tuple(random.sample(pool, 2)) for _ in range(SHIP_SAMPLES)]
         (a_id, a), (b_id, b) = max(pairs, key=lambda p: ship_score(p[0][0], p[1][0]))
 
-    quota, refusal = await use_quota(update.effective_user.id, "ship")
+    quota, refusal = await use_quota(update.effective_user.id, "ring")
     if refusal:
         await update.message.reply_text(refusal, do_quote=True)
         return
@@ -996,21 +997,27 @@ async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
         line, _ = await ask_gemini([{"role": "user", "text": (
-            f"Write ONE short, funny, wholesome line (max 25 words) for a group-chat 'ship' game about why "
-            f"{a} and {b} would be a {score}% match. Playful and kind; nothing sexual, nothing mean, no hashtags. Don't guess anyone's gender: use their "
-            "names or they/them. Reply with only the line itself."
+            f"You are Laden, officiating a joke wedding in a group chat: you've just handed over the ring and "
+            f"married {a} and {b}, who are {score}% compatible. Write ONE short, funny, wholesome line (max 30 words) "
+            "about their marriage: the ring, vows, wedding gifts, the cake, the honeymoon or married life. "
+            "If the score is low, joke that it's a questionable match. Nothing sexual, nothing mean, no hashtags. "
+            "Don't guess anyone's gender: use their names or they/them. Reply with only the line itself."
         )}])
         line = re.sub(r"^\s*\w+:\s*", "", (line or "").strip())  # drop a stray "Name:" prefix
     except Exception:
-        log.exception("Ship line failed")
+        log.exception("Wedding line failed")
         line = ""
     line = line or random.choice([
-        "The stars aligned, the memes agreed. 💫",
-        "Two chaotic energies, one shared playlist. 🎧",
-        "Certified group-chat power couple. 👑",
+        "The vows were short, the cake was huge, and the group chat cried. 🎂",
+        "Wedding gift from Laden: one shared Netflix password. 📺",
+        "May your arguments be short and your snacks be plentiful. 🍿",
     ])
-    hearts = "💘" if score >= 75 else "💕" if score >= 50 else "💔" if score < 25 else "🤝"
-    text = f"{hearts} <b>{html.escape(couple_name(a, b))}</b>: {html.escape(a)} + {html.escape(b)} = <b>{score}%</b>\n\n{markdown_to_html(line)}"
+    hearts = "💞" if score >= 75 else "💕" if score >= 50 else "💔" if score < 25 else "🤝"
+    text = (
+        f"💍 <b>Laden gifts the ring!</b>\n"
+        f"{html.escape(a)} {hearts} {html.escape(b)} are now married: <b>{score}%</b> compatible\n"
+        f"Couple name: <b>{html.escape(couple_name(a, b))}</b>\n\n{markdown_to_html(line)}"
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, do_quote=True)
 
 
@@ -1062,13 +1069,13 @@ async def register_commands(app):
         ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
         ("serious", "Toggle serious mode: critical, logical answers"),
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
-        ("ship", "Play matchmaker 💘 (or @ two people)"),
+        ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
         ("lore", "Group lore (admins: /lore Name: text)"),
         ("usage", "See your daily allowance"),
         ("reset", "Forget the conversation"),
-        ("noship", "Never get shipped"),
-        ("yesship", "Join the shipping pool again"),
+        ("noring", "Never get married off by /ring"),
+        ("yesring", "Back on the /ring market"),
         ("chatid", "Show chat and user IDs"),
     ]
     try:
@@ -1194,11 +1201,11 @@ def main():
     app.add_handler(CommandHandler("criticise", criticize))
     app.add_handler(CommandHandler("on", power_on))
     app.add_handler(CommandHandler("off", power_off_cmd))
-    app.add_handler(CommandHandler("ship", ship))
-    app.add_handler(CommandHandler("noship", noship))
+    app.add_handler(CommandHandler("ring", ring))
+    app.add_handler(CommandHandler("noring", noring))
     app.add_handler(CommandHandler("nick", nick))
-    app.add_handler(CommandHandler("yesship", yesship))
-    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ship\s*[!.]*\s*$"), ship))  # plain "ship"
+    app.add_handler(CommandHandler("yesring", yesring))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
     app.add_handler(CommandHandler("lore", lore_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

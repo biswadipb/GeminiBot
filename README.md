@@ -13,7 +13,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
 - `/fetch` finds real pictures and GIFs on the web (DuckDuckGo images, Tavily fallback)
-- A wholesome `ship` matchmaking game with opt-out
+- A wholesome `/ring` wedding game with opt-out
 - Optional allowlist of groups and/or users
 - Per-person daily/monthly limits, with admin exemption
 
@@ -61,7 +61,7 @@ All settings live in `.env`:
 | `LIMIT_IMAGINE_DAILY` | no | `20` | `/imagine` uses per person per day |
 | `LIMIT_FETCH_DAILY` | no | `20` | `/fetch` and keyword-picture uses per person per day |
 | `LIMIT_CRITICIZE_DAILY` | no | `5` | `/criticize` uses per person per day |
-| `LIMIT_SHIP_DAILY` | no | `10` | `/ship` uses per person per day |
+| `LIMIT_RING_DAILY` | no | `10` | `/ring` uses per person per day |
 | `LIMIT_NICK_DAILY` | no | `10` | `/nick` uses per person per day |
 
 Limits reset at midnight UTC (daily) and on the 1st (monthly). Counters live in Upstash when configured, otherwise in RAM. Failed requests don't count.
@@ -77,7 +77,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/fetch <search>` – a real picture from the web (with source link); add `gif` for an animated GIF, e.g. `/fetch happy dance gif`
 - `/usage` – see how much of your allowance you've used
 - `/chatid` – show the current chat's ID and your user ID
-- `ship` or `/ship` – pair two people active this week who score well (falls back to anyone seen and the group admins); `/ship @a @b` ships specific people; `/noship` / `/yesship` to opt out / back in
+- `ring` or `/ring` – Laden gifts the ring and marries off two people active this week who score well (falls back to anyone seen and the group admins); `/ring @a @b` marries specific people; `/noring` / `/yesring` to opt out / back in
 - `/nick [name]` – fun nickname ideas, incl. portmanteaus (for you, a name/@mention, or reply to someone)
 - `kittypic`, `foodporn`, `carporn` – send just the word for a random cat, food (with a tasty description) or car photo
 - `/lore` – list group lore; admins add with `/lore Name: description` and remove with `/lore -Name`. Lore lives in Upstash (not in the repo) and Laden plays along with it.
