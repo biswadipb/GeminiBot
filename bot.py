@@ -1,8 +1,10 @@
 """Telegram bot that forwards messages to Google Gemini and replies with the answer."""
 
 import asyncio
+import base64
 import datetime
 import hashlib
+import io
 import json
 import logging
 import os
@@ -12,6 +14,7 @@ import httpx
 from ddgs import DDGS
 from dotenv import load_dotenv
 from google import genai
+from huggingface_hub import AsyncInferenceClient
 from google.genai import errors, types
 from telegram import LinkPreviewOptions, Update
 from telegram.constants import ChatAction
@@ -49,6 +52,12 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip().strip("\"'")
 # anonymous endpoint is used (watermarked, stricter rate limits).
 POLLINATIONS_KEY = os.getenv("POLLINATIONS_KEY", "").strip().strip("\"'")
 POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "black-forest-labs/flux.1-schnell")
+# Optional /imagine fallbacks, tried in this order when Pollinations is busy (both have free tiers)
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip().strip("\"'")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip().strip("\"'")
+CLOUDFLARE_MODEL = os.getenv("CLOUDFLARE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip().strip("\"'")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
@@ -61,6 +70,7 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)  # keep search answers from sh
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("primp").setLevel(logging.WARNING)  # DuckDuckGo search client
+logging.getLogger("httpx2").setLevel(logging.WARNING)  # Hugging Face client
 log = logging.getLogger("gemini-bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -285,6 +295,50 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk, do_quote=group, link_preview_options=NO_PREVIEW)
 
 
+async def pollinations_image(prompt, seed):
+    params = {"width": 1024, "height": 1024, "seed": seed}
+    if POLLINATIONS_KEY:
+        r = await http.get(
+            f"https://gen.pollinations.ai/image/{quote(prompt)}",
+            params={**params, "model": POLLINATIONS_MODEL},
+            headers={"Authorization": f"Bearer {POLLINATIONS_KEY}"},
+        )
+    else:
+        r = await http.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}", params={**params, "nologo": "true"})
+    r.raise_for_status()
+    if not r.headers.get("content-type", "").startswith("image/"):
+        raise ValueError(f"unexpected response type {r.headers.get('content-type')}")
+    return r.content
+
+
+async def cloudflare_image(prompt, seed):
+    r = await http.post(
+        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_MODEL}",
+        headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+        json={"prompt": prompt, "steps": 4, "seed": seed},
+    )
+    r.raise_for_status()
+    return base64.b64decode(r.json()["result"]["image"])
+
+
+async def huggingface_image(prompt, seed):
+    hf = AsyncInferenceClient(provider="auto", api_key=HF_TOKEN)
+    image = await hf.text_to_image(prompt, model=HF_IMAGE_MODEL, seed=seed)
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def image_providers():
+    """Image services in the order we try them; ones without credentials are skipped."""
+    providers = [("Pollinations", pollinations_image)]
+    if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
+        providers.append(("Cloudflare", cloudflare_image))
+    if HF_TOKEN:
+        providers.append(("Hugging Face", huggingface_image))
+    return providers
+
+
 async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -296,28 +350,19 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group = is_group(update)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
-    try:
-        # A random seed gives a new picture each time, even for a repeated prompt
-        params = {"width": 1024, "height": 1024, "seed": int.from_bytes(os.urandom(3))}
-        if POLLINATIONS_KEY:
-            r = await http.get(
-                f"https://gen.pollinations.ai/image/{quote(prompt)}",
-                params={**params, "model": POLLINATIONS_MODEL},
-                headers={"Authorization": f"Bearer {POLLINATIONS_KEY}"},
-            )
-        else:
-            r = await http.get(f"https://image.pollinations.ai/prompt/{quote(prompt)}", params={**params, "nologo": "true"})
-        if r.status_code == 402:
-            await update.message.reply_text("Image credits are used up for now (Pollinations budget).", do_quote=group)
-            return
-        r.raise_for_status()
-        if not r.headers.get("content-type", "").startswith("image/"):
-            raise ValueError(f"unexpected response type {r.headers.get('content-type')}")
-    except Exception:
-        log.exception("Image generation failed")
-        await update.message.reply_text("The image service is busy, please try again in a minute.", do_quote=group)
+    seed = int.from_bytes(os.urandom(3))  # new picture each time, even for a repeated prompt
+    for name, generate in image_providers():
+        try:
+            image = await generate(prompt, seed)
+            break
+        except Exception as e:
+            log.warning("%s image generation failed: %s", name, e)
+    else:
+        await update.message.reply_text("The image services are busy, please try again in a minute.", do_quote=group)
         return
-    await update.message.reply_photo(r.content, caption=prompt[:1024], do_quote=group)
+    if name != "Pollinations":
+        log.info("Image generated by fallback %s", name)
+    await update.message.reply_photo(image, caption=prompt[:1024], do_quote=group)
 
 
 def main():
@@ -330,7 +375,7 @@ def main():
     app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
-    log.info("Images: %s", f"Pollinations key ({POLLINATIONS_MODEL})" if POLLINATIONS_KEY else "Pollinations anonymous")
+    log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
     log.info("Search: %s", "Tavily" if TAVILY_API_KEY else "DuckDuckGo")
     log.info("Memory: %s", "Upstash Redis (persistent)" if use_redis else "in RAM (lost on restart)")
 
