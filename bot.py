@@ -62,10 +62,10 @@ HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 # Per-person usage limits (0 = unlimited). Counted per UTC day / month; admins are exempt.
 ADMIN_USERS = {int(u) for u in os.getenv("ADMIN_USER_IDS", "").split(",") if u.strip()}
 LIMITS = {  # (kind, period) -> max uses
-    ("chat", "day"): int(os.getenv("LIMIT_CHAT_DAILY", "50")),
-    ("search", "day"): int(os.getenv("LIMIT_SEARCH_DAILY", "5")),
-    ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "60")),
-    ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "10")),
+    ("chat", "day"): int(os.getenv("LIMIT_CHAT_DAILY", "150")),
+    ("search", "day"): int(os.getenv("LIMIT_SEARCH_DAILY", "10")),
+    ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "100")),
+    ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
 }
 LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures"}
 

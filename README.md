@@ -52,10 +52,10 @@ All settings live in `.env`:
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
-| `LIMIT_CHAT_DAILY` | no | `50` | Messages per person per day (`0` = unlimited) |
-| `LIMIT_SEARCH_DAILY` | no | `5` | `/search` uses per person per day |
-| `LIMIT_SEARCH_MONTHLY` | no | `60` | `/search` uses per person per month |
-| `LIMIT_IMAGINE_DAILY` | no | `10` | `/imagine` uses per person per day |
+| `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
+| `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
+| `LIMIT_SEARCH_MONTHLY` | no | `100` | `/search` uses per person per month |
+| `LIMIT_IMAGINE_DAILY` | no | `20` | `/imagine` uses per person per day |
 
 Limits reset at midnight UTC (daily) and on the 1st (monthly). Counters live in Upstash when configured, otherwise in RAM. Failed requests don't count.
 
