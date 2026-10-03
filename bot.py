@@ -86,8 +86,9 @@ NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, BOT_NAMES)) + r")\b",
 LORE_INSTRUCTIONS = (
     "Group lore (running in-jokes about people in this chat). When someone asks about one of these people, "
     "or asks you to check on them, play along with the lore in character, playfully and sarcastically. "
-    "Treat it as a fun inside joke; stay light, never genuinely hateful. Keep lore replies short and punchy: one to "
-    "three sentences, full of character (match the tone of any example given), never a long paragraph. "
+    "Treat it as a fun inside joke; stay light, never genuinely hateful. Keep lore replies short and punchy: one or "
+    "two short sentences (under about 25 words), full of character. "
+    "The person asking is not the person being asked about (unless they share the name). "
     "Examples show the style only: don't copy them word for word, write a fresh line each time."
 )
 SYSTEM_PROMPT = (
