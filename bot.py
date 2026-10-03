@@ -30,7 +30,10 @@ FALLBACK_MODELS = [
     if m.strip()
 ]
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
-# Optional: comma-separated Telegram user IDs allowed to use the bot (empty = everyone)
+# Optional allowlists (comma-separated). If both are empty, anyone can use the bot.
+# ALLOWED_CHAT_IDS: group IDs whose members may use it (in that group); get one with /chatid.
+# ALLOWED_USER_IDS: individual users who may use it anywhere, including private chat.
+ALLOWED_CHATS = {int(c) for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 ALLOWED_USERS = {int(u) for u in os.getenv("ALLOWED_USER_IDS", "").split(",") if u.strip()}
 
 TELEGRAM_LIMIT = 4096
@@ -47,7 +50,21 @@ histories = {}  # telegram chat_id -> list[types.Content]; model-agnostic so fal
 
 
 def is_allowed(update: Update) -> bool:
-    return not ALLOWED_USERS or update.effective_user.id in ALLOWED_USERS
+    if not ALLOWED_CHATS and not ALLOWED_USERS:
+        return True
+    return update.effective_chat.id in ALLOWED_CHATS or update.effective_user.id in ALLOWED_USERS
+
+
+def is_group(update: Update) -> bool:
+    return update.effective_chat.type in ("group", "supergroup")
+
+
+def addressed_to_bot(update: Update, bot_username: str) -> bool:
+    """In groups, only respond when @mentioned or when someone replies to the bot."""
+    msg = update.message
+    if msg.reply_to_message and msg.reply_to_message.from_user.username == bot_username:
+        return True
+    return f"@{bot_username}".lower() in msg.text.lower()
 
 
 def split_message(text, limit=TELEGRAM_LIMIT):
@@ -86,26 +103,43 @@ async def ask_gemini(history):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    how = f"Mention me (@{context.bot.username}) or reply to one of my messages" if is_group(update) else "Send me any message"
     await update.message.reply_text(
-        "Hi! Send me any message and I'll ask Gemini.\n\n"
+        f"Hi! {how} and I'll ask Gemini.\n\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
     )
 
 
+async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Always available, so the owner can find the group ID to put in ALLOWED_CHAT_IDS."""
+    await update.message.reply_text(
+        f"Chat ID: {update.effective_chat.id}\nYour user ID: {update.effective_user.id}"
+    )
+
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
     histories.pop(update.effective_chat.id, None)
     await update.message.reply_text("Conversation cleared.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group = is_group(update)
+    if group and not addressed_to_bot(update, context.bot.username):
+        return  # ordinary group chatter, not for us
     if not is_allowed(update):
-        await update.message.reply_text("Sorry, you're not allowed to use this bot.")
+        await update.message.reply_text("Sorry, this bot is private.")
         return
 
     chat_id = update.effective_chat.id
+    text = update.message.text.replace(f"@{context.bot.username}", "").strip()
+    if group:
+        # Shared group conversation: tell Gemini who is speaking
+        text = f"{update.effective_user.first_name}: {text}"
     history = histories.setdefault(chat_id, [])
-    history.append(types.Content(role="user", parts=[types.Part(text=update.message.text)]))
+    history.append(types.Content(role="user", parts=[types.Part(text=text)]))
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
@@ -125,7 +159,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     for chunk in split_message(answer):
-        await update.message.reply_text(chunk)
+        await update.message.reply_text(chunk, do_quote=group)
 
 
 def main():
@@ -133,6 +167,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
 

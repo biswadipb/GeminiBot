@@ -8,7 +8,8 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Remembers the conversation per chat (`/reset` to clear it)
 - Retries when Gemini is busy, then falls back to backup models — context carries over
 - Splits long answers to fit Telegram's 4096-character limit
-- Optional allowlist of Telegram user IDs
+- Works in groups: answers when @mentioned or replied to
+- Optional allowlist of groups and/or users
 
 ## Setup
 
@@ -36,12 +37,18 @@ All settings live in `.env`:
 | `GEMINI_MODEL` | no | `gemini-3.8-flash` | Main model |
 | `GEMINI_FALLBACK_MODELS` | no | `gemini-3.5-flash,gemini-3.1-flash-lite` | Tried in order when the main model is busy |
 | `GEMINI_RETRIES` | no | `3` | Attempts per model before falling back |
-| `ALLOWED_USER_IDS` | no | (anyone) | Comma-separated Telegram user IDs allowed to use the bot |
+| `ALLOWED_CHAT_IDS` | no | – | Comma-separated group IDs whose members may use the bot (get it with `/chatid`) |
+| `ALLOWED_USER_IDS` | no | – | Comma-separated user IDs allowed anywhere, including private chat |
+
+If both allowlists are empty, anyone can use the bot.
 
 ## Commands
 
 - `/start`, `/help` – intro
 - `/reset` – forget the conversation
+- `/chatid` – show the current chat's ID and your user ID
+
+In groups, mention the bot (`@YourBot question`) or reply to one of its messages.
 
 ## Hosting for free on Render (no credit card)
 
