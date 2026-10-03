@@ -81,7 +81,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/nick [name]` – fun nickname ideas, incl. portmanteaus (for you, a name/@mention, or reply to someone)
 - `kittypic`, `foodporn`, `carporn` – send just the word for a random cat, food (with a tasty description) or car photo
 - `/lore` – list group lore; admins add with `/lore Name: description` and remove with `/lore -Name`. Lore lives in Upstash (not in the repo) and Laden plays along with it.
-- `/serious` – toggle serious mode for the chat: critical, logical, less agreeable answers with reasoning
+- `/serious` – serious mode for the chat: critical, logical, less agreeable answers with reasoning. Stays on (even across restarts) until `/unserious`
 - `/criticize` – a mildly hostile roast of today's behaviour (yours, a replied-to person's, or an @mention's). Uses today's group messages, kept in Upstash for up to 2 days.
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 

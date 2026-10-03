@@ -370,7 +370,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/search <question> – answer from the web, with sources\n"
         "/imagine <description> – generate a picture\n"
         "/fetch <search> – a picture from the web (add \"gif\" for a GIF)\n"
-        "/serious – toggle critical, logical mode\n"
+        "/serious – critical, logical mode (stays on until /unserious)\n"
         "/criticize [@someone] – a roast of today's behaviour\n"
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
@@ -1067,7 +1067,8 @@ async def register_commands(app):
         ("search", "Answer from the web, with sources"),
         ("imagine", "Generate a picture"),
         ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
-        ("serious", "Toggle serious mode: critical, logical answers"),
+        ("serious", "Serious mode on: critical, logical answers"),
+        ("unserious", "Back to the usual Laden"),
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
@@ -1126,25 +1127,34 @@ async def load_serious():
     return serious_chats
 
 
-async def serious(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/serious toggles critical, logical, less agreeable answers for this chat (/serious on|off also work)."""
+async def set_serious(update: Update, turn_on: bool):
+    """Serious mode stays on for the chat (across restarts) until someone sends /unserious."""
     if await ignored_while_off(update) or not is_allowed(update):
         return
     chats = await load_serious()
     chat_id = update.effective_chat.id
-    arg = (context.args[0].lower() if context.args else "")
-    turn_on = arg == "on" if arg in ("on", "off") else chat_id not in chats
+    already = (chat_id in chats) == turn_on
     (chats.add if turn_on else chats.discard)(chat_id)
-    if use_redis:
+    if use_redis and not already:
         try:
             await redis("SADD" if turn_on else "SREM", "serious", str(chat_id))
         except Exception:
             log.exception("Could not save serious mode")
-    await update.message.reply_text(
-        "🧐 Serious mode ON: expect critical, logical answers with reasoning, and less agreeing. /serious to turn off."
-        if turn_on else "😄 Serious mode OFF: back to the usual Laden.",
-        do_quote=is_group(update),
-    )
+    if turn_on:
+        text = ("🧐 Serious mode is already on." if already else
+                "🧐 Serious mode ON: critical, logical answers with reasoning, and less agreeing. "
+                "It stays on until someone sends /unserious.")
+    else:
+        text = "😄 Serious mode is already off." if already else "😄 Serious mode OFF: back to the usual Laden."
+    await update.message.reply_text(text, do_quote=is_group(update))
+
+
+async def serious(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_serious(update, True)
+
+
+async def unserious(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_serious(update, False)
 
 
 async def lore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1197,6 +1207,7 @@ def main():
     app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(CommandHandler("fetch", fetch))
     app.add_handler(CommandHandler("serious", serious))
+    app.add_handler(CommandHandler("unserious", unserious))
     app.add_handler(CommandHandler("criticize", criticize))
     app.add_handler(CommandHandler("criticise", criticize))
     app.add_handler(CommandHandler("on", power_on))
