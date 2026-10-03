@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import html
 import os
 import re
 from urllib.parse import quote
@@ -18,7 +19,8 @@ from google import genai
 from huggingface_hub import AsyncInferenceClient
 from google.genai import errors, types
 from telegram import LinkPreviewOptions, Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -212,6 +214,39 @@ def addressed_to_bot(update: Update, bot_username: str) -> bool:
     return bool(NAME_PATTERN and NAME_PATTERN.search(msg.text))
 
 
+def markdown_to_html(text):
+    """Convert the Markdown Gemini writes into the small HTML subset Telegram understands."""
+    stash = []
+
+    def keep(fragment):
+        stash.append(fragment)
+        return f"\x00{len(stash) - 1}\x00"
+
+    # Code first, so nothing inside it gets formatted
+    text = re.sub(r"```[^\n`]*\n?(.*?)```", lambda m: keep(f"<pre>{html.escape(m[1].strip())}</pre>"), text, flags=re.S)
+    text = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m[1])}</code>"), text)
+    text = html.escape(text, quote=False)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", lambda m: keep(f'<a href="{m[2]}">{m[1]}</a>'), text)
+    text = re.sub(r"^#{1,6}\s+(.+?)\s*#*$", r"<b>\1</b>", text, flags=re.M)        # ### Heading
+    text = re.sub(r"^(\s*)[*\-+]\s+", r"\1• ", text, flags=re.M)                   # * bullet
+    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: f"<b>{m[1] or m[2]}</b>", text)  # **bold**
+    text = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)   # *italic*
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)           # _italic_
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"^\s*([-*_])\1{2,}\s*$", "", text, flags=re.M)                     # --- rules
+    return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m[1])], text)
+
+
+async def send_formatted(message, text, **kwargs):
+    """Reply with Gemini's Markdown rendered as Telegram formatting; fall back to plain text."""
+    for chunk in split_message(text, limit=TELEGRAM_LIMIT - 400):  # leave room for HTML tags
+        try:
+            await message.reply_text(markdown_to_html(chunk), parse_mode=ParseMode.HTML, **kwargs)
+        except BadRequest as e:
+            log.warning("Formatted reply rejected (%s); sending plain text", e)
+            await message.reply_text(chunk, **kwargs)
+
+
 def split_message(text, limit=TELEGRAM_LIMIT):
     """Split text into chunks under Telegram's limit, preferring newline boundaries."""
     chunks = []
@@ -324,8 +359,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer, ok = await chat_turn(chat_id, text)
     if not ok:
         await refund(quota)
-    for chunk in split_message(answer):
-        await update.message.reply_text(chunk, do_quote=group)
+    await send_formatted(update.message, answer, do_quote=group)
 
 
 async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
@@ -408,8 +442,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer, ok = await chat_turn(chat_id, speaker(update, f"(web search) {query}"), gemini_text, sources)
     if not ok:
         await refund(quota)  # the Tavily search was spent, but don't penalise the user for Gemini being busy
-    for chunk in split_message(answer):
-        await update.message.reply_text(chunk, do_quote=group, link_preview_options=NO_PREVIEW)
+    await send_formatted(update.message, answer, do_quote=group, link_preview_options=NO_PREVIEW)
 
 
 async def pollinations_image(prompt, seed):
