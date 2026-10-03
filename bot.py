@@ -119,6 +119,18 @@ ACTIVE_DAYS = 7  # /ring picks from people who spoke in the last week
 SEEN_SAVE_EVERY = 3600  # save a member's "last seen" at most hourly, to keep Redis traffic low
 SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets married
 LOG_MAX = 400  # today's messages kept per group for /criticize
+REACTION_RATE = min(float(os.getenv("REACTION_RATE", "0.25")), 0.3)  # share of group messages Laden reacts to (max 30%)
+REACTION_MODEL = os.getenv("REACTION_MODEL", "gemini-3.5-flash-lite")  # separate free quota from the chat models
+REACTIONS = "👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 😢 🎉 🤩 🤮 💩 🙏 👌 🤡 🥱 🥴 😍 🐳 🌚 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 😈 😴 😭 🤓 👻 👀 🙈 😇 😨 🤝 🤗 🫡 💅 🤪 🗿 🆒 🙉 🦄 🙊 😎 🤷 😡".split()
+REACTION_RULES = [  # cheap fallback when the model is unavailable: (pattern, choices)
+    (r"\b(lol|lmao|haha+|😂|🤣|rofl|dead)\b", ["🤣", "😁", "🗿"]),
+    (r"\b(love|cute|aww+|❤)\b", ["❤", "🥰", "😍"]),
+    (r"\b(sad|sorry|miss|cry|rip)\b", ["😢", "🤗", "💔"]),
+    (r"\b(food|eat|hungry|pizza|banana|biryani|lunch|dinner)\b", ["🍌", "😍", "🔥"]),
+    (r"\b(congrats|passed|won|win|finally)\b", ["🎉", "🏆", "👏"]),
+    (r"\?$", ["🤔", "👀", "🤨"]),
+    (r"\b(sleep|tired|bored)\b", ["😴", "🥱"]),
+]
 IMITATE_SECONDS = 600  # imitation mode switches itself off after 10 minutes...
 IMITATE_MAX = 30  # ...or this many copied messages, to stay polite and within Telegram's rate limits
 PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
@@ -379,7 +391,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/serious – critical, logical mode (stays on until /unserious)\n"
         "/criticize [@someone] – a roast of today's behaviour\n"
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
-        "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
+        "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/mock – reply to a message to mOcK iT\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kittypic · foodporn · carporn – instant pictures\n"
@@ -1064,8 +1076,14 @@ async def ring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, do_quote=True)
 
 
+NICK_STYLES = [
+    "funny", "silly and absurd", "cool and badass", "mildly embarrassing (but affectionate)",
+    "dramatic, like a villain or wrestler title", "cute", "oddly specific", "like a pirate or knight's title",
+]
+
+
 async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Suggest fun nicknames for someone (or the sender), including portmanteaus of their name."""
+    """Give one nickname for someone (or the sender) in a random style, inspired by what they said today."""
     if await ignored_while_off(update):
         return
     if not is_allowed(update):
@@ -1073,12 +1091,12 @@ async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     group = is_group(update)
     msg = update.message
-    target = None
+    target_id, target = update.effective_user.id, None
     if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
-        target = msg.reply_to_message.from_user.first_name  # /nick as a reply -> nickname that person
+        target_id, target = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
     if not target and context.args:
         mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id)) if group else []
-        target = mentioned[0][1] if mentioned else " ".join(context.args)
+        target_id, target = mentioned[0] if mentioned else (None, " ".join(context.args))
     target = target or update.effective_user.first_name
 
     quota, refusal = await use_quota(update.effective_user.id, "nick")
@@ -1086,21 +1104,67 @@ async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(refusal, do_quote=group)
         return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    said = [e["text"] for e in (await todays_log(update.effective_chat.id)) if group and e["uid"] == target_id
+            and not e["text"].startswith("/")][-15:]
+    style = random.choice(NICK_STYLES)
+    use_name = random.random() < 0.3  # mostly NOT a pun on their name
+    if random.random() < 0.4:
+        said = []  # sometimes ignore today's messages entirely, so nicknames don't all riff on the same thing
     try:
         answer, _ = await ask_gemini([{"role": "user", "text": (
-            f"Suggest 5 fun nicknames for {target} in a friendly group chat. Mix styles: one-word, two or three "
-            f"words, and at least two portmanteaus that blend '{target}' with another word. Playful and kind, "
-            "never insulting or sexual. Don't guess their gender: use their name or they/them. Format: a numbered list, each nickname in bold followed by a short reason "
-            "(max 10 words). No intro or outro."
+            f"Invent ONE {style} nickname for {target} in a friendly group chat. "
+            + (f"It may play on the name '{target}'. " if use_name else
+               f"Do NOT base it on the name '{target}' at all; use completely different words. ")
+            + ("Draw inspiration from what they said in the chat today: " + " | ".join(said) + ". " if said else "")
+            + "Be creative and surprising, not generic. Playful teasing is fine; nothing hateful or sexual, "
+            "and don't guess their gender. Reply exactly in this format, nothing else:\n"
+            "<nickname>\n<one short line (max 12 words) explaining why>"
         )}])
     except Exception:
         log.exception("Nickname generation failed")
         answer = None
-    if not answer:
+    lines = [l.strip(" *\"") for l in (answer or "").strip().splitlines() if l.strip()]
+    if not lines:
         await refund(quota)
         await msg.reply_text("My nickname generator is napping, try again in a minute.", do_quote=group)
         return
-    await send_formatted(msg, f"🏷️ **Nickname ideas for {target}:**\n\n{answer.strip()}", do_quote=group)
+    reason = f"\n<i>{html.escape(lines[1])}</i>" if len(lines) > 1 else ""
+    await msg.reply_text(f"🏷️ {html.escape(target)} is now <b>{html.escape(lines[0])}</b>{reason}",
+                         parse_mode=ParseMode.HTML, do_quote=group)
+
+
+async def pick_reaction(text):
+    try:
+        response = await client.aio.models.generate_content(
+            model=REACTION_MODEL,
+            contents=(f"Pick ONE emoji reaction for this group-chat message, from only these: {' '.join(REACTIONS)}\n"
+                      "Usually fitting; about a third of the time pick a playfully funny one (like 🗿 🤡 🌚 🍌 👀 💅). "
+                      f"Reply with just the emoji.\n\nMessage: {text[:500]}"),
+        )
+        choice = (response.text or "").strip()
+        if choice in REACTIONS:
+            return choice
+    except Exception as e:
+        log.info("Reaction model unavailable (%s); using keyword rules", str(e)[:80])
+    for pattern, choices in REACTION_RULES:
+        if re.search(pattern, text, re.IGNORECASE):
+            return random.choice(choices)
+    return random.choice(["👍", "👀", "🔥", "😁", "🗿", "🤔", "💯", "🫡"])
+
+
+async def react_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """React to a random ~25% of group messages (never more than 30%) with a fitting, sometimes funny emoji."""
+    msg, user = update.message, update.effective_user
+    if (not msg or not msg.text or not user or user.is_bot or msg.text.startswith("/") or not is_group(update)
+            or random.random() >= REACTION_RATE):
+        return
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    emoji = await pick_reaction(msg.text)
+    try:
+        await msg.set_reaction(emoji)
+    except Exception as e:  # e.g. the group restricts which reactions are allowed
+        log.info("Could not react with %s: %s", emoji, e)
 
 
 def mocking_case(text):
@@ -1188,7 +1252,7 @@ async def register_commands(app):
         ("unserious", "Back to the usual Laden"),
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
-        ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
+        ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("mock", "Reply to a message to mOcK iT"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
         ("stopimitate", "Stop copying"),
@@ -1304,6 +1368,7 @@ def main():
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, react_randomly), group=2)  # occasional emoji reactions
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
