@@ -1,6 +1,9 @@
 """Telegram bot that forwards messages to Google Gemini and replies with the answer."""
 
+import ast
 import asyncio
+import math
+import operator
 import base64
 import datetime
 import hashlib
@@ -394,6 +397,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/criticize [@someone] – a roast of today's behaviour\n"
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
+        "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
         "/mock – reply to a message to mOcK iT\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kitty · foodporn · carporn – instant pictures\n"
@@ -449,6 +453,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
+        return
+
+    question = NAME_PATTERN.sub("", update.message.text) if NAME_PATTERN else update.message.text
+    maths = calculate(question.replace(f"@{context.bot.username}", "").strip(" ,:"))
+    if maths:  # exact answer from code: no Gemini call, no quota used
+        await update.message.reply_text(f"🧮 {maths[0]} = {maths[1]}", do_quote=group)
         return
 
     quota, refusal = await use_quota(update.effective_user.id, "chat")
@@ -1224,6 +1234,74 @@ async def react_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("Could not react with %s: %s", emoji, e)
 
 
+# ---------- exact arithmetic (computed by code, not guessed by Gemini) ----------
+CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+            ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow,
+            ast.USub: operator.neg, ast.UAdd: operator.pos}
+CALC_FUNCS = {"sqrt": math.sqrt, "abs": abs, "round": round, "log": math.log10, "ln": math.log,
+              "sin": lambda x: math.sin(math.radians(x)), "cos": lambda x: math.cos(math.radians(x)),
+              "tan": lambda x: math.tan(math.radians(x))}
+CALC_CONSTS = {"pi": math.pi, "e": math.e}
+CALC_PREFIX = re.compile(r"^(please\s+)?(what'?s|what\s+is|whats|calculate|calc|compute|solve|how\s+much\s+is)\s+", re.I)
+
+
+def calc_eval(node):
+    if isinstance(node, ast.Expression):
+        return calc_eval(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in CALC_CONSTS:
+        return CALC_CONSTS[node.id]
+    if isinstance(node, ast.UnaryOp) and type(node.op) in CALC_OPS:
+        return CALC_OPS[type(node.op)](calc_eval(node.operand))
+    if isinstance(node, ast.BinOp) and type(node.op) in CALC_OPS:
+        left, right = calc_eval(node.left), calc_eval(node.right)
+        if isinstance(node.op, ast.Pow) and (abs(right) > 1000 or abs(left) > 1e6):
+            raise ValueError("number too big")
+        return CALC_OPS[type(node.op)](left, right)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in CALC_FUNCS
+            and len(node.args) == 1 and not node.keywords):
+        return CALC_FUNCS[node.func.id](calc_eval(node.args[0]))
+    raise ValueError("not arithmetic")
+
+
+def calculate(text):
+    """Return (expression, result) if text is a plain arithmetic question, else None."""
+    expr = shown = CALC_PREFIX.sub("", text.strip()).rstrip(" ?=!.").strip()
+    if not expr or not re.search(r"\d", expr) or not re.search(r"[-+*/x×÷^%()]|sqrt|of", expr, re.I):
+        return None
+    expr = re.sub(r"(\d+(?:\.\d+)?)\s*%\s*of\s*", r"(\1/100)*", expr, flags=re.I)  # 15% of 80
+    expr = (expr.replace("×", "*").replace("÷", "/").replace("^", "**").replace(",", "")
+            .replace("−", "-"))
+    expr = re.sub(r"(?<=[\d)])\s*[xX]\s*(?=[\d(])", "*", expr)  # 12 x 7
+    if re.search(r"[A-Za-z]", re.sub(r"\b(sqrt|abs|round|log|ln|sin|cos|tan|pi|e)\b", "", expr)):
+        return None  # other words -> not pure arithmetic, let Gemini handle it
+    try:
+        result = calc_eval(ast.parse(expr, mode="eval"))
+    except ZeroDivisionError:
+        return shown, "undefined (division by zero)"
+    except Exception:
+        return None
+    if isinstance(result, float):
+        if math.isnan(result) or math.isinf(result):
+            return None
+        result = int(result) if result.is_integer() and abs(result) < 1e15 else float(f"{result:.10g}")
+    return shown, f"{result:,}" if isinstance(result, int) else str(result)
+
+
+async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    expression = " ".join(context.args)
+    answer = calculate(expression) if expression else None
+    if not answer:
+        await update.message.reply_text("Usage: /calc 2+2*3   (also: 15% of 80, sqrt(16), 2^10, 12 x 7)",
+                                        do_quote=is_group(update))
+        return
+    expr, result = answer
+    await update.message.reply_text(f"🧮 {expr} = {result}", do_quote=is_group(update))
+
+
 def mocking_case(text):
     """i DiD nOt Do ThAt – alternate the case of letters, skipping spaces and punctuation."""
     out, upper = [], False
@@ -1310,6 +1388,7 @@ async def register_commands(app):
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
+        ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
         ("mock", "Reply to a message to mOcK iT"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
         ("stopimitate", "Stop copying"),
@@ -1426,6 +1505,7 @@ def main():
     app.add_handler(CommandHandler("noring", noring))
     app.add_handler(CommandHandler("nick", nick))
     app.add_handler(CommandHandler("mock", mock))
+    app.add_handler(CommandHandler("calc", calc))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
