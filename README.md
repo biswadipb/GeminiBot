@@ -10,6 +10,8 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Splits long answers to fit Telegram's 4096-character limit
 - Works in groups: answers when @mentioned or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
+- `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
+- `/imagine` generates pictures (free, via Pollinations.ai)
 - Optional allowlist of groups and/or users
 
 ## Setup
@@ -42,6 +44,7 @@ All settings live in `.env`:
 | `ALLOWED_USER_IDS` | no | – | Comma-separated user IDs allowed anywhere, including private chat |
 | `UPSTASH_REDIS_REST_URL` | no | – | Upstash Redis REST URL, for memory that survives restarts |
 | `UPSTASH_REDIS_REST_TOKEN` | no | – | Upstash Redis REST token |
+| `TAVILY_API_KEY` | no | – | Tavily key for better `/search` results; without it DuckDuckGo is used |
 
 If both allowlists are empty, anyone can use the bot.
 
@@ -49,6 +52,8 @@ If both allowlists are empty, anyone can use the bot.
 
 - `/start`, `/help` – intro
 - `/reset` – forget the conversation
+- `/search <question>` – answer from a web search, with sources
+- `/imagine <description>` – generate a picture
 - `/chatid` – show the current chat's ID and your user ID
 
 In groups, mention the bot (`@YourBot question`) or reply to one of its messages.

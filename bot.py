@@ -1,16 +1,19 @@
 """Telegram bot that forwards messages to Google Gemini and replies with the answer."""
 
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
 import os
+from urllib.parse import quote
 
 import httpx
+from ddgs import DDGS
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -40,25 +43,31 @@ ALLOWED_USERS = {int(u) for u in os.getenv("ALLOWED_USER_IDS", "").split(",") if
 # Optional: Upstash Redis (free) so conversation memory survives restarts. Without it, memory is RAM-only.
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'")  # tolerate pasted quotes
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'")
+# Optional: Tavily key for /search (free at tavily.com). Without it, /search uses DuckDuckGo.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip().strip("\"'")
 
 TELEGRAM_LIMIT = 4096
 MAX_HISTORY = 40  # messages kept per chat (user + model turns)
 MAX_QUOTE = 2000  # max characters taken from a replied-to message
 RETRYABLE = {429, 500, 502, 503, 504}  # rate limited / overloaded / server hiccup
 SKIP_MODEL = {404}  # model not available for this key -> go straight to the next one
+SEARCH_RESULTS = 5
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)  # keep search answers from showing a big link card
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("primp").setLevel(logging.WARNING)  # DuckDuckGo search client
 log = logging.getLogger("gemini-bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 histories = {}  # telegram chat_id -> [{"role": "user"|"model", "text": ...}]; cache of what's in Redis
-redis_http = httpx.AsyncClient(timeout=10) if UPSTASH_URL and UPSTASH_TOKEN else None
+use_redis = bool(UPSTASH_URL and UPSTASH_TOKEN)
+http = httpx.AsyncClient(timeout=120)  # shared by Redis, Tavily and image generation
 
 
 async def redis(*command):
     """Run one Redis command via Upstash's REST API, e.g. redis("GET", "key")."""
-    r = await redis_http.post(UPSTASH_URL, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, json=list(command))
+    r = await http.post(UPSTASH_URL, headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, json=list(command))
     r.raise_for_status()
     return r.json().get("result")
 
@@ -66,7 +75,7 @@ async def redis(*command):
 async def load_history(chat_id):
     if chat_id not in histories:
         history = []
-        if redis_http:
+        if use_redis:
             try:
                 raw = await redis("GET", f"history:{chat_id}")
                 history = json.loads(raw) if raw else []
@@ -77,7 +86,7 @@ async def load_history(chat_id):
 
 
 async def save_history(chat_id):
-    if redis_http:
+    if use_redis:
         try:
             await redis("SET", f"history:{chat_id}", json.dumps(histories.get(chat_id, [])))
         except Exception:
@@ -86,7 +95,7 @@ async def save_history(chat_id):
 
 async def clear_history(chat_id):
     histories.pop(chat_id, None)
-    if redis_http:
+    if use_redis:
         try:
             await redis("DEL", f"history:{chat_id}")
         except Exception:
@@ -151,6 +160,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     how = f"Mention me (@{context.bot.username}) or reply to one of my messages" if is_group(update) else "Send me any message"
     await update.message.reply_text(
         f"Hi! {how} and I'll ask Gemini.\n\n"
+        "/search <question> – answer from the web, with sources\n"
+        "/imagine <description> – generate a picture\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
     )
@@ -186,32 +197,115 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quoted_text = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
         if quoted_text:
             text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
-    if group:
-        # Shared group conversation: tell Gemini who is speaking
-        text = f"{update.effective_user.first_name}: {text}"
-    history = await load_history(chat_id)
-    history.append({"role": "user", "text": text})
-
+    text = speaker(update, text)
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    answer = await chat_turn(chat_id, text)
+    for chunk in split_message(answer):
+        await update.message.reply_text(chunk, do_quote=group)
+
+
+async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
+    """Ask Gemini with the chat's history and remember the exchange. Returns the reply to send.
+
+    gemini_text: what Gemini actually sees for this turn (e.g. the question plus search results),
+    while only `text` is stored in history to keep it small.
+    """
+    history = await load_history(chat_id)
     try:
-        answer, model = await ask_gemini(history)
-        answer = answer or "(Gemini returned an empty response.)"
-        history.append({"role": "model", "text": answer})
+        answer, model = await ask_gemini(history + [{"role": "user", "text": gemini_text or text}])
+        answer = (answer or "(Gemini returned an empty response.)") + answer_suffix
+        history += [{"role": "user", "text": text}, {"role": "model", "text": answer}]
         del history[:-MAX_HISTORY]
         await save_history(chat_id)
         if model != GEMINI_MODEL:
             log.info("Answered with fallback model %s", model)
+        return answer
     except Exception as e:
         log.exception("Gemini request failed")
-        history.pop()  # drop the unanswered question so history stays user/model alternating
-        answer = (
-            "Gemini is busy right now, please try again in a minute."
-            if isinstance(e, errors.APIError) and e.code in RETRYABLE
-            else f"Error talking to Gemini: {e}"
-        )
+        if isinstance(e, errors.APIError) and e.code in RETRYABLE:
+            return "Gemini is busy right now, please try again in a minute."
+        return f"Error talking to Gemini: {e}"
 
+
+def speaker(update: Update, text):
+    """In groups, prefix who is speaking so Gemini can follow a shared conversation."""
+    return f"{update.effective_user.first_name}: {text}" if is_group(update) else text
+
+
+async def web_search(query):
+    """Return [{"title", "url", "content"}] from Tavily if configured, otherwise DuckDuckGo."""
+    if TAVILY_API_KEY:
+        r = await http.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+            json={"query": query, "max_results": SEARCH_RESULTS},
+        )
+        r.raise_for_status()
+        return [{"title": x["title"], "url": x["url"], "content": x.get("content", "")} for x in r.json()["results"]]
+    results = await asyncio.to_thread(lambda: DDGS().text(query, max_results=SEARCH_RESULTS))
+    return [{"title": x["title"], "url": x["href"], "content": x.get("body", "")} for x in results]
+
+
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /search <question>")
+        return
+
+    group = is_group(update)
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    try:
+        results = await web_search(query)
+    except Exception:
+        log.exception("Web search failed")
+        await update.message.reply_text("Web search failed, please try again in a bit.", do_quote=group)
+        return
+    if not results:
+        await update.message.reply_text("No search results found.", do_quote=group)
+        return
+
+    numbered = "\n\n".join(f"[{i}] {r['title']}\n{r['url']}\n{r['content']}" for i, r in enumerate(results, 1))
+    gemini_text = (
+        "Answer the question using the web search results below. Cite sources inline as [1], [2] etc. "
+        "If the results don't contain the answer, say so instead of guessing. "
+        f"Today's date is {datetime.date.today():%B %d, %Y}.\n\n"
+        f"Search results:\n{numbered}\n\nQuestion: {speaker(update, query)}"
+    )
+    sources = "\n\nSources:\n" + "\n".join(f"[{i}] {r['title']} – {r['url']}" for i, r in enumerate(results, 1))
+    answer = await chat_turn(chat_id, speaker(update, f"(web search) {query}"), gemini_text, sources)
     for chunk in split_message(answer):
-        await update.message.reply_text(chunk, do_quote=group)
+        await update.message.reply_text(chunk, do_quote=group, link_preview_options=NO_PREVIEW)
+
+
+async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    prompt = " ".join(context.args)
+    if not prompt:
+        await update.message.reply_text("Usage: /imagine <description of the picture>")
+        return
+
+    group = is_group(update)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    try:
+        # Pollinations.ai: free, no key. A random seed gives a new picture for repeated prompts.
+        r = await http.get(
+            f"https://image.pollinations.ai/prompt/{quote(prompt)}",
+            params={"width": 1024, "height": 1024, "nologo": "true", "seed": int.from_bytes(os.urandom(3))},
+        )
+        r.raise_for_status()
+        if not r.headers.get("content-type", "").startswith("image/"):
+            raise ValueError(f"unexpected response type {r.headers.get('content-type')}")
+    except Exception:
+        log.exception("Image generation failed")
+        await update.message.reply_text("The image service is busy, please try again in a minute.", do_quote=group)
+        return
+    await update.message.reply_photo(r.content, caption=prompt[:1024], do_quote=group)
 
 
 def main():
@@ -220,9 +314,12 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("search", search))
+    app.add_handler(CommandHandler("imagine", imagine))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
-    log.info("Memory: %s", "Upstash Redis (persistent)" if redis_http else "in RAM (lost on restart)")
+    log.info("Search: %s", "Tavily" if TAVILY_API_KEY else "DuckDuckGo")
+    log.info("Memory: %s", "Upstash Redis (persistent)" if use_redis else "in RAM (lost on restart)")
 
     # On hosts like Render, Telegram pushes updates to us (webhook), which also wakes a sleeping
     # free instance. Locally, with no public URL, we poll Telegram instead.
