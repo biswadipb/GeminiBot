@@ -82,9 +82,15 @@ LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
 NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, BOT_NAMES)) + r")\b", re.IGNORECASE) if BOT_NAMES else None
+LORE_INSTRUCTIONS = (
+    "Group lore (running in-jokes about people in this chat). When someone asks about one of these people, "
+    "or asks you to check on them, play along with the lore in character, playfully and sarcastically. "
+    "Treat it as a fun inside joke; stay light, never genuinely hateful."
+)
 SYSTEM_PROMPT = (
     f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
-    "In group chats, messages are prefixed with the sender's name. Keep answers concise unless asked for detail."
+    "In group chats, messages are prefixed with the sender's name; never start your own reply with a name label. "
+    "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail."
 )
 
 TELEGRAM_LIMIT = 4096
@@ -328,7 +334,7 @@ async def ask_gemini(history):
         for attempt in range(RETRIES_PER_MODEL):
             try:
                 response = await client.aio.models.generate_content(
-                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=await system_prompt())
                 )
                 return response.text, model
             except errors.APIError as e:
@@ -353,6 +359,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/photo <search> – find a real photo on the web\n"
         "ship or /ship [@a @b] – play matchmaker 💘 (/noship to opt out)\n"
         "/nick [name] – nickname ideas (or reply to someone with /nick)\n"
+        "kittypic · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -437,7 +444,11 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
     history = await load_history(chat_id)
     try:
         answer, model = await ask_gemini(history + [{"role": "user", "text": gemini_text or text}])
-        answer = (answer or "(Gemini returned an empty response.)") + answer_suffix
+        answer = answer or "(Gemini returned an empty response.)"
+        speaker_name = re.match(r"(\w+): ", text)
+        if speaker_name:  # Gemini sometimes echoes the "Name:" prefix group messages carry
+            answer = re.sub(rf"^\s*\**{re.escape(speaker_name[1])}\**:\**\s*", "", answer)
+        answer += answer_suffix
         history += [{"role": "user", "text": text}, {"role": "model", "text": answer}]
         del history[:-MAX_HISTORY]
         await save_history(chat_id)
@@ -632,17 +643,8 @@ async def download_photo(url):
     return await asyncio.to_thread(to_jpeg, r.content)
 
 
-async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await ignored_while_off(update):
-        return
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("Usage: /photo <what to look for>")
-        return
-
+async def send_web_photo(update: Update, context, query, caption_head=None, shuffle=False):
+    """Search the web for `query` and post the first image that downloads. Counts against the photo limit."""
     group = is_group(update)
     quota, refusal = await use_quota(update.effective_user.id, "photo")
     if refusal:
@@ -654,6 +656,10 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("Image search failed")
         candidates = []
+    if shuffle:  # variety for repeat triggers like "kittypic"; keep small thumbnails as the last resort
+        full, thumbs = candidates[:PHOTO_CANDIDATES], candidates[PHOTO_CANDIDATES:]
+        random.shuffle(full)
+        candidates = full + thumbs
 
     for image_url, title, page_url in candidates:
         try:
@@ -661,12 +667,65 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.info("Skipping image %s: %s", image_url[:80], e)
             continue
-        caption = "\n".join(part for part in (title[:200], f"Source: {page_url or image_url}") if part)
-        await update.message.reply_photo(image, caption=caption[:1024], do_quote=group)
+        head = caption_head if caption_head is not None else html.escape(title[:200])
+        source = html.escape(page_url or image_url)
+        caption = "\n".join(part for part in (head, f'<a href="{source}">Source</a>') if part)
+        try:
+            await update.message.reply_photo(image, caption=caption[:1024], parse_mode=ParseMode.HTML, do_quote=group)
+        except BadRequest:
+            await update.message.reply_photo(image, caption=f"Source: {page_url or image_url}"[:1024], do_quote=group)
         return
 
     await refund(quota)
     await update.message.reply_text("Couldn't find a usable photo for that, try different words.", do_quote=group)
+
+
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Usage: /photo <what to look for>")
+        return
+    await send_web_photo(update, context, query)
+
+
+# Keyword triggers: a message that is just the word posts a fitting web photo
+DISHES = ["ramen", "margherita pizza", "butter chicken", "sushi platter", "cheeseburger", "biryani", "tiramisu",
+          "pad thai", "chocolate lava cake", "tacos al pastor", "croissants", "dim sum", "pasta carbonara",
+          "masala dosa", "pancakes with berries", "bibimbap", "falafel wrap", "cheesecake"]
+CARS = ["Porsche 911", "Lamborghini Huracan", "Ferrari SF90", "Nissan GT-R", "BMW M4", "Ford Mustang",
+        "Toyota Supra", "McLaren 720S", "Audi R8", "Mercedes-AMG GT", "Bugatti Chiron", "Aston Martin DB11",
+        "Chevrolet Corvette", "Koenigsegg Jesko", "Mazda RX-7", "Rolls-Royce Phantom"]
+KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "cat close up portrait", "tabby kitten"]
+KEYWORD_PATTERN = r"(?i)^\s*(kittypic|foodporn|carporn)\s*[!.]*\s*$"
+
+
+async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
+    if not is_allowed(update):
+        return  # stay quiet for one-word triggers outside allowed chats
+    keyword = context.matches[0].group(1).lower()
+    if keyword == "kittypic":
+        await send_web_photo(update, context, random.choice(KITTY_QUERIES), caption_head="🐱", shuffle=True)
+    elif keyword == "carporn":
+        car = random.choice(CARS)
+        await send_web_photo(update, context, f"{car} car photo", caption_head=f"🏎️ <b>{car}</b>", shuffle=True)
+    else:
+        dish = random.choice(DISHES)
+        try:
+            blurb, _ = await ask_gemini([{"role": "user", "text": (
+                f"Write a mouth-watering 1-2 sentence description of {dish} for a food photo caption. "
+                "No hashtags, no quotes, just the description."
+            )}])
+        except Exception:
+            blurb = ""
+        head = f"🍽️ <b>{dish.title()}</b>" + (f"\n{markdown_to_html(blurb.strip())}" if blurb else "")
+        await send_web_photo(update, context, f"{dish} food photography", caption_head=head, shuffle=True)
 
 
 members = {}  # chat_id -> {user_id: {"name", "username", "seen"}}; mirrors Redis hash members:<chat>
@@ -890,6 +949,7 @@ async def register_commands(app):
         ("photo", "Find a real photo on the web"),
         ("ship", "Play matchmaker 💘 (or @ two people)"),
         ("nick", "Suggest nicknames (for you, a name, or reply to someone)"),
+        ("lore", "Group lore (admins: /lore Name: text)"),
         ("usage", "See your daily allowance"),
         ("reset", "Forget the conversation"),
         ("noship", "Never get shipped"),
@@ -900,6 +960,69 @@ async def register_commands(app):
         await app.bot.set_my_commands(commands)
     except Exception:
         log.exception("Could not register the command menu")
+
+
+lore = None  # name -> description; cached copy of the Redis hash "lore"
+
+
+async def load_lore():
+    global lore
+    if lore is None:
+        lore = {}
+        if use_redis:
+            try:
+                flat = await redis("HGETALL", "lore") or []
+                lore = dict(zip(flat[::2], flat[1::2]))
+            except Exception:
+                log.exception("Could not load lore")
+    return lore
+
+
+async def system_prompt():
+    entries = await load_lore()
+    if not entries:
+        return SYSTEM_PROMPT
+    facts = "\n".join(f"- {name}: {text}" for name, text in sorted(entries.items()))
+    return f"{SYSTEM_PROMPT}\n\n{LORE_INSTRUCTIONS}\n{facts}"
+
+
+async def lore_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lore lists entries; admins add with "/lore Name: text" and remove with "/lore -Name"."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    group = is_group(update)
+    entries = await load_lore()
+    arg = update.message.text.split(maxsplit=1)[1].strip() if len(update.message.text.split(maxsplit=1)) > 1 else ""
+    if not arg:
+        listing = "\n".join(f"• <b>{html.escape(n)}</b>: {html.escape(t)}" for n, t in sorted(entries.items()))
+        await update.message.reply_text(listing or "No lore yet. Admins can add some with /lore Name: description",
+                                        parse_mode=ParseMode.HTML, do_quote=group)
+        return
+    if update.effective_user.id not in ADMIN_USERS:
+        await update.message.reply_text("Only admins can change the lore.", do_quote=group)
+        return
+    if arg.startswith("-"):
+        name = arg[1:].strip()
+        match = next((n for n in entries if n.lower() == name.lower()), None)
+        if not match:
+            await update.message.reply_text(f"No lore about {name}.", do_quote=group)
+            return
+        entries.pop(match)
+        if use_redis:
+            await redis("HDEL", "lore", match)
+        await update.message.reply_text(f"Forgot the lore about {match}.", do_quote=group)
+        return
+    if ":" not in arg:
+        await update.message.reply_text("Format: /lore Name: description  (or /lore -Name to remove)", do_quote=group)
+        return
+    name, text = (part.strip() for part in arg.split(":", 1))
+    if not name or not text:
+        await update.message.reply_text("Format: /lore Name: description", do_quote=group)
+        return
+    entries[name] = text[:1000]
+    if use_redis:
+        await redis("HSET", "lore", name, entries[name])
+    await update.message.reply_text(f"Noted. I now know about {name}. 🕵️", do_quote=group)
 
 
 def main():
@@ -919,6 +1042,8 @@ def main():
     app.add_handler(CommandHandler("nick", nick))
     app.add_handler(CommandHandler("yesship", yesship))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ship\s*[!.]*\s*$"), ship))  # plain "ship"
+    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kittypic / foodporn / carporn
+    app.add_handler(CommandHandler("lore", lore_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")

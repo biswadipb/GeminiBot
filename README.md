@@ -78,6 +78,8 @@ If both allowlists are empty, anyone can use the bot.
 - `/chatid` – show the current chat's ID and your user ID
 - `ship` or `/ship` – pair two people active this week who score well (falls back to anyone seen and the group admins); `/ship @a @b` ships specific people; `/noship` / `/yesship` to opt out / back in
 - `/nick [name]` – fun nickname ideas, incl. portmanteaus (for you, a name/@mention, or reply to someone)
+- `kittypic`, `foodporn`, `carporn` – send just the word for a random cat, food (with a tasty description) or car photo
+- `/lore` – list group lore; admins add with `/lore Name: description` and remove with `/lore -Name`. Lore lives in Upstash (not in the repo) and Laden plays along with it.
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
