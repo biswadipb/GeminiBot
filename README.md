@@ -80,7 +80,7 @@ If both allowlists are empty, anyone can use the bot.
 - `ring` or `/ring` – Laden gifts the ring and marries off two people active this week who score well (falls back to anyone seen and the group admins); `/ring @a @b` marries specific people; `/noring` / `/yesring` to opt out / back in
 - `/nick [name]` – one fresh nickname in a random style (funny, silly, cool, embarrassing…), inspired by what they said today
 - `kittypic`, `foodporn`, `carporn` – send just the word for a random cat photo or funny cat meme (TheCatAPI / cataas.com / r/catmemes), food (with a tasty description) or car photo
-- Group lore lives in `lore.json` (name → description); Laden plays along with it. Edit the file and redeploy to change it.
+- Group lore lives in `lore.json` (name → description); Laden plays along with it. Edit the file and redeploy to change it. Lore that shouldn't be public can go in the `LORE_PRIVATE` env var as a JSON object with the same shape.
 - `/serious` – serious mode for the chat: critical, logical, less agreeable answers with reasoning. Stays on (even across restarts) until `/unserious`
 - `/criticize` – a mildly hostile roast of today's behaviour (yours, a replied-to person's, or an @mention's). Uses today's group messages, kept in Upstash for up to 2 days.
 - `/mock` – reply to a message (or `/mock text`) to get it back as "i DiD nOt Do ThAt"

@@ -1341,6 +1341,10 @@ async def load_lore():
         except Exception:
             log.exception("Could not read lore.json")
             lore = {}
+        try:  # extra lore kept out of the public repo, as a JSON object in a Render env var
+            lore.update(json.loads(os.getenv("LORE_PRIVATE", "") or "{}"))
+        except Exception:
+            log.exception("LORE_PRIVATE is not valid JSON; ignoring it")
     return lore
 
 
