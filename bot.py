@@ -9,7 +9,10 @@ import json
 import logging
 import html
 import os
+import random
 import re
+import time
+import zlib
 from urllib.parse import quote
 
 import httpx
@@ -71,8 +74,9 @@ LIMITS = {  # (kind, period) -> max uses
     ("search", "month"): int(os.getenv("LIMIT_SEARCH_MONTHLY", "100")),
     ("imagine", "day"): int(os.getenv("LIMIT_IMAGINE_DAILY", "20")),
     ("photo", "day"): int(os.getenv("LIMIT_PHOTO_DAILY", "20")),
+    ("ship", "day"): int(os.getenv("LIMIT_SHIP_DAILY", "10")),
 }
-LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos"}
+LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", "photo": "photos", "ship": "ships"}
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
@@ -88,6 +92,9 @@ MAX_QUOTE = 2000  # max characters taken from a replied-to message
 RETRYABLE = {429, 500, 502, 503, 504}  # rate limited / overloaded / server hiccup
 SKIP_MODEL = {404}  # model not available for this key -> go straight to the next one
 SEARCH_RESULTS = 5
+ACTIVE_DAYS = 7  # /ship picks from people who spoke in the last week
+SEEN_SAVE_EVERY = 3600  # save a member's "last seen" at most hourly, to keep Redis traffic low
+SHIP_SAMPLES = 8  # random pairs to compare; the best-scoring one gets shipped
 PHOTO_CANDIDATES = 6  # web images to try before giving up (some sites block downloads)
 PHOTO_MAX_BYTES = 15 * 1024 * 1024
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
@@ -343,6 +350,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/search <question> – answer from the web, with sources\n"
         "/imagine <description> – generate a picture\n"
         "/photo <search> – find a real photo on the web\n"
+        "ship or /ship [@a @b] – play matchmaker 💘 (/noship to opt out)\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -659,6 +667,165 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Couldn't find a usable photo for that, try different words.", do_quote=group)
 
 
+members = {}  # chat_id -> {user_id: {"name", "username", "seen"}}; mirrors Redis hash members:<chat>
+noship_ram = set()
+
+
+async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remember who's active in each group, so /ship can pick from real, recent members."""
+    user, chat = update.effective_user, update.effective_chat
+    if not user or user.is_bot or not chat or chat.type not in ("group", "supergroup"):
+        return
+    group_members = await load_members(chat.id)
+    old = group_members.get(user.id)
+    now = int(time.time())
+    if old and now - old["seen"] < SEEN_SAVE_EVERY and old["name"] == user.first_name:
+        return
+    group_members[user.id] = {"name": user.first_name, "username": user.username or "", "seen": now}
+    if use_redis:
+        try:
+            await redis("HSET", f"members:{chat.id}", str(user.id), json.dumps(group_members[user.id]))
+        except Exception:
+            log.exception("Could not save member activity")
+
+
+async def load_members(chat_id):
+    if chat_id not in members:
+        members[chat_id] = {}
+        if use_redis:
+            try:
+                flat = await redis("HGETALL", f"members:{chat_id}") or []
+                members[chat_id] = {int(k): json.loads(v) for k, v in zip(flat[::2], flat[1::2])}
+            except Exception:
+                log.exception("Could not load members")
+    return members[chat_id]
+
+
+async def opted_out(user_id):
+    if use_redis:
+        try:
+            return bool(await redis("SISMEMBER", "noship", str(user_id)))
+        except Exception:
+            log.exception("Could not read opt-outs")
+    return user_id in noship_ram
+
+
+async def set_noship(update: Update, out: bool):
+    user_id = update.effective_user.id
+    (noship_ram.add if out else noship_ram.discard)(user_id)
+    if use_redis:
+        try:
+            await redis("SADD" if out else "SREM", "noship", str(user_id))
+        except Exception:
+            log.exception("Could not save opt-out")
+    await update.message.reply_text(
+        "Got it, I'll never ship you. Send /yesship to opt back in." if out else "You're back in the shipping pool! 💘",
+        do_quote=is_group(update),
+    )
+
+
+async def noship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_noship(update, True)
+
+
+async def yesship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await set_noship(update, False)
+
+
+def ship_score(a, b):
+    """Stable 0-100 compatibility for a pair, so re-rolling the same couple can't change it."""
+    key = "|".join(sorted([str(a).lower(), str(b).lower()]))
+    return zlib.crc32(key.encode()) % 101
+
+
+def couple_name(a, b):
+    return (a[: max(1, (len(a) + 1) // 2)] + b[len(b) // 2 :]).capitalize()
+
+
+async def resolve_ship_targets(update: Update, group_members):
+    """Turn /ship arguments (@usernames, tagged users, or plain names) into [(key, name)]."""
+    msg = update.message
+    by_username = {m["username"].lower(): (uid, m["name"]) for uid, m in group_members.items() if m["username"]}
+    targets = []
+    for entity, text in msg.parse_entities(["mention", "text_mention"]).items():
+        if entity.type == "text_mention" and entity.user:
+            targets.append((entity.user.id, entity.user.first_name))
+        else:
+            uid, name = by_username.get(text.lstrip("@").lower(), (text.lstrip("@"), text.lstrip("@")))
+            targets.append((uid, name))
+    if not targets:  # plain names: /ship Rahul Priya
+        words = msg.text.split()[1:]
+        targets = [(w, w) for w in words if not w.startswith("/")]
+    return targets[:2]
+
+
+async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await ignored_while_off(update):
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    group = is_group(update)
+    if not group:
+        await update.message.reply_text("Shipping works in groups – add me to one! 💘")
+        return
+
+    group_members = await load_members(update.effective_chat.id)
+    is_command = update.message.text.startswith("/")
+    targets = await resolve_ship_targets(update, group_members) if is_command else []
+
+    if len(targets) == 1:
+        await update.message.reply_text("I need two people to ship! Try /ship @someone @someone_else", do_quote=True)
+        return
+    if targets:
+        (a_id, a), (b_id, b) = targets
+        if a_id == b_id:
+            await update.message.reply_text("Self-love is important, but I need two different people 😄", do_quote=True)
+            return
+        for uid, name in targets:
+            if isinstance(uid, int) and await opted_out(uid):
+                await update.message.reply_text(f"{name} has opted out of shipping 🚫💘", do_quote=True)
+                return
+    else:
+        cutoff = time.time() - ACTIVE_DAYS * 86400
+        pool = [(uid, m["name"]) for uid, m in group_members.items() if m["seen"] >= cutoff]
+        pool = [p for p in pool if not await opted_out(p[0])]
+        if len(pool) < 2:
+            await update.message.reply_text(
+                "I don't know enough active people here yet – I need at least two who've chatted this week "
+                "(and haven't used /noship).",
+                do_quote=True,
+            )
+            return
+        pairs = [tuple(random.sample(pool, 2)) for _ in range(SHIP_SAMPLES)]
+        (a_id, a), (b_id, b) = max(pairs, key=lambda p: ship_score(p[0][0], p[1][0]))
+
+    quota, refusal = await use_quota(update.effective_user.id, "ship")
+    if refusal:
+        await update.message.reply_text(refusal, do_quote=True)
+        return
+
+    score = ship_score(a_id, b_id)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    try:
+        line, _ = await ask_gemini([{"role": "user", "text": (
+            f"Write ONE short, funny, wholesome line (max 25 words) for a group-chat 'ship' game about why "
+            f"{a} and {b} would be a {score}% match. Playful and kind; nothing sexual, nothing mean, no hashtags."
+        )}])
+        line = (line or "").strip()
+    except Exception:
+        log.exception("Ship line failed")
+        line = ""
+    line = line or random.choice([
+        "The stars aligned, the memes agreed. 💫",
+        "Two chaotic energies, one shared playlist. 🎧",
+        "Certified group-chat power couple. 👑",
+    ])
+    hearts = "💘" if score >= 75 else "💕" if score >= 50 else "💔" if score < 25 else "🤝"
+    text = f"{hearts} <b>{html.escape(couple_name(a, b))}</b>: {html.escape(a)} + {html.escape(b)} = <b>{score}%</b>\n\n{markdown_to_html(line)}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, do_quote=True)
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -671,7 +838,12 @@ def main():
     app.add_handler(CommandHandler("photo", photo))
     app.add_handler(CommandHandler("on", power_on))
     app.add_handler(CommandHandler("off", power_off_cmd))
+    app.add_handler(CommandHandler("ship", ship))
+    app.add_handler(CommandHandler("noship", noship))
+    app.add_handler(CommandHandler("yesship", yesship))
+    app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ship\s*[!.]*\s*$"), ship))  # plain "ship"
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
     log.info("Limits: %s (admins: %d)", ", ".join(f"{k}/{p}={v or 'unlimited'}" for (k, p), v in LIMITS.items()), len(ADMIN_USERS))
