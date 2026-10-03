@@ -315,7 +315,7 @@ async def cloudflare_image(prompt, seed):
     r = await http.post(
         f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_MODEL}",
         headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
-        json={"prompt": prompt, "steps": 4, "seed": seed},
+        json={"prompt": prompt, "steps": 4},  # this model rejects a seed; output varies anyway
     )
     r.raise_for_status()
     return base64.b64decode(r.json()["result"]["image"])
