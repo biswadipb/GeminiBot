@@ -86,7 +86,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/mock` – reply to a message (or `/mock text`) to get it back as "i DiD nOt Do ThAt"
 - `/imitate text` repeats the text; `/imitate` alone copies every message for 10 minutes (or 30 messages); as a reply it copies only that person; `/stopimitate` ends it
 - Laden reacts to roughly 25% of group messages with a fitting (sometimes funny) emoji. Set `REACTION_RATE` (max 0.3, `0` to disable).
-- About 5% of messages also get a reply of 1–3 emojis (😂 😴 🤡 💦 🌭 🍆 …). Set `EMOJI_REPLY_RATE` (`0` to disable).
+- About 5% of messages also get an emoji reply: usually one emoji repeated (laughs like 😂😂😂 come in bursts, sometimes long ones), occasionally a mixed combo (😏🍆💦). Set `EMOJI_REPLY_RATE` (`0` to disable).
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.

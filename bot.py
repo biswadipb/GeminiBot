@@ -1160,27 +1160,47 @@ def only_emoji(text):
     return 0 < len(text) <= 16 and not re.search(r"[A-Za-z0-9\u0400-\u04FF\u0900-\u097F]", text)
 
 
+LAUGHS = ["😂", "🤣", "💀", "😭"]
+MIXED_EMOJI_SHARE = 0.15  # most emoji replies repeat one emoji; only sometimes mix different ones
+
+
+def repeat_count(emoji):
+    """Laughs come in bursts (sometimes long ones); anything else appears once or a few times."""
+    if emoji in LAUGHS:
+        return random.choices([random.randint(2, 3), random.randint(4, 8), random.randint(9, 15)], weights=[50, 35, 15])[0]
+    return random.choices([1, random.randint(2, 3)], weights=[60, 40])[0]
+
+
 async def emoji_reply_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Answer a random ~5% of group messages with one to three fitting (often cheeky) emojis."""
+    """Answer a random ~5% of group messages with emojis: usually one emoji repeated (laughs in bursts),
+    occasionally a mixed combo."""
     msg, user = update.message, update.effective_user
     if (not msg or not msg.text or not user or user.is_bot or msg.text.startswith("/") or not is_group(update)
             or random.random() >= EMOJI_REPLY_RATE):
         return
     if await ignored_while_off(update) or not is_allowed(update):
         return
+    mixed = random.random() < MIXED_EMOJI_SHARE
+    ask = ("ONE to THREE different emojis" if mixed else
+           "exactly ONE emoji (if it's even slightly funny, a laughing one like 😂 🤣 💀 😭)")
     emojis = ""
     try:
         response = await client.aio.models.generate_content(
             model=REACTION_MODEL,
-            contents=("Reply to this group-chat message with ONE to THREE emojis only, like a cheeky friend would: "
-                      "laughing, sleepy, clown, skull, side-eye, or suggestive food emojis for innuendo, whatever fits best. "
-                      f"Ideas: {' '.join(EMOJI_PALETTE)}. Reply with just the emojis, no words.\n\nMessage: {msg.text[:500]}"),
+            contents=(f"Reply to this group-chat message with {ask}, like a cheeky friend would: laughing, sleepy, "
+                      "clown, skull, side-eye, or suggestive food emojis for innuendo, whatever fits best. "
+                      f"Ideas: {' '.join(EMOJI_PALETTE)}. Reply with just the emoji, no words.\n\nMessage: {msg.text[:500]}"),
         )
-        emojis = (response.text or "").strip()
+        emojis = (response.text or "").strip().replace(" ", "")
     except Exception as e:
         log.info("Emoji reply model unavailable (%s)", str(e)[:80])
     if not only_emoji(emojis):
-        emojis = "".join(random.sample(EMOJI_PALETTE, random.randint(1, 3)))
+        emojis = "".join(random.sample(EMOJI_PALETTE, random.randint(2, 3))) if mixed else random.choice(LAUGHS + EMOJI_PALETTE)
+    if not mixed:
+        single = next((e for e in LAUGHS + EMOJI_PALETTE if emojis.startswith(e)), emojis)
+        if single in LAUGHS:
+            single = random.choices(LAUGHS, weights=[40, 30, 15, 15])[0]  # mostly 😂🤣, sometimes 💀😭
+        emojis = single * repeat_count(single)
     try:
         await msg.reply_text(emojis, do_quote=True)
     except Exception:
