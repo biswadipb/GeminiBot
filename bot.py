@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import decimal
 import math
 import operator
 import base64
@@ -16,6 +17,8 @@ import random
 import re
 import time
 import zlib
+from decimal import Decimal, getcontext
+from fractions import Fraction
 from urllib.parse import quote
 
 import httpx
@@ -1235,58 +1238,130 @@ async def react_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- exact arithmetic (computed by code, not guessed by Gemini) ----------
-CALC_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
-            ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow,
-            ast.USub: operator.neg, ast.UAdd: operator.pos}
-CALC_FUNCS = {"sqrt": math.sqrt, "abs": abs, "round": round, "log": math.log10, "ln": math.log,
-              "sin": lambda x: math.sin(math.radians(x)), "cos": lambda x: math.cos(math.radians(x)),
-              "tan": lambda x: math.tan(math.radians(x))}
-CALC_CONSTS = {"pi": math.pi, "e": math.e}
+# Numbers become exact Fractions (0.1 really is 1/10), so + - * / and integer powers are exact.
+# Things that can't be exact (sqrt(2), logs, pi, fractional powers) use 50-digit Decimals.
+getcontext().prec = 50
+CALC_PI = Decimal("3.14159265358979323846264338327950288419716939937510")
+CALC_FUNCS = {"sqrt", "abs", "round", "log", "ln", "sin", "cos", "tan"}
 CALC_PREFIX = re.compile(r"^(please\s+)?(what'?s|what\s+is|whats|calculate|calc|compute|solve|how\s+much\s+is)\s+", re.I)
 
 
-def calc_eval(node):
-    if isinstance(node, ast.Expression):
-        return calc_eval(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return node.value
-    if isinstance(node, ast.Name) and node.id in CALC_CONSTS:
-        return CALC_CONSTS[node.id]
-    if isinstance(node, ast.UnaryOp) and type(node.op) in CALC_OPS:
-        return CALC_OPS[type(node.op)](calc_eval(node.operand))
-    if isinstance(node, ast.BinOp) and type(node.op) in CALC_OPS:
-        left, right = calc_eval(node.left), calc_eval(node.right)
-        if isinstance(node.op, ast.Pow) and (abs(right) > 1000 or abs(left) > 1e6):
+def to_decimal(x):
+    return Decimal(x.numerator) / Decimal(x.denominator) if isinstance(x, Fraction) else x
+
+
+def exact_sqrt(x):
+    """sqrt that stays an exact Fraction for perfect squares like 16 or 9/4."""
+    if isinstance(x, Fraction) and x >= 0:
+        n, d = math.isqrt(x.numerator), math.isqrt(x.denominator)
+        if n * n == x.numerator and d * d == x.denominator:
+            return Fraction(n, d)
+    if x < 0:
+        raise ValueError("square root of a negative number")
+    return to_decimal(x).sqrt()
+
+
+def calc_pow(base, exp):
+    if isinstance(exp, Fraction) and exp.denominator == 1:
+        if abs(exp) > 1000 or (isinstance(base, Fraction) and abs(base.numerator) > 10**6 and abs(exp) > 100):
             raise ValueError("number too big")
-        return CALC_OPS[type(node.op)](left, right)
+        if base == 0 and exp < 0:
+            raise ZeroDivisionError
+        return base ** int(exp) if isinstance(base, Fraction) else to_decimal(base) ** int(exp)
+    if base < 0:
+        raise ValueError("fractional power of a negative number")
+    return to_decimal(base) ** to_decimal(exp)
+
+
+def calc_eval(node, source):
+    if isinstance(node, ast.Expression):
+        return calc_eval(node.body, source)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return Fraction(ast.get_source_segment(source, node))  # exact from the typed digits, e.g. "0.1" -> 1/10
+    if isinstance(node, ast.Name) and node.id in ("pi", "e"):
+        return CALC_PI if node.id == "pi" else Decimal(1).exp()
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = calc_eval(node.operand, source)
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp):
+        left, right = calc_eval(node.left, source), calc_eval(node.right, source)
+        if isinstance(node.op, ast.Pow):
+            return calc_pow(left, right)
+        if isinstance(left, Decimal) or isinstance(right, Decimal):
+            left, right = to_decimal(left), to_decimal(right)
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+               ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod}
+        if type(node.op) in ops:
+            return ops[type(node.op)](left, right)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in CALC_FUNCS
             and len(node.args) == 1 and not node.keywords):
-        return CALC_FUNCS[node.func.id](calc_eval(node.args[0]))
+        x, name = calc_eval(node.args[0], source), node.func.id
+        if name == "sqrt":
+            return exact_sqrt(x)
+        if name == "abs":
+            return abs(x)
+        if name == "round":  # school rounding: 2.5 -> 3 (Python's round() would give 2)
+            return Fraction(int(to_decimal(x).quantize(Decimal(1), rounding=decimal.ROUND_HALF_UP)))
+        if name in ("log", "ln"):
+            if x <= 0:
+                raise ValueError("log of a non-positive number")
+            return to_decimal(x).log10() if name == "log" else to_decimal(x).ln()
+        trig = {"sin": math.sin, "cos": math.cos, "tan": math.tan}[name]  # degrees; float precision is plenty here
+        return Decimal(f"{trig(math.radians(float(x))):.12g}")
     raise ValueError("not arithmetic")
 
 
+def format_number(value):
+    """Exact integers with commas; terminating decimals exactly; repeating ones as a decimal plus the fraction."""
+    if isinstance(value, int):  # e.g. from // on fractions
+        value = Fraction(value)
+    if isinstance(value, Fraction):
+        if value.denominator == 1:
+            return f"{value.numerator:,}"
+        d = value.denominator
+        for p in (2, 5):
+            while d % p == 0:
+                d //= p
+        decimal = to_decimal(value)
+        if d == 1 and len(str(value.denominator)) <= 30:  # terminates, e.g. 0.1+0.2 = 0.3 exactly
+            return format(decimal.normalize(), "f")
+        approx = tidy(format(decimal, ".15g"))
+        exact = f"{value.numerator}/{value.denominator}"
+        return f"{approx} (exactly {exact})" if value.denominator <= 10**6 else approx
+    if value.is_nan() or value.is_infinite():
+        raise ValueError("undefined")
+    rounded = value.quantize(Decimal(1)) if abs(value) < Decimal(10) ** 30 else None
+    if rounded is not None and abs(value - rounded) < Decimal("1e-40"):  # e.g. ln(e) = 1.000...0 -> 1
+        return f"{int(rounded):,}"
+    return tidy(format(value, ".15g"))
+
+
+def tidy(number):
+    """Drop trailing zeros from a formatted decimal (1.41421356237310 -> 1.4142135623731)."""
+    if "." in number and "e" not in number:
+        number = number.rstrip("0").rstrip(".")
+    return number
+
+
 def calculate(text):
-    """Return (expression, result) if text is a plain arithmetic question, else None."""
+    """Return (expression as typed, exact result text) if text is a plain arithmetic question, else None."""
     expr = shown = CALC_PREFIX.sub("", text.strip()).rstrip(" ?=!.").strip()
-    if not expr or not re.search(r"\d", expr) or not re.search(r"[-+*/x×÷^%()]|sqrt|of", expr, re.I):
+    has_number = re.search(r"\d|\bpi\b|\be\b", expr, re.I)
+    if not expr or not has_number or not (re.search(r"[-+*/x×÷^%()]|sqrt|of|\de", expr, re.I) or expr.lower() == "pi"):
         return None
     expr = re.sub(r"(\d+(?:\.\d+)?)\s*%\s*of\s*", r"(\1/100)*", expr, flags=re.I)  # 15% of 80
-    expr = (expr.replace("×", "*").replace("÷", "/").replace("^", "**").replace(",", "")
-            .replace("−", "-"))
+    expr = (expr.replace("×", "*").replace("÷", "/").replace("^", "**").replace(",", "").replace("−", "-"))
     expr = re.sub(r"(?<=[\d)])\s*[xX]\s*(?=[\d(])", "*", expr)  # 12 x 7
-    if re.search(r"[A-Za-z]", re.sub(r"\b(sqrt|abs|round|log|ln|sin|cos|tan|pi|e)\b", "", expr)):
+    leftover = re.sub(r"\d+(?:\.\d+)?[eE][+-]?\d+", "", expr)  # scientific notation like 1e20 is fine
+    if re.search(r"[A-Za-z]", re.sub(r"\b(sqrt|abs|round|log|ln|sin|cos|tan|pi|e)\b", "", leftover)):
         return None  # other words -> not pure arithmetic, let Gemini handle it
     try:
-        result = calc_eval(ast.parse(expr, mode="eval"))
-    except ZeroDivisionError:
+        result = format_number(calc_eval(ast.parse(expr, mode="eval"), expr))
+    except (ZeroDivisionError, decimal.DivisionByZero, decimal.InvalidOperation):
         return shown, "undefined (division by zero)"
     except Exception:
         return None
-    if isinstance(result, float):
-        if math.isnan(result) or math.isinf(result):
-            return None
-        result = int(result) if result.is_integer() and abs(result) < 1e15 else float(f"{result:.10g}")
-    return shown, f"{result:,}" if isinstance(result, int) else str(result)
+    return shown, result
 
 
 async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
