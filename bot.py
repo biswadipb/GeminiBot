@@ -61,6 +61,8 @@ UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().strip("\"'")  # to
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip().strip("\"'")
 # Optional: Tavily key for /search (free at tavily.com). Without it, /search uses DuckDuckGo.
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip().strip("\"'")
+# Optional: Serper key (free at serper.dev) so /fetch uses real Google Images results; DuckDuckGo is the fallback
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "").strip().strip("\"'")
 # Optional: Pollinations secret key (sk_...) from enter.pollinations.ai for /imagine. Without it, the
 # anonymous endpoint is used (watermarked, stricter rate limits).
 POLLINATIONS_KEY = os.getenv("POLLINATIONS_KEY", "").strip().strip("\"'")
@@ -652,8 +654,33 @@ async def imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(image, caption=prompt[:1024], do_quote=group)
 
 
+async def google_images(query, gif=False):
+    """Google Images results via Serper. Returns [(image_url, title, page_url)]."""
+    r = await http.post(
+        "https://google.serper.dev/images",
+        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+        json={"q": f"{query} gif" if gif else query, "num": 20 if gif else 10},
+        timeout=20,
+    )
+    r.raise_for_status()
+    found = [(i["imageUrl"], i.get("title", ""), i.get("link", "")) for i in r.json().get("images", []) if i.get("imageUrl")]
+    if gif:
+        found = [f for f in found if f[0].lower().split("?")[0].endswith(".gif")]
+    # Google's thumbnails are small but always load, so keep them as a last resort
+    thumbs = [(i["thumbnailUrl"], i.get("title", ""), i.get("link", "")) for i in r.json().get("images", [])
+              if i.get("thumbnailUrl")] if not gif else []
+    return found[:PHOTO_CANDIDATES] + thumbs[:3]
+
+
 async def find_web_images(query, gif=False):
-    """Return [(image_url, title, page_url)] from DuckDuckGo images, falling back to Tavily."""
+    """Return [(image_url, title, page_url)]: Google Images (Serper) if configured, else DuckDuckGo, then Tavily."""
+    if SERPER_API_KEY:
+        try:
+            found = await google_images(query, gif=gif)
+            if found:
+                return found
+        except Exception as e:  # out of credits, bad key, outage... fall back to DuckDuckGo
+            log.warning("Google image search (Serper) failed: %s", e)
     try:
         if gif:  # DuckDuckGo's GIF filter doesn't work; searching "... gif" and keeping .gif URLs does
             results = await asyncio.to_thread(lambda: DDGS().images(f"{query} gif", max_results=20, safesearch="moderate"))
@@ -1594,6 +1621,7 @@ def main():
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
     log.info("Limits: %s (admins: %d)", ", ".join(f"{k}/{p}={v or 'unlimited'}" for (k, p), v in LIMITS.items()), len(ADMIN_USERS))
+    log.info("Image search: %s", "Google (Serper) -> DuckDuckGo" if SERPER_API_KEY else "DuckDuckGo")
     log.info("Search: %s", "Tavily" if TAVILY_API_KEY else "DuckDuckGo")
     log.info("Memory: %s", "Upstash Redis (persistent)" if use_redis else "in RAM (lost on restart)")
 

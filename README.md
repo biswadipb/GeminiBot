@@ -12,7 +12,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Reply to anyone's message and mention the bot, and it reads that message too
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
-- `/fetch` finds real pictures and GIFs on the web (DuckDuckGo images, Tavily fallback)
+- `/fetch` finds real pictures and GIFs on the web (Google Images via Serper if `SERPER_API_KEY` is set, else DuckDuckGo; Tavily fallback)
 - A wholesome `/ring` wedding game with opt-out
 - Optional allowlist of groups and/or users
 - Per-person daily/monthly limits, with admin exemption
@@ -54,6 +54,7 @@ All settings live in `.env`:
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
 | `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word) |
+| `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
 | `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
