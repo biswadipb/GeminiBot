@@ -1406,6 +1406,7 @@ async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 PP_OWNER_ID = 8546107986  # always measures above 4
+PP_OWNER_NAMES = ["biswa"]  # typing any start of these ("b", "bis", "biswa") also means the owner
 PP_WEIGHTS = {0: 4, 1: 8, 2: 23, 3: 25, 4: 22, 5: 7, 6: 4, 7: 2.5, 8: 1.5, 9: 1, 10: 0.6}  # 2-4 common, 6+ rare
 PP_WEIGHTS.update({n: 0.1 for n in range(11, 21)})  # 11-20 very rare
 
@@ -1416,6 +1417,20 @@ def pp_length(user_id):
     return random.choices(list(PP_WEIGHTS), weights=list(PP_WEIGHTS.values()))[0]
 
 
+def match_member_name(typed, group_members):
+    """Turn a typed (possibly partial) name into (user_id, name): the owner if it starts their name,
+    otherwise the one member whose first name or username starts with it."""
+    if not typed:
+        return None
+    owner = group_members.get(PP_OWNER_ID, {})
+    owner_names = PP_OWNER_NAMES + [owner.get("name", "").lower(), owner.get("username", "").lower()]
+    if any(n and n.startswith(typed) for n in owner_names):
+        return PP_OWNER_ID, owner.get("name") or PP_OWNER_NAMES[0].capitalize()
+    matches = {uid: m["name"] for uid, m in group_members.items()
+               if m["name"].lower().startswith(typed) or (m["username"] and m["username"].lower().startswith(typed))}
+    return next(iter(matches.items())) if len(matches) == 1 else None
+
+
 async def ppcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/ppcheck [name or @someone], or as a reply; alone it checks a random member (never the sender)."""
     if await ignored_while_off(update) or not is_allowed(update):
@@ -1424,8 +1439,13 @@ async def ppcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
         target_id, name = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
     elif context.args:
-        mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id)) if is_group(update) else []
-        target_id, name = mentioned[0] if mentioned else (None, " ".join(context.args))
+        group_members = await load_members(update.effective_chat.id) if is_group(update) else {}
+        mentioned = await resolve_ship_targets(update, group_members) if is_group(update) else []
+        typed = " ".join(context.args).lstrip("@").strip().lower()
+        if msg.parse_entities(["mention", "text_mention"]) and mentioned and isinstance(mentioned[0][0], int):
+            target_id, name = mentioned[0]
+        else:
+            target_id, name = match_member_name(typed, group_members) or (None, " ".join(context.args))
     elif is_group(update):  # nobody named: check a random member (never the person asking)
         chat_id = update.effective_chat.id
         pool = [p for p in await ship_pool(chat_id, await load_members(chat_id), context) if p[0] != update.effective_user.id]
