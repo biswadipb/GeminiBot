@@ -404,6 +404,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
         "/mock – reply to a message to mOcK iT\n"
+        "/ppcheck [name] – 8===D\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kitty · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
@@ -1404,6 +1405,31 @@ async def calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧮 {expr} = {result}", do_quote=is_group(update))
 
 
+PP_OWNER_ID = 8546107986  # always measures above 4
+PP_WEIGHTS = {0: 4, 1: 8, 2: 23, 3: 25, 4: 22, 5: 7, 6: 4, 7: 2.5, 8: 1.5, 9: 1, 10: 0.6}  # 2-4 common, 6+ rare
+PP_WEIGHTS.update({n: 0.1 for n in range(11, 21)})  # 11-20 very rare
+
+
+def pp_length(user_id):
+    if user_id == PP_OWNER_ID:
+        return random.choices(range(5, 21), weights=[10, 10, 9, 9, 8, 8, 7, 6, 5, 5, 4, 4, 3, 3, 3, 3])[0]
+    return random.choices(list(PP_WEIGHTS), weights=list(PP_WEIGHTS.values()))[0]
+
+
+async def ppcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ppcheck [name or @someone], or as a reply: 8===D with a random (mostly short) length."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    msg = update.message
+    target_id, name = update.effective_user.id, update.effective_user.first_name
+    if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
+        target_id, name = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
+    elif context.args:
+        mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id)) if is_group(update) else []
+        target_id, name = mentioned[0] if mentioned else (None, " ".join(context.args))
+    await msg.reply_text(f"{name}'s pp is like this\n8{'=' * pp_length(target_id)}D", do_quote=is_group(update))
+
+
 def mocking_case(text):
     """i DiD nOt Do ThAt – alternate the case of letters, skipping spaces and punctuation."""
     out, upper = [], False
@@ -1492,6 +1518,7 @@ async def register_commands(app):
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
         ("mock", "Reply to a message to mOcK iT"),
+        ("ppcheck", "Measure someone's pp (name, @someone, or reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
         ("stopimitate", "Stop copying"),
         ("usage", "See your daily allowance"),
@@ -1609,6 +1636,7 @@ def main():
     app.add_handler(CommandHandler("noring", noring))
     app.add_handler(CommandHandler("nick", nick))
     app.add_handler(CommandHandler("mock", mock))
+    app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
