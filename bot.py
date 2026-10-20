@@ -1588,7 +1588,9 @@ async def unserious(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(register_commands).build()
+    # concurrent_updates: handle messages in parallel, so one slow Gemini call (or an emoji reaction)
+    # doesn't hold up every message behind it
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(register_commands).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
