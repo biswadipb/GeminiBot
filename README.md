@@ -89,7 +89,7 @@ If both allowlists are empty, anyone can use the bot.
 - Laden reacts to roughly 25% of group messages with a fitting (sometimes funny) emoji. Set `REACTION_RATE` (max 0.3, `0` to disable).
 - Very rarely (about 0.1% of messages) Laden replies with emojis: usually one emoji repeated (laughs like 😂😂😂 come in bursts, sometimes long ones), occasionally a mixed combo (😏🍆💦). Set `EMOJI_REPLY_RATE` (`0` to disable).
 - `/calc 2+2*3` or "Laden what's 15% of 80" – exact arithmetic computed by code with Python's `fractions` (0.1+0.2 = 0.3 exactly, 1/3 kept as an exact fraction) and 50-digit `decimal` for roots, logs and pi (no Gemini quota used); supports + - * / ^ %, `x`, `×`, `÷`, `% of`, sqrt, abs, round, log, ln, sin/cos/tan (degrees), pi, e
-- `/ppcheck [name]` (or as a reply) – "name's pp is like this 8===D" with a random length: 2–4 common, 5+ rare, up to 20
+- `/ppcheck [name]` (or as a reply; with no name it picks a random member other than the sender) – "name's pp is like this 8===D" with a random length: 2–4 common, 5+ rare, up to 20
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.

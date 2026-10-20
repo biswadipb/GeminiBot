@@ -404,7 +404,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
         "/mock – reply to a message to mOcK iT\n"
-        "/ppcheck [name] – 8===D\n"
+        "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kitty · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
@@ -1417,16 +1417,24 @@ def pp_length(user_id):
 
 
 async def ppcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ppcheck [name or @someone], or as a reply: 8===D with a random (mostly short) length."""
+    """/ppcheck [name or @someone], or as a reply; alone it checks a random member (never the sender)."""
     if await ignored_while_off(update) or not is_allowed(update):
         return
     msg = update.message
-    target_id, name = update.effective_user.id, update.effective_user.first_name
     if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
         target_id, name = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
     elif context.args:
         mentioned = await resolve_ship_targets(update, await load_members(update.effective_chat.id)) if is_group(update) else []
         target_id, name = mentioned[0] if mentioned else (None, " ".join(context.args))
+    elif is_group(update):  # nobody named: check a random member (never the person asking)
+        chat_id = update.effective_chat.id
+        pool = [p for p in await ship_pool(chat_id, await load_members(chat_id), context) if p[0] != update.effective_user.id]
+        if not pool:
+            await msg.reply_text("I don't know anyone else here yet. Tag someone: /ppcheck @someone", do_quote=True)
+            return
+        target_id, name = random.choice(pool)
+    else:
+        target_id, name = update.effective_user.id, update.effective_user.first_name
     await msg.reply_text(f"{name}'s pp is like this\n8{'=' * pp_length(target_id)}D", do_quote=is_group(update))
 
 
@@ -1518,7 +1526,7 @@ async def register_commands(app):
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
         ("mock", "Reply to a message to mOcK iT"),
-        ("ppcheck", "Measure someone's pp (name, @someone, or reply)"),
+        ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
         ("stopimitate", "Stop copying"),
         ("usage", "See your daily allowance"),
