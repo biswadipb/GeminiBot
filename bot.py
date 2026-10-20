@@ -300,6 +300,58 @@ async def power_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_power(update, off=True)
 
 
+rights_cache = {}  # chat_id -> (expires_at, can_send_text, can_react)
+RIGHTS_TTL = 600  # re-check the bot's own permissions in a group at most every 10 minutes
+
+
+async def bot_rights(update: Update, context):
+    """(can_send_text, can_react) for the bot in this chat, cached. Lets a muted bot skip Gemini calls
+    whose replies Telegram would reject anyway. Fails open if Telegram can't be asked."""
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return True, True
+    cached = rights_cache.get(chat.id)
+    if cached and cached[0] > time.time():
+        return cached[1], cached[2]
+    expires = time.time() + RIGHTS_TTL
+    try:
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if member.status in ("administrator", "creator"):
+            text, react = True, True
+        elif member.status == "restricted":
+            text = bool(member.can_send_messages)
+            react = bool(getattr(member, "can_react_to_messages", True))
+            if member.until_date:  # look again right when the mute ends
+                expires = min(expires, member.until_date.timestamp() + 5)
+        elif member.status == "member":
+            permissions = (await context.bot.get_chat(chat.id)).permissions
+            text = bool(permissions.can_send_messages) if permissions else True
+            react = True
+        else:  # left or kicked
+            text, react = False, False
+    except Exception:
+        log.exception("Could not check the bot's rights in %s", chat.id)
+        rights_cache[chat.id] = (time.time() + 60, True, True)  # assume allowed; try again in a minute
+        return True, True
+    if not text or not react:
+        log.info("Bot rights in %s: send text=%s, react=%s (rechecking in %ds)", chat.id, text, react, int(expires - time.time()))
+    rights_cache[chat.id] = (expires, text, react)
+    return text, react
+
+
+async def muted(update: Update, context) -> bool:
+    """True if the bot can't send text in this chat right now (e.g. an admin muted it)."""
+    return not (await bot_rights(update, context))[0]
+
+
+async def on_error(update, context):
+    """Log errors; if Telegram says we lack rights, forget the cached rights so we re-check right away."""
+    log.error("Error while handling an update", exc_info=context.error)
+    text = str(context.error).lower()
+    if any(w in text for w in ("not enough rights", "chat_write_forbidden", "forbidden")) and getattr(update, "effective_chat", None):
+        rights_cache.pop(update.effective_chat.id, None)
+
+
 def is_allowed(update: Update) -> bool:
     if not ALLOWED_CHATS and not ALLOWED_USERS:
         return True
@@ -455,7 +507,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = is_group(update)
     if group and not addressed_to_bot(update, context.bot.username):
         return  # ordinary group chatter, not for us
-    if await ignored_while_off(update):
+    if await ignored_while_off(update) or await muted(update, context):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -535,7 +587,7 @@ async def web_search(query):
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await ignored_while_off(update):
+    if await ignored_while_off(update) or await muted(update, context):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -914,7 +966,7 @@ async def todays_log(chat_id):
 
 async def criticize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """A mildly hostile critique of someone's behaviour in the chat today (the sender, a reply target or @mention)."""
-    if await ignored_while_off(update):
+    if await ignored_while_off(update) or await muted(update, context):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -1048,7 +1100,7 @@ async def resolve_ship_targets(update: Update, group_members):
 
 async def ring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Laden "gifts the ring" and marries off two people: named ones, or a well-matched random pair."""
-    if await ignored_while_off(update):
+    if await ignored_while_off(update) or await muted(update, context):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -1127,7 +1179,7 @@ NICK_STYLES = [
 
 async def nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Give one nickname for someone (or the sender) in a random style, inspired by what they said today."""
-    if await ignored_while_off(update):
+    if await ignored_while_off(update) or await muted(update, context):
         return
     if not is_allowed(update):
         await update.message.reply_text("Sorry, this bot is private.")
@@ -1221,7 +1273,7 @@ async def emoji_reply_randomly(update: Update, context: ContextTypes.DEFAULT_TYP
     if (not msg or not msg.text or not user or user.is_bot or msg.text.startswith("/") or not is_group(update)
             or random.random() >= EMOJI_REPLY_RATE):
         return
-    if await ignored_while_off(update) or not is_allowed(update):
+    if await ignored_while_off(update) or not is_allowed(update) or await muted(update, context):
         return
     mixed = random.random() < MIXED_EMOJI_SHARE
     ask = ("ONE to THREE different emojis" if mixed else
@@ -1256,13 +1308,15 @@ async def react_randomly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (not msg or not msg.text or not user or user.is_bot or msg.text.startswith("/") or not is_group(update)
             or random.random() >= REACTION_RATE):
         return
-    if await ignored_while_off(update) or not is_allowed(update):
+    if await ignored_while_off(update) or not is_allowed(update) or not (await bot_rights(update, context))[1]:
         return
     emoji = await pick_reaction(msg.text)
     try:
         await msg.set_reaction(emoji)
     except Exception as e:  # e.g. the group restricts which reactions are allowed
         log.info("Could not react with %s: %s", emoji, e)
+        if "forbidden" in str(e).lower() or "rights" in str(e).lower():
+            rights_cache.pop(update.effective_chat.id, None)
 
 
 # ---------- exact arithmetic (computed by code, not guessed by Gemini) ----------
@@ -1676,6 +1730,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
+    app.add_error_handler(on_error)
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")
     log.info("Images: %s", " -> ".join(name for name, _ in image_providers()))
     log.info("Limits: %s (admins: %d)", ", ".join(f"{k}/{p}={v or 'unlimited'}" for (k, p), v in LIMITS.items()), len(ADMIN_USERS))
