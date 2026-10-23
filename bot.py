@@ -534,10 +534,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
     text = speaker(update, text)
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    answer, ok = await chat_turn(chat_id, text)
-    if not ok:
+    await answer_or_retry(update, context, quota, text, do_quote=group)
+
+
+BUSY_REPLY = "The models are busy right now. I'll answer this as soon as they're free, so no need to ask again."
+GAVE_UP_REPLY = "Sorry, the models are still busy, so I couldn't answer this one. Please ask me again a bit later."
+RETRY_DELAYS = [60, 180, 600]  # seconds to wait before each retry (about 15 minutes in total)
+MAX_PENDING_RETRIES = 5  # per chat, so a long outage doesn't end in a flood of late answers
+pending_retries = {}  # chat_id -> questions waiting for a retry
+
+
+async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix="", **send_kwargs):
+    """Answer with Gemini; if every model is busy, say so and keep retrying this same message in the background."""
+    chat_id = update.effective_chat.id
+    answer, ok = await chat_turn(chat_id, text, gemini_text, suffix)
+    if ok or answer != BUSY_REPLY:
+        if not ok:
+            await refund(quota)
+        await send_formatted(update.message, answer, **send_kwargs)
+        return
+    if pending_retries.get(chat_id, 0) >= MAX_PENDING_RETRIES:
         await refund(quota)
-    await send_formatted(update.message, answer, do_quote=group)
+        await update.message.reply_text(GAVE_UP_REPLY, do_quote=True)
+        return
+    await update.message.reply_text(BUSY_REPLY, do_quote=True)
+    pending_retries[chat_id] = pending_retries.get(chat_id, 0) + 1
+    asyncio.create_task(retry_later(update, context, quota, text, gemini_text, suffix, send_kwargs))
+
+
+async def retry_later(update, context, quota, text, gemini_text, suffix, send_kwargs):
+    chat_id = update.effective_chat.id
+    try:
+        for delay in RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            if await ignored_while_off(update) or await muted(update, context):
+                await refund(quota)
+                return  # switched off or muted meanwhile: drop it quietly
+            answer, ok = await chat_turn(chat_id, text, gemini_text, suffix)
+            if ok:
+                send_kwargs["do_quote"] = True  # reply to the original question, so it's clear what this answers
+                await send_formatted(update.message, answer, **send_kwargs)
+                return
+            if answer != BUSY_REPLY:  # a real error, not busyness: report it and stop
+                await refund(quota)
+                await send_formatted(update.message, answer, do_quote=True)
+                return
+        await refund(quota)
+        await update.message.reply_text(GAVE_UP_REPLY, do_quote=True)
+    except Exception:
+        log.exception("Retrying a busy answer failed")
+    finally:
+        pending_retries[chat_id] = max(0, pending_retries.get(chat_id, 1) - 1)
 
 
 async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
@@ -563,7 +610,7 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
     except Exception as e:
         log.exception("Gemini request failed")
         if isinstance(e, errors.APIError) and e.code in RETRYABLE:
-            return "Gemini is busy right now, please try again in a minute.", False
+            return BUSY_REPLY, False
         return f"Error talking to Gemini: {e}", False
 
 
@@ -623,10 +670,8 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Search results:\n{numbered}\n\nQuestion: {speaker(update, query)}"
     )
     sources = "\n\nSources:\n" + "\n".join(f"[{i}] {r['title']} – {r['url']}" for i, r in enumerate(results, 1))
-    answer, ok = await chat_turn(chat_id, speaker(update, f"(web search) {query}"), gemini_text, sources)
-    if not ok:
-        await refund(quota)  # the Tavily search was spent, but don't penalise the user for Gemini being busy
-    await send_formatted(update.message, answer, do_quote=group, link_preview_options=NO_PREVIEW)
+    await answer_or_retry(update, context, quota, speaker(update, f"(web search) {query}"), gemini_text, sources,
+                          do_quote=group, link_preview_options=NO_PREVIEW)
 
 
 async def pollinations_image(prompt, seed):

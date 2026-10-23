@@ -6,7 +6,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 
 - Chat with Gemini directly from Telegram
 - Remembers the conversation per chat (`/reset` to clear it)
-- Retries when Gemini is busy, then falls back to backup models — context carries over
+- Retries when Gemini is busy, then falls back to backup models — context carries over. If every model is busy, it says so and answers the same message later (after 1, 3 and 10 minutes)
 - Splits long answers to fit Telegram's 4096-character limit
 - Works in groups: answers when called by name ("Laden, ..."), @mentioned, or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
