@@ -41,7 +41,7 @@ All settings live in `.env`:
 | `TELEGRAM_BOT_TOKEN` | yes | – | Token from @BotFather |
 | `GEMINI_API_KEY` | yes | – | Key from Google AI Studio |
 | `GEMINI_MODEL` | no | `gemini-3.8-flash` | Main model |
-| `GEMINI_FALLBACK_MODELS` | no | `gemini-3.5-flash,gemini-3.1-flash-lite` | Tried in order when the main model is busy |
+| `GEMINI_FALLBACK_MODELS` | no | `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest,gemini-3.1-flash-lite,gemini-flash-lite-latest` | Tried in order when the main model is busy. A model whose free allowance is used up is skipped until it resets |
 | `GEMINI_RETRIES` | no | `3` | Attempts per model before falling back |
 | `ALLOWED_CHAT_IDS` | no | – | Comma-separated group IDs whose members may use the bot (get it with `/chatid`) |
 | `ALLOWED_USER_IDS` | no | – | Comma-separated user IDs allowed anywhere, including private chat |

@@ -47,10 +47,13 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 # Tried in order when the main model is busy or unavailable
 FALLBACK_MODELS = [
     m.strip()
-    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash,gemini-3.1-flash-lite").split(",")
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", ",".join([
+        "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest",
+        "gemini-3.1-flash-lite", "gemini-flash-lite-latest",  # each model has its own free daily allowance
+    ])).split(",")
     if m.strip()
 ]
-RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "3"))
+RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "2"))  # only for temporary overload (5xx), not used-up quota
 # Optional allowlists (comma-separated). If both are empty, anyone can use the bot.
 # ALLOWED_CHAT_IDS: group IDs whose members may use it (in that group); get one with /chatid.
 # ALLOWED_USER_IDS: individual users who may use it anywhere, including private chat.
@@ -103,18 +106,14 @@ SYSTEM_PROMPT = (
     f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
     "In group chats, messages are prefixed with the sender's name; never start your own reply with a name label. "
     "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail. "
-    "Occasionally (roughly one reply in four at most, never more than one per reply) use an Islamic "
-    "exclamation where it genuinely fits the moment, naturally and respectfully: "
-    "Mashallah (praise or admiration), Inshallah (hopes and future plans), Subhanallah (amazement or wonder), "
-    "Astaghfirullah (something outrageous, shameful or sinful), Alhamdulillah (relief or good news). "
-    "Most replies should have none."
+    "Don't use religious exclamations (such as Mashallah, Inshallah, Subhanallah, Astaghfirullah or Alhamdulillah)."
 )
 SERIOUS_PROMPT = (
     "SERIOUS MODE is on. Prioritise accuracy and critical thinking over being agreeable: don't flatter, don't "
     "simply go along with the user, and challenge weak claims, faulty logic or missing evidence directly. "
     "Give the logical basis for your conclusions when it matters (premises, evidence, step-by-step reasoning), "
     "note uncertainty and the strongest counterarguments, and say plainly when something is wrong. "
-    "Minimise jokes and roleplay; keep exclamations rare."
+    "Minimise jokes and roleplay."
 )
 
 TELEGRAM_LIMIT = 4096
@@ -419,27 +418,54 @@ def split_message(text, limit=TELEGRAM_LIMIT):
     return chunks
 
 
+model_blocked_until = {}  # model -> time it can be tried again (its free allowance ran out, or it doesn't exist)
+
+
+def quota_retry_seconds(error):
+    """How long Google says to wait (e.g. '29703s'), and whether it's the daily allowance that ran out."""
+    details = (getattr(error, "details", None) or {}).get("error", {}).get("details", [])
+    wait = next((float(d["retryDelay"].rstrip("s")) for d in details if str(d.get("retryDelay", "")).endswith("s")), None)
+    daily = any("PerDay" in v.get("quotaId", "") for d in details for v in d.get("violations", []))
+    return wait, daily
+
+
 async def ask_gemini(history, chat_id=None):
-    """Send the conversation to Gemini, retrying busy models and falling back to others."""
+    """Send the conversation to Gemini. Models whose free allowance is used up are skipped instantly until
+    it resets; temporarily overloaded models get one quick retry; then the next model in the chain is tried."""
     contents = [types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in history]
+    config = types.GenerateContentConfig(system_instruction=await system_prompt(chat_id))
+    chain = [GEMINI_MODEL, *FALLBACK_MODELS]
+    available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
     last_error = None
-    for model in [GEMINI_MODEL, *FALLBACK_MODELS]:
+    for model in available:
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                response = await client.aio.models.generate_content(
-                    model=model, contents=contents, config=types.GenerateContentConfig(system_instruction=await system_prompt(chat_id))
-                )
+                response = await client.aio.models.generate_content(model=model, contents=contents, config=config)
+                if model != chain[0]:
+                    log.info("Answered with %s", model)
                 return response.text, model
             except errors.APIError as e:
                 last_error = e
-                if e.code in SKIP_MODEL:
-                    log.warning("%s unavailable (%s), trying next model", model, e.code)
+                if e.code in SKIP_MODEL:  # model doesn't exist for this key
+                    model_blocked_until[model] = time.time() + 86400
+                    log.warning("%s not available (404); skipping it for a day", model)
+                    break
+                if e.code == 429:  # allowance used up: don't retry, go straight to the next model
+                    wait, daily = quota_retry_seconds(e)
+                    wait = min(wait or (3600 if daily else 60), 86400)
+                    model_blocked_until[model] = time.time() + wait
+                    log.warning("%s %s allowance used up; skipping it for %dm", model, "daily" if daily else "per-minute",
+                                wait // 60)
                     break
                 if e.code not in RETRYABLE:
                     raise
-                log.warning("%s busy (%s), attempt %d/%d", model, e.code, attempt + 1, RETRIES_PER_MODEL)
+                log.warning("%s overloaded (%s), attempt %d/%d", model, e.code, attempt + 1, RETRIES_PER_MODEL)
                 if attempt < RETRIES_PER_MODEL - 1:
-                    await asyncio.sleep(2**attempt)  # 1s, 2s, 4s...
+                    await asyncio.sleep(1)
+    if last_error is None:  # every model is cooling down right now
+        soonest = min(model_blocked_until.get(m, 0) for m in chain) - time.time()
+        log.warning("All models are out of allowance; the first frees up in %dm", max(0, soonest) // 60)
+        raise errors.APIError(429, {"error": {"code": 429, "message": "all models cooling down", "status": "RESOURCE_EXHAUSTED"}})
     raise last_error
 
 
@@ -1041,8 +1067,8 @@ async def criticize(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = (
         f"Criticize {target}'s behaviour in this group chat today, with mild hostility: a sharp, sarcastic "
         "dressing-down like a disappointed, slightly irritated friend. 3-5 sentences. Base it on what they actually "
-        "said today (quote or reference specifics); if they said nothing, mock their lurking. Use an exclamation like "
-        "Astaghfirullah if it fits. Keep it a roast between friends: no slurs, nothing about race, religion, gender, "
+        "said today (quote or reference specifics); if they said nothing, mock their lurking. "
+        "Keep it a roast between friends: no slurs, nothing about race, religion, gender, "
         "body or disability, no threats, nothing genuinely cruel, and don't guess their gender.\n\n"
         f"Their {len(theirs)} messages today (out of {len(today)} in the chat):\n{evidence}"
     )
