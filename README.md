@@ -136,6 +136,8 @@ bash deploy/install.sh      # installs and starts the service
 
 The bot then starts on boot and restarts automatically if it crashes.
 
+On Render the bot pings its own public address every 5 minutes so the free instance never sleeps (24/7 uses ~744 of the 750 free hours a month).
+
 - Logs: `journalctl -u geminibot -f`
 - Restart: `sudo systemctl restart geminibot`
 - Update: `git pull && sudo systemctl restart geminibot`

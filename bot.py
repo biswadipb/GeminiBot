@@ -559,8 +559,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if quoted_text:
             text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
     text = speaker(update, text)
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    await answer_or_retry(update, context, quota, text, do_quote=group)
+    async with keep_typing(context, chat_id):
+        await answer_or_retry(update, context, quota, text, do_quote=group)
+
+
+class keep_typing:
+    """Show "typing…" until the block finishes (Telegram hides it after ~5 seconds on its own)."""
+
+    def __init__(self, context, chat_id):
+        self.context, self.chat_id, self.task = context, chat_id, None
+
+    async def _loop(self):
+        while True:
+            try:
+                await self.context.bot.send_chat_action(self.chat_id, ChatAction.TYPING)
+            except Exception:
+                return
+            await asyncio.sleep(4)
+
+    async def __aenter__(self):
+        self.task = asyncio.create_task(self._loop())
+
+    async def __aexit__(self, *exc):
+        self.task.cancel()
 
 
 BUSY_REPLY = "The models are busy right now. I'll answer this as soon as they're free, so no need to ask again."
@@ -983,7 +1004,11 @@ noship_ram = set()
 
 
 async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remember who's active in each group, so /ring can pick from real, recent members."""
+    """Remember who's active (for /ring) and today's messages (for /criticize), without delaying replies."""
+    asyncio.create_task(save_activity(update))
+
+
+async def save_activity(update: Update):
     user, chat = update.effective_user, update.effective_chat
     if not user or user.is_bot or not chat or chat.type not in ("group", "supergroup"):
         return
@@ -1000,6 +1025,20 @@ async def record_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await redis("HSET", f"members:{chat.id}", str(user.id), json.dumps(group_members[user.id]))
         except Exception:
             log.exception("Could not save member activity")
+
+
+SELF_PING_EVERY = 300  # seconds; Render's free plan sleeps after 15 idle minutes
+
+
+async def keep_awake(public_url):
+    """Ping our own public address so Render sees inbound traffic and never puts the bot to sleep
+    (waking up takes up to a minute). The request goes out through Render's front door, so it counts."""
+    while True:
+        await asyncio.sleep(SELF_PING_EVERY)
+        try:
+            await http.get(public_url, timeout=30)
+        except Exception as e:
+            log.info("Self-ping failed: %s", e)
 
 
 chat_logs = {}  # (chat_id, date) -> [{"uid", "name", "text"}]; today's messages, for /criticize
@@ -1657,6 +1696,14 @@ async def imitate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Could not imitate message")
 
 
+async def on_startup(app):
+    await register_commands(app)
+    public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if public_url:
+        asyncio.create_task(keep_awake(public_url))
+        log.info("Keep-awake: pinging %s every %d minutes", public_url, SELF_PING_EVERY // 60)
+
+
 async def register_commands(app):
     """Show Laden's commands in Telegram's "/" menu."""
     commands = [
@@ -1770,7 +1817,7 @@ async def unserious(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     # concurrent_updates: handle messages in parallel, so one slow Gemini call (or an emoji reaction)
     # doesn't hold up every message behind it
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(register_commands).concurrent_updates(True).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("reset", reset))
