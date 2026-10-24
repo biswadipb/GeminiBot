@@ -106,7 +106,9 @@ SYSTEM_PROMPT = (
     f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
     "In group chats, messages are prefixed with the sender's name; never start your own reply with a name label. "
     "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail. "
-    "Don't use religious exclamations (such as Mashallah, Inshallah, Subhanallah, Astaghfirullah or Alhamdulillah)."
+    "Don't use religious exclamations (such as Mashallah, Inshallah, Subhanallah, Astaghfirullah or Alhamdulillah). "
+    "Telegram can't display LaTeX: never write $...$, \\rightarrow, \\frac and the like; use plain Unicode symbols "
+    "instead (→ ← ⇒ × ÷ ± ≈ ≤ ≥ ≠ ° ² ³ √ ∞ π, H₂O, CO₂)."
 )
 SERIOUS_PROMPT = (
     "SERIOUS MODE is on. Prioritise accuracy and critical thinking over being agreeable: don't flatter, don't "
@@ -371,6 +373,49 @@ def addressed_to_bot(update: Update, bot_username: str) -> bool:
     return bool(NAME_PATTERN and NAME_PATTERN.search(msg.text))
 
 
+LATEX_SYMBOLS = {
+    "rightarrow": "→", "to": "→", "leftarrow": "←", "gets": "←", "leftrightarrow": "↔", "Rightarrow": "⇒",
+    "implies": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔", "iff": "⇔", "uparrow": "↑", "downarrow": "↓",
+    "longrightarrow": "⟶", "mapsto": "↦", "times": "×", "div": "÷", "cdot": "·", "pm": "±", "mp": "∓",
+    "approx": "≈", "sim": "~", "simeq": "≃", "equiv": "≡", "neq": "≠", "ne": "≠", "leq": "≤", "le": "≤",
+    "geq": "≥", "ge": "≥", "ll": "≪", "gg": "≫", "propto": "∝", "infty": "∞", "partial": "∂", "nabla": "∇",
+    "sum": "∑", "prod": "∏", "int": "∫", "in": "∈", "notin": "∉", "subset": "⊂", "cup": "∪", "cap": "∩",
+    "forall": "∀", "exists": "∃", "degree": "°", "circ": "°", "checkmark": "✓", "ldots": "…", "dots": "…",
+    "cdots": "⋯", "therefore": "∴", "because": "∵", "angle": "∠", "perp": "⊥", "parallel": "∥",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε", "zeta": "ζ",
+    "eta": "η", "theta": "θ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ",
+    "sigma": "σ", "tau": "τ", "phi": "φ", "varphi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Pi": "Π", "Sigma": "Σ", "Phi": "Φ",
+    "Psi": "Ψ", "Omega": "Ω", "%": "%", "$": "$", "&": "&", "_": "_", "#": "#",
+}
+SUPERSCRIPT = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+SUBSCRIPT = str.maketrans("0123456789+-=()aeoxhklmnpst", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜ")
+
+
+def latex_to_unicode(text):
+    """Turn the LaTeX Gemini sometimes writes ($\\rightarrow$, x^2, \\frac{a}{b}) into plain symbols Telegram can show."""
+    def convert(math):
+        math = re.sub(r"\\(?:text|mathrm|textbf|mathbf|operatorname|mathit)\{([^{}]*)\}", r"\1", math)
+        math = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"\1/\2", math)
+        math = re.sub(r"\\sqrt\{([^{}]*)\}", r"√(\1)", math)
+        math = re.sub(r"\\(?:left|right|big|Big|bigg|Bigg)(?![a-zA-Z])", "", math)
+        math = re.sub(r"\^\{?\\circ\}?", "°", math)  # 45^\circ -> 45°
+        math = re.sub(r"\\([a-zA-Z]+|[%$&_#])", lambda m: LATEX_SYMBOLS.get(m[1], m[1]), math)
+        math = re.sub(r"\^\{([^{}]*)\}", lambda m: m[1].translate(SUPERSCRIPT) if all(c in "0123456789+-=()ni" for c in m[1]) else "^(" + m[1] + ")", math)
+        math = re.sub(r"\^([0-9+\-ni])", lambda m: m[1].translate(SUPERSCRIPT), math)
+        math = re.sub(r"_\{([^{}]*)\}", lambda m: m[1].translate(SUBSCRIPT) if all(c in "0123456789+-=()aeoxhklmnpst" for c in m[1]) else "_" + m[1], math)
+        math = re.sub(r"(?<=[A-Za-z)])_([0-9])", lambda m: m[1].translate(SUBSCRIPT), math)
+        return math.replace("{", "").replace("}", "").replace("\\,", " ").replace("\\ ", " ").replace("~", " ")
+
+    # $...$ / $$...$$ / \(...\) that actually contain maths markup (so prices like "$5 and $10" are left alone)
+    text = re.sub(r"\$\$(.+?)\$\$", lambda m: convert(m[1]), text, flags=re.S)
+    text = re.sub(r"\$([^$\n]{1,300}?)\$", lambda m: convert(m[1]) if re.search(r"[\\^_{}]", m[1]) else m[0], text)
+    text = re.sub(r"\\\((.+?)\\\)", lambda m: convert(m[1]), text)
+    # stray commands outside $...$, e.g. "intestine \rightarrow chylomicrons"
+    return re.sub(r"\\(" + "|".join(sorted((k for k in LATEX_SYMBOLS if k.isalpha()), key=len, reverse=True)) + r")(?![a-zA-Z])",
+                  lambda m: LATEX_SYMBOLS[m[1]], text)
+
+
 def markdown_to_html(text):
     """Convert the Markdown Gemini writes into the small HTML subset Telegram understands."""
     stash = []
@@ -382,6 +427,8 @@ def markdown_to_html(text):
     # Code first, so nothing inside it gets formatted
     text = re.sub(r"```[^\n`]*\n?(.*?)```", lambda m: keep(f"<pre>{html.escape(m[1].strip())}</pre>"), text, flags=re.S)
     text = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m[1])}</code>"), text)
+    text = latex_to_unicode(text)
+    text = re.sub(r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "", text, flags=re.M)  # ---, ***, ___ divider lines
     text = html.escape(text, quote=False)
     text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", lambda m: keep(f'<a href="{m[2]}">{m[1]}</a>'), text)
     text = re.sub(r"^#{1,6}\s+(.+?)\s*#*$", r"<b>\1</b>", text, flags=re.M)        # ### Heading
@@ -390,7 +437,6 @@ def markdown_to_html(text):
     text = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)   # *italic*
     text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)           # _italic_
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"^\s*([-*_])\1{2,}\s*$", "", text, flags=re.M)                     # --- rules
     return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m[1])], text)
 
 
