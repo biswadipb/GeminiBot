@@ -366,11 +366,12 @@ def is_group(update: Update) -> bool:
 def addressed_to_bot(update: Update, bot_username: str) -> bool:
     """In groups, only respond when @mentioned, called by name (e.g. "Laden, ..."), or replied to."""
     msg = update.message
+    text = msg.text or msg.caption or ""
     if msg.reply_to_message and msg.reply_to_message.from_user.username == bot_username:
         return True
-    if f"@{bot_username}".lower() in msg.text.lower():
+    if f"@{bot_username}".lower() in text.lower():
         return True
-    return bool(NAME_PATTERN and NAME_PATTERN.search(msg.text))
+    return bool(NAME_PATTERN and NAME_PATTERN.search(text))
 
 
 LATEX_SYMBOLS = {
@@ -478,7 +479,9 @@ def quota_retry_seconds(error):
 async def ask_gemini(history, chat_id=None):
     """Send the conversation to Gemini. Models whose free allowance is used up are skipped instantly until
     it resets; temporarily overloaded models get one quick retry; then the next model in the chain is tried."""
-    contents = [types.Content(role=m["role"], parts=[types.Part(text=m["text"])]) for m in history]
+    contents = [types.Content(role=m["role"], parts=[*(types.Part.from_bytes(data=data, mime_type=mime)
+                                                         for data, mime in m.get("images", [])),
+                                                       types.Part(text=m["text"])]) for m in history]
     config = types.GenerateContentConfig(system_instruction=await system_prompt(chat_id))
     chain = [GEMINI_MODEL, *FALLBACK_MODELS]
     available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
@@ -585,9 +588,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, this bot is private.")
         return
 
-    question = NAME_PATTERN.sub("", update.message.text) if NAME_PATTERN else update.message.text
+    message_text = update.message.text or update.message.caption or ""
+    question = NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text
     maths = calculate(question.replace(f"@{context.bot.username}", "").strip(" ,:"))
-    if maths:  # exact answer from code: no Gemini call, no quota used
+    if maths and not update.message.photo:  # exact answer from code: no Gemini call, no quota used
         await update.message.reply_text(f"🧮 {maths[0]} = {maths[1]}", do_quote=group)
         return
 
@@ -597,16 +601,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    text = update.message.text.replace(f"@{context.bot.username}", "").strip()
+    text = message_text.replace(f"@{context.bot.username}", "").strip()
     quoted = update.message.reply_to_message
+    images = await message_images(context, update.message)
+    if images:
+        text = f"[Sent a picture]\n{text}"
+    quoted_images = await message_images(context, quoted) if quoted else []
+    images += quoted_images  # includes the bot's own /imagine and /fetch pictures, which history can't hold
     if quoted and quoted.from_user.id != context.bot.id:
         # Bot's own messages are already in history; anyone else's we pass along as context
         quoted_text = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
-        if quoted_text:
-            text = f'[Replying to {quoted.from_user.first_name}\'s message: "{quoted_text}"]\n{text}'
+        if quoted_text or quoted_images:
+            what = f'message: "{quoted_text}"' if quoted_text else "message"
+            if quoted_images:
+                what = "picture (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
+            text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
+    if images and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
+            f"@{context.bot.username}", "").strip(" ,:?!."):
+        text += "\nWhat's in this picture?"  # just the picture (or "Laden" in reply to one)
     text = speaker(update, text)
     async with keep_typing(context, chat_id):
-        await answer_or_retry(update, context, quota, text, do_quote=group)
+        await answer_or_retry(update, context, quota, text, images=images, do_quote=group)
+
+
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # Gemini accepts up to ~20 MB of inline data per request
+
+
+async def message_images(context, msg):
+    """Download a message's photo (or image sent as a file, or static sticker) as [(bytes, mime type)]."""
+    if msg.photo:
+        # Telegram offers several sizes; the largest up to ~1600px is plenty for Gemini and quicker to send
+        sizes = sorted(msg.photo, key=lambda p: p.width * p.height)
+        file_id, mime = next((p for p in reversed(sizes) if max(p.width, p.height) <= 1600), sizes[0]).file_id, "image/jpeg"
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        if (msg.document.file_size or 0) > MAX_IMAGE_BYTES:
+            return []
+        file_id, mime = msg.document.file_id, msg.document.mime_type
+    elif msg.sticker and not (msg.sticker.is_animated or msg.sticker.is_video):
+        file_id, mime = msg.sticker.file_id, "image/webp"
+    else:
+        return []
+    try:
+        file = await context.bot.get_file(file_id)
+        return [(bytes(await file.download_as_bytearray()), mime)]
+    except Exception:
+        log.exception("Could not download a picture")
+        return []
 
 
 class keep_typing:
@@ -637,10 +677,10 @@ MAX_PENDING_RETRIES = 5  # per chat, so a long outage doesn't end in a flood of 
 pending_retries = {}  # chat_id -> questions waiting for a retry
 
 
-async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix="", **send_kwargs):
+async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix="", images=(), **send_kwargs):
     """Answer with Gemini; if every model is busy, say so and keep retrying this same message in the background."""
     chat_id = update.effective_chat.id
-    answer, ok = await chat_turn(chat_id, text, gemini_text, suffix)
+    answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, images)
     if ok or answer != BUSY_REPLY:
         if not ok:
             await refund(quota)
@@ -652,10 +692,10 @@ async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix
         return
     await update.message.reply_text(BUSY_REPLY, do_quote=True)
     pending_retries[chat_id] = pending_retries.get(chat_id, 0) + 1
-    asyncio.create_task(retry_later(update, context, quota, text, gemini_text, suffix, send_kwargs))
+    asyncio.create_task(retry_later(update, context, quota, text, gemini_text, suffix, images, send_kwargs))
 
 
-async def retry_later(update, context, quota, text, gemini_text, suffix, send_kwargs):
+async def retry_later(update, context, quota, text, gemini_text, suffix, images, send_kwargs):
     chat_id = update.effective_chat.id
     try:
         for delay in RETRY_DELAYS:
@@ -663,7 +703,7 @@ async def retry_later(update, context, quota, text, gemini_text, suffix, send_kw
             if await ignored_while_off(update) or await muted(update, context):
                 await refund(quota)
                 return  # switched off or muted meanwhile: drop it quietly
-            answer, ok = await chat_turn(chat_id, text, gemini_text, suffix)
+            answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, images)
             if ok:
                 send_kwargs["do_quote"] = True  # reply to the original question, so it's clear what this answers
                 await send_formatted(update.message, answer, **send_kwargs)
@@ -680,15 +720,16 @@ async def retry_later(update, context, quota, text, gemini_text, suffix, send_kw
         pending_retries[chat_id] = max(0, pending_retries.get(chat_id, 1) - 1)
 
 
-async def chat_turn(chat_id, text, gemini_text=None, answer_suffix=""):
+async def chat_turn(chat_id, text, gemini_text=None, answer_suffix="", images=()):
     """Ask Gemini with the chat's history and remember the exchange. Returns (reply, succeeded).
 
     gemini_text: what Gemini actually sees for this turn (e.g. the question plus search results),
-    while only `text` is stored in history to keep it small.
+    while only `text` is stored in history to keep it small. Pictures are sent for this turn only.
     """
     history = await load_history(chat_id)
     try:
-        answer, model = await ask_gemini(history + [{"role": "user", "text": gemini_text or text}], chat_id)
+        turn = {"role": "user", "text": gemini_text or text, "images": list(images)}
+        answer, model = await ask_gemini(history + [turn], chat_id)
         answer = answer or "(Gemini returned an empty response.)"
         speaker_name = re.match(r"(\w+): ", text)
         if speaker_name:  # Gemini sometimes echoes the "Name:" prefix group messages carry
@@ -1892,7 +1933,8 @@ def main():
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    pictures = filters.PHOTO | filters.Document.IMAGE  # stickers are only read when someone replies to one
+    app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     app.add_error_handler(on_error)
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")

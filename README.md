@@ -10,6 +10,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Splits long answers to fit Telegram's 4096-character limit
 - Works in groups: answers when called by name ("Laden, ..."), @mentioned, or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
+- Reads pictures: send a photo with a caption (in groups, call Laden in the caption), or reply to a photo, picture file or sticker with "Laden what's this?"
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
 - `/fetch` finds real pictures and GIFs on the web (Google Images via Serper if `SERPER_API_KEY` is set, else DuckDuckGo; Tavily fallback)
