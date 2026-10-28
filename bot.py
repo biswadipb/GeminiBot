@@ -14,8 +14,11 @@ import json
 import logging
 import html
 import os
+import platform
 import random
 import re
+import shutil
+import tarfile
 import time
 import zlib
 from decimal import Decimal, getcontext
@@ -23,6 +26,7 @@ from fractions import Fraction
 from urllib.parse import parse_qsl, quote
 
 import chess
+import chess.engine
 import httpx
 import tornado.web
 from ddgs import DDGS
@@ -111,7 +115,8 @@ SYSTEM_PROMPT = (
     "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail. "
     "Don't use religious exclamations (such as Mashallah, Inshallah, Subhanallah, Astaghfirullah or Alhamdulillah). "
     "Telegram can't display LaTeX: never write $...$, \\rightarrow, \\frac and the like; use plain Unicode symbols "
-    "instead (→ ← ⇒ × ÷ ± ≈ ≤ ≥ ≠ ° ² ³ √ ∞ π, H₂O, CO₂)."
+    "instead (→ ← ⇒ × ÷ ± ≈ ≤ ≥ ≠ ° ² ³ √ ∞ π, H₂O, CO₂). Telegram can't display tables either: never use Markdown "
+    "tables; for comparisons, give each item a bold name followed by short bullet points."
 )
 SERIOUS_PROMPT = (
     "SERIOUS MODE is on. Prioritise accuracy and critical thinking over being agreeable: don't flatter, don't "
@@ -420,6 +425,40 @@ def latex_to_unicode(text):
                   lambda m: LATEX_SYMBOLS[m[1]], text)
 
 
+TABLE_DIVIDER = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+def table_cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def tables_to_lists(text):
+    """Telegram can't show tables, so turn each Markdown table row into a bold title with bullet points."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        if "|" in lines[i] and i + 1 < len(lines) and TABLE_DIVIDER.match(lines[i + 1]):
+            piped = lines[i].lstrip().startswith("|")  # then every row starts with "|" too
+            header, rows, i = table_cells(lines[i]), [], i + 2
+            while i < len(lines) and (lines[i].lstrip().startswith("|") if piped
+                                      else len(table_cells(lines[i])) == len(header)):
+                rows.append(table_cells(lines[i]))
+                i += 1
+            for row in rows:
+                title = row[0].replace("**", "") if row else ""
+                if len(header) == 2:  # two columns read best as "Name: value"
+                    out.append(f"• **{title}**: {row[1] if len(row) > 1 else ''}")
+                    continue
+                out.append(f"**{title}**")
+                out += [f"• {label.replace('**', '')}: {cell}" for label, cell in zip(header[1:], row[1:]) if cell]
+                out.append("")
+            if out and out[-1] == "":
+                out.pop()
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def markdown_to_html(text):
     """Convert the Markdown Gemini writes into the small HTML subset Telegram understands."""
     stash = []
@@ -431,6 +470,7 @@ def markdown_to_html(text):
     # Code first, so nothing inside it gets formatted
     text = re.sub(r"```[^\n`]*\n?(.*?)```", lambda m: keep(f"<pre>{html.escape(m[1].strip())}</pre>"), text, flags=re.S)
     text = re.sub(r"`([^`\n]+)`", lambda m: keep(f"<code>{html.escape(m[1])}</code>"), text)
+    text = tables_to_lists(text)
     text = latex_to_unicode(text)
     text = re.sub(r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "", text, flags=re.M)  # ---, ***, ___ divider lines
     text = html.escape(text, quote=False)
@@ -533,7 +573,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
-        "/chessmatch [@someone] – play chess (or leave the slot open)\n"
+        "/chessmatch [@someone] – play chess (or leave the slot open); /chessmatch bot 1-8 to play Laden\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -1850,6 +1890,161 @@ def chess_pgn(game, board):
     return " ".join(parts + [game.get("result") or "*"])
 
 
+# Laden's chess engine: Stockfish (open source), downloaded on first use unless STOCKFISH_PATH points to one
+STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "")
+STOCKFISH_DOWNLOAD = "https://github.com/official-stockfish/Stockfish/releases/latest/download/"
+ENGINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines")
+# level -> (Stockfish "Skill Level" 0-20, max search depth, max seconds per move); roughly like lichess's levels
+CHESS_BOT_LEVELS = {1: (0, 1, 0.05), 2: (3, 2, 0.1), 3: (6, 3, 0.15), 4: (9, 5, 0.2),
+                    5: (11, 7, 0.3), 6: (14, 9, 0.4), 7: (17, 12, 0.6), 8: (20, 18, 1.0)}
+CHESS_BOT_DEFAULT_LEVEL = 3
+CHESS_BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
+stockfish_path = None
+engine = None
+engine_setup_lock = asyncio.Lock()  # one download/start at a time
+engine_lock = asyncio.Lock()  # one search at a time (the engine is shared by all games)
+
+
+def stockfish_asset():
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x86-64"
+    if platform.system() == "Darwin":
+        return "stockfish-macos-universal"
+    if platform.system() == "Linux":
+        return f"stockfish-linux-{arch}-universal"
+    return None
+
+
+async def find_stockfish():
+    """Path to a Stockfish binary: STOCKFISH_PATH, one on the PATH, or the official release (downloaded once)."""
+    global stockfish_path
+    async with engine_setup_lock:
+        if stockfish_path:
+            return stockfish_path
+        asset = stockfish_asset()
+        local = os.path.join(ENGINE_DIR, asset or "stockfish")
+        path = STOCKFISH_PATH or shutil.which("stockfish") or (local if os.path.exists(local) else None)
+        if not path and asset:
+            log.info("Downloading Stockfish (%s)…", asset)
+            os.makedirs(ENGINE_DIR, exist_ok=True)
+            archive = local + ".tar.gz"
+            try:
+                async with http.stream("GET", STOCKFISH_DOWNLOAD + asset + ".tar.gz", follow_redirects=True,
+                                       timeout=300) as r:
+                    r.raise_for_status()
+                    with open(archive, "wb") as f:
+                        async for chunk in r.aiter_bytes(1 << 20):
+                            f.write(chunk)
+                await asyncio.to_thread(extract_stockfish, archive, asset, local)
+                path = local
+                log.info("Stockfish ready")
+            except Exception:
+                log.exception("Could not download Stockfish; Laden will play on instinct")
+            finally:
+                if os.path.exists(archive):
+                    os.remove(archive)
+        stockfish_path = path
+        return path
+
+
+def extract_stockfish(archive, asset, target):
+    with tarfile.open(archive) as tar:
+        member = next(m for m in tar.getmembers() if m.isfile() and os.path.basename(m.name) == asset)
+        with tar.extractfile(member) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    os.chmod(target, 0o755)
+
+
+async def get_engine():
+    global engine
+    if engine is None:
+        path = await find_stockfish()
+        if not path:
+            return None
+        async with engine_setup_lock:
+            if engine is None:
+                _, engine = await chess.engine.popen_uci(path)
+                await engine.configure({"Threads": 1, "Hash": 16})  # Render's free instance is small
+    return engine
+
+
+def instinct_move(board):
+    """No engine available: mate if possible, else the juiciest capture or a check, else anything."""
+    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+
+    def score(move):
+        board.push(move)
+        mate, check = board.is_checkmate(), board.is_check()
+        board.pop()
+        taken = board.piece_type_at(move.to_square) if board.is_capture(move) else None
+        return (mate, values.get(taken, 0), check, random.random())
+
+    return max(board.legal_moves, key=score)
+
+
+async def engine_move(board, level):
+    global engine
+    skill, depth, seconds = CHESS_BOT_LEVELS[level]
+    try:
+        eng = await get_engine()
+        if eng:
+            async with engine_lock:
+                await eng.configure({"Skill Level": skill})
+                result = await eng.play(board, chess.engine.Limit(depth=depth, time=seconds))
+            if result.move:
+                return result.move
+    except Exception:
+        log.exception("Stockfish failed; restarting it next time")
+        engine = None
+    return instinct_move(board)
+
+
+def is_bot_turn(game, board):
+    bot_color = next((c for c in ("white", "black") if (game.get(c) or {}).get("bot")), None)
+    return bot_color is not None and (bot_color == "white") == board.turn
+
+
+async def play_bot_move(game, board):
+    """If it's Laden's turn in a game against it, make its move (and end the game if that finishes it)."""
+    if game["status"] != "playing" or not is_bot_turn(game, board):
+        return
+    move = await engine_move(board, game["bot_level"])
+    board.push(move)
+    game["moves"].append(move.uci())
+    outcome = board.outcome(claim_draw=True)
+    if outcome:
+        await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
+
+
+def bot_level_from(words):
+    """('bot', '5') -> 5; None if these words don't ask for a game against Laden."""
+    words = [w.lower().lstrip("@") for w in words]
+    if not words or words[0] not in CHESS_BOT_WORDS:
+        return None
+    level = next((int(w) for w in words[1:] if w.isdigit()), CHESS_BOT_DEFAULT_LEVEL)
+    return min(max(level, 1), 8)
+
+
+async def start_bot_game(update, context, level):
+    msg, user, chat = update.message, update.effective_user, update.effective_chat
+    me = {"id": user.id, "name": user.full_name}
+    laden = {"id": context.bot.id, "name": f"Laden 🤖 (level {level})", "bot": True}
+    my_color = random.choice(["white", "black"])
+    game = {"id": base64.urlsafe_b64encode(os.urandom(9)).decode(), "chat_id": chat.id, "message_id": None,
+            "creator": user.id, "invited": None, "bot_level": level,
+            "white": me if my_color == "white" else laden, "black": laden if my_color == "white" else me,
+            "moves": [], "status": "playing", "result": None, "reason": None, "draw_offer": None,
+            "created": int(time.time())}
+    text = (f"♟ <b>{html.escape(user.full_name)}</b> ({my_color.capitalize()}) takes on <b>Laden 🤖</b> "
+            f"at level {level}/8 (Stockfish).\n\nMoves stay private until the game ends; then I'll post "
+            "the result and the notation here.")
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game["id"]))]])
+    sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=button, do_quote=is_group(update))
+    game["message_id"] = sent.message_id
+    await play_bot_move(game, chess.Board())  # Laden opens when it has White
+    await save_game(game)
+
+
 async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/chessmatch [@someone | name], or as a reply: start a game and post a button that opens the board."""
     if await ignored_while_off(update) or await muted(update, context):
@@ -1865,8 +2060,17 @@ async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              do_quote=True)
         return
 
-    invited = None
     quoted = msg.reply_to_message
+    level = bot_level_from(context.args)
+    if quoted and quoted.from_user and quoted.from_user.id == context.bot.id and not context.args:
+        level = CHESS_BOT_DEFAULT_LEVEL  # /chessmatch as a reply to Laden
+    if level is None and context.args and context.args[0].lstrip("@").lower() == context.bot.username.lower():
+        level = bot_level_from(["bot", *context.args[1:]])
+    if level is not None:
+        await start_bot_game(update, context, level)
+        return
+
+    invited = None
     if quoted and quoted.from_user and not quoted.from_user.is_bot:
         invited = {"id": quoted.from_user.id, "name": quoted.from_user.full_name}
     elif context.args:
@@ -1888,9 +2092,6 @@ async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                      do_quote=True)
                 return
             invited = {"id": found[0], "name": found[1]}
-        if invited.get("id") == context.bot.id or (invited.get("username") or "") == context.bot.username.lower():
-            await msg.reply_text("I'd win too easily. Pick a human. ♟", do_quote=True)
-            return
     if invited and invited.get("id") == user.id:
         await msg.reply_text("Playing yourself? Leave the slot open instead.", do_quote=True)
         return
@@ -1967,7 +2168,7 @@ def chess_view(game, user_id):
     """What this person may see. Only the two players see the board while the game is on."""
     color = player_color(game, user_id)
     names = {c: (game.get(c) or {}).get("name") for c in ("white", "black")}
-    view = {"status": game["status"], "version": game.get("version", 0), "you": color}
+    view = {"status": game["status"], "version": game.get("version", 0), "you": color, "bot": bool(game.get("bot_level"))}
     if game["status"] == "waiting":
         invited = game.get("invited")
         view.update(host=names["white"] or names["black"], invited=invited and invited["name"],
@@ -2051,8 +2252,11 @@ async def chess_action(body):
                 outcome = board.outcome(claim_draw=True)
                 if outcome:
                     await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
+                await play_bot_move(game, board)
             elif action == "resign":
                 await finish_game(game, board, "0-1" if color == "white" else "1-0", "resignation")
+            elif action == "offer_draw" and game.get("bot_level"):
+                return 400, {"error": "Laden doesn't do draws. Play on or resign!", **chess_view(game, uid)}
             elif action == "offer_draw":
                 game["draw_offer"] = uid
             elif action == "accept_draw" and game.get("draw_offer") not in (None, uid):
@@ -2134,6 +2338,7 @@ async def run_web(app, public_url):
 
 async def on_startup(app):
     await register_commands(app)
+    asyncio.create_task(find_stockfish())  # fetch the chess engine now, so the first game against Laden is quick
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if public_url:
         asyncio.create_task(keep_awake(public_url))
@@ -2153,7 +2358,7 @@ async def register_commands(app):
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
-        ("chessmatch", "Play chess (@someone, reply, or leave it open)"),
+        ("chessmatch", "Play chess: @someone, open slot, or 'bot 1-8' vs Laden"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),

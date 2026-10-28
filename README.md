@@ -7,6 +7,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Chat with Gemini directly from Telegram
 - Remembers the conversation per chat (`/reset` to clear it)
 - Retries when Gemini is busy, then falls back to backup models — context carries over. If every model is busy, it says so and answers the same message later (after 1, 3 and 10 minutes)
+- Markdown from Gemini is shown as Telegram formatting; tables (which Telegram can't display) become a bold name per row with bullet points
 - Splits long answers to fit Telegram's 4096-character limit
 - Works in groups: answers when called by name ("Laden, ..."), @mentioned, or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
@@ -57,6 +58,7 @@ All settings live in `.env`:
 | `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word) |
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
 | `CHESS_APP_NAME` | no | – | Short name of a BotFather `/newapp` Mini App for `/chessmatch`; empty uses the bot's Main Mini App |
+| `STOCKFISH_PATH` | no | – | Path to a Stockfish binary for `/chessmatch bot`; empty = download the official release on first start |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
 | `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
@@ -93,6 +95,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/calc 2+2*3` or "Laden what's 15% of 80" – exact arithmetic computed by code with Python's `fractions` (0.1+0.2 = 0.3 exactly, 1/3 kept as an exact fraction) and 50-digit `decimal` for roots, logs and pi (no Gemini quota used); supports + - * / ^ %, `x`, `×`, `÷`, `% of`, sqrt, abs, round, log, ln, sin/cos/tan (degrees), pi, e
 - `/ppcheck [name]` (or as a reply; with no name it picks a random member other than the sender) – "name's pp is like this 8===D" with a random length: 2–4 common, 5+ rare, up to 20
 - `/chessmatch [@someone | name]` (or as a reply) – a chess game in a Telegram Mini App. Invite someone or leave the slot open for any group member. Only the two players can see the board while it's on; when it ends, Laden posts the winner and the full notation in the group. Players are tied to their user IDs and shown by their Telegram profile names. Needs a one-time BotFather setup (see below)
+- `/chessmatch bot [1-8]` (or `laden 5`, `@DaLadenBot 5`, or as a reply to Laden) – play Laden 🤖, powered by the open-source [Stockfish](https://stockfishchess.org) engine. Level 1 is a beginner, 8 is very strong (default 3). The engine is downloaded once on first start (set `STOCKFISH_PATH` to use your own); if it's unavailable Laden plays a simple capture-happy fallback. No draw offers against Laden. Board pieces are the cburnett set (GPLv2+) by Colin M.L. Burnett, as on lichess.org
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
