@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Laden Chess</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Symbols+2&display=block" rel="stylesheet">
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #1d1d1f);
+    --hint: var(--tg-theme-hint-color, #8a8a8e);
+    --button: var(--tg-theme-button-color, #2f7de1);
+    --button-text: var(--tg-theme-button-text-color, #ffffff);
+    --card: var(--tg-theme-secondary-bg-color, #f2f2f5);
+    --light: #eedab6;
+    --dark: #b48764;
+    --select: rgba(255, 214, 0, .55);
+    --last: rgba(155, 199, 0, .45);
+    --danger: #d64545;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 12px 16px 24px; background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    user-select: none; -webkit-user-select: none;
+  }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  .player { display: flex; align-items: center; gap: 8px; padding: 8px 2px; font-weight: 600; }
+  .player .dot { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--hint); }
+  .player .dot.white { background: #fff; }
+  .player .dot.black { background: #222; }
+  .player .turn { margin-left: auto; font-size: 13px; font-weight: 500; color: var(--button); }
+  .board {
+    display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; aspect-ratio: 1;
+    border-radius: 6px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+  }
+  .sq { position: relative; display: flex; align-items: center; justify-content: center; }
+  .sq.l { background: var(--light); }
+  .sq.d { background: var(--dark); }
+  .sq.last::before, .sq.sel::before { content: ""; position: absolute; inset: 0; }
+  .sq.last::before { background: var(--last); }
+  .sq.sel::before { background: var(--select); }
+  .sq.check { background: radial-gradient(circle, #ff3b30 0%, rgba(255,59,48,.5) 45%, transparent 75%), var(--dark); }
+  .sq.l.check { background: radial-gradient(circle, #ff3b30 0%, rgba(255,59,48,.5) 45%, transparent 75%), var(--light); }
+  .sq.target::after {
+    content: ""; position: absolute; width: 30%; height: 30%; border-radius: 50%; background: rgba(0,0,0,.22);
+  }
+  .sq.target.capture::after { width: 88%; height: 88%; background: none; border: 4px solid rgba(0,0,0,.22); }
+  .coord { position: absolute; font-size: 10px; font-weight: 700; opacity: .7; pointer-events: none; }
+  .coord.file { right: 3px; bottom: 1px; }
+  .coord.rank { left: 3px; top: 1px; }
+  .sq.l .coord { color: var(--dark); }
+  .sq.d .coord { color: var(--light); }
+  .piece {
+    position: relative; z-index: 1; font-family: "Noto Sans Symbols 2", "Segoe UI Symbol", "DejaVu Sans", serif;
+    font-size: min(9.5vw, 46px); line-height: 1; pointer-events: none;
+  }
+  .piece.w { color: #fff; text-shadow: 0 0 1px #000, 0 0 1px #000, 0 0 2px #000, 0 1px 1px rgba(0,0,0,.6); }
+  .piece.b { color: #1a1a1a; text-shadow: 0 0 1px #fff4, 0 1px 1px rgba(0,0,0,.4); }
+  .status { min-height: 22px; margin: 10px 2px 4px; text-align: center; color: var(--hint); font-size: 14px; }
+  .status.strong { color: var(--text); font-weight: 600; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; }
+  button {
+    flex: 1; padding: 11px 12px; border: 0; border-radius: 10px; font: inherit; font-weight: 600;
+    background: var(--card); color: var(--text); cursor: pointer;
+  }
+  button.primary { background: var(--button); color: var(--button-text); }
+  button.danger { color: var(--danger); }
+  button:disabled { opacity: .45; }
+  .card { background: var(--card); border-radius: 12px; padding: 18px 16px; text-align: center; margin-top: 24px; }
+  .card h2 { margin: 0 0 6px; font-size: 20px; }
+  .card p { margin: 6px 0 14px; color: var(--hint); }
+  .big { font-size: 48px; line-height: 1; margin-bottom: 8px; }
+  .moves { margin-top: 12px; font-size: 13px; color: var(--hint); word-spacing: 2px; max-height: 96px; overflow-y: auto; }
+  .promo { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; z-index: 5; }
+  .promo.open { display: flex; }
+  .promo div { background: var(--bg); border-radius: 14px; padding: 14px; display: flex; gap: 8px; }
+  .promo button { width: 60px; height: 60px; flex: none; font-size: 40px; padding: 0; font-family: "Noto Sans Symbols 2", serif; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="message" class="card hidden"></div>
+  <div id="game" class="hidden">
+    <div class="player" id="topPlayer"></div>
+    <div class="board" id="board"></div>
+    <div class="player" id="bottomPlayer"></div>
+    <div class="status" id="status"></div>
+    <div class="actions" id="actions"></div>
+    <div class="moves" id="moves"></div>
+  </div>
+</div>
+<div class="promo" id="promo"><div id="promoChoices"></div></div>
+
+<script>
+const tg = window.Telegram && Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const params = new URLSearchParams(location.search);
+const gameId = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || params.get("game") || "";
+const GLYPH = { k: "♚", q: "♛", r: "♜", b: "♝", n: "♞", p: "♟" };  // solid shapes, coloured with CSS
+let state = null, selected = null, busy = false;
+
+function haptic(kind) { try { tg.HapticFeedback.impactOccurred(kind || "light"); } catch (e) {} }
+function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function api(action, extra) {
+  const r = await fetch("/chess/api", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, game: gameId, initData: tg ? tg.initData : "", ...extra }),
+  });
+  const data = await r.json().catch(() => ({ error: "Connection problem. Try again." }));
+  if (data.error && !data.status) throw new Error(data.error);
+  if (data.error && tg) tg.showAlert(data.error);
+  return data;
+}
+
+function showMessage(html) {
+  document.getElementById("game").classList.add("hidden");
+  const m = document.getElementById("message");
+  m.innerHTML = html; m.classList.remove("hidden");
+}
+
+function parseFen(fen) {
+  const grid = {};
+  fen.split(" ")[0].split("/").forEach((row, r) => {
+    let f = 0;
+    for (const ch of row) {
+      if (/\d/.test(ch)) { f += +ch; continue; }
+      grid["abcdefgh"[f] + (8 - r)] = ch;
+      f++;
+    }
+  });
+  return grid;
+}
+
+function render() {
+  const s = state;
+  if (s.status === "waiting") {
+    const who = s.invited ? `${esc(s.host)} challenged <b>${esc(s.invited)}</b>.` : `${esc(s.host)} is waiting for an opponent.`;
+    let html = `<div class="big">♞</div><h2>Chess match</h2><p>${who}</p>`;
+    if (s.can_join) html += `<button class="primary" onclick="act('join')">Join the game</button>`;
+    else html += `<p>Waiting for ${s.invited ? esc(s.invited) : "someone"} to join…</p>`;
+    if (s.can_cancel) html += `<div class="actions"><button class="danger" onclick="act('cancel')">Cancel game</button></div>`;
+    return showMessage(html);
+  }
+  if (s.status === "private") {
+    return showMessage(`<div class="big">🔒</div><h2>${esc(s.white)} vs ${esc(s.black)}</h2>
+      <p>This game is private while it's being played. Laden will post the result and the moves in the group when it ends.</p>`);
+  }
+  if (s.status === "over" && !s.fen) {
+    return showMessage(`<div class="big">♟</div><h2>Game cancelled</h2><p>Start a new one with /chessmatch.</p>`);
+  }
+  document.getElementById("message").classList.add("hidden");
+  document.getElementById("game").classList.remove("hidden");
+
+  const flip = s.you === "black";
+  const grid = parseFen(s.fen);
+  const myTurn = s.status === "playing" && s.you === s.turn;
+  const targets = selected ? s.legal.filter(m => m.startsWith(selected)).map(m => m.slice(2, 4)) : [];
+  const board = document.getElementById("board");
+  board.innerHTML = "";
+  for (let r = 0; r < 8; r++) {
+    for (let f = 0; f < 8; f++) {
+      const file = "abcdefgh"[flip ? 7 - f : f], rank = flip ? r + 1 : 8 - r, sq = file + rank;
+      const el = document.createElement("div");
+      el.className = "sq " + ((f + r) % 2 ? "d" : "l");
+      if (s.last && (s.last.slice(0, 2) === sq || s.last.slice(2, 4) === sq)) el.classList.add("last");
+      if (sq === selected) el.classList.add("sel");
+      if (sq === s.check) el.classList.add("check");
+      if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
+      const p = grid[sq];
+      if (p) el.innerHTML = `<span class="piece ${p === p.toUpperCase() ? "w" : "b"}">${GLYPH[p.toLowerCase()]}︎</span>`;
+      if (r === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${file}</span>`);
+      if (f === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${rank}</span>`);
+      el.onclick = () => tap(sq, grid);
+      board.appendChild(el);
+    }
+  }
+
+  const me = s.you, them = me === "white" ? "black" : "white";
+  const bottom = me || "white", top = me ? them : "black";
+  const line = c => `<span class="dot ${c}"></span>${esc(s[c])}${s.status === "playing" && s.turn === c ? `<span class="turn">to move</span>` : ""}`;
+  document.getElementById("topPlayer").innerHTML = line(top);
+  document.getElementById("bottomPlayer").innerHTML = line(bottom);
+
+  const status = document.getElementById("status");
+  status.className = "status";
+  if (s.status === "over") {
+    const winner = s.result === "1-0" ? s.white : s.result === "0-1" ? s.black : null;
+    status.textContent = winner ? `${winner} won by ${s.reason}.` : `Draw by ${s.reason}.`;
+    status.classList.add("strong");
+  } else if (s.draw_offer === "them") {
+    status.textContent = `${s[them]} offers a draw.`; status.classList.add("strong");
+  } else if (myTurn) {
+    status.textContent = s.check ? "Check! Your move." : "Your move."; status.classList.add("strong");
+  } else {
+    status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" : `Waiting for ${s[them]}…`;
+  }
+
+  const actions = document.getElementById("actions");
+  if (s.status !== "playing") actions.innerHTML = "";
+  else if (s.draw_offer === "them") actions.innerHTML =
+    `<button class="primary" onclick="act('accept_draw')">Accept draw</button><button onclick="act('decline_draw')">Decline</button>`;
+  else actions.innerHTML =
+    `<button onclick="act('offer_draw')" ${s.draw_offer ? "disabled" : ""}>Offer draw</button><button class="danger" onclick="resign()">Resign</button>`;
+
+  const moves = s.pgn.replace(/\s*(\*|1-0|0-1|1\/2-1\/2)$/, "");
+  document.getElementById("moves").textContent = moves || "No moves yet.";
+  const mv = document.getElementById("moves"); mv.scrollTop = mv.scrollHeight;
+}
+
+function tap(sq, grid) {
+  const s = state;
+  if (busy || s.status !== "playing" || s.you !== s.turn) return;
+  const mine = p => p && (p === p.toUpperCase()) === (s.you === "white");
+  if (selected) {
+    const options = s.legal.filter(m => m.startsWith(selected + sq));
+    if (options.length === 1) return send(options[0]);
+    if (options.length > 1) return choosePromotion(options, s.you);
+  }
+  selected = mine(grid[sq]) && s.legal.some(m => m.startsWith(sq)) ? (selected === sq ? null : sq) : null;
+  if (selected) haptic("light");
+  render();
+}
+
+function choosePromotion(options, color) {
+  const box = document.getElementById("promoChoices");
+  box.innerHTML = "";
+  for (const piece of ["q", "r", "b", "n"]) {
+    const move = options.find(m => m.endsWith(piece));
+    if (!move) continue;
+    const b = document.createElement("button");
+    b.innerHTML = `<span class="piece ${color === "white" ? "w" : "b"}" style="font-size:40px">${GLYPH[piece]}︎</span>`;
+    b.onclick = () => { document.getElementById("promo").classList.remove("open"); send(move); };
+    box.appendChild(b);
+  }
+  document.getElementById("promo").classList.add("open");
+}
+
+async function send(move) {
+  busy = true; selected = null;
+  try { state = await api("move", { move }); haptic("medium"); }
+  catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false; render();
+}
+
+function resign() {
+  const go = ok => ok && act("resign");
+  tg ? tg.showConfirm("Resign this game?", go) : go(confirm("Resign this game?"));
+}
+
+async function act(action) {
+  if (busy) return;
+  busy = true;
+  try { state = await api(action); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false; render();
+}
+
+async function poll() {
+  if (!busy && !document.hidden && state && state.status !== "over") {
+    try {
+      const fresh = await api("state");
+      if (fresh.version !== state.version || fresh.status !== state.status) {
+        if (state.status === "playing" && fresh.turn === fresh.you && state.turn !== fresh.turn) haptic("medium");
+        state = fresh; selected = null; render();
+      }
+    } catch (e) {}
+  }
+  setTimeout(poll, 2000);
+}
+
+(async () => {
+  if (!gameId) return showMessage(`<div class="big">♟</div><h2>No game</h2><p>Start one in the group with /chessmatch.</p>`);
+  try { state = await api("state"); render(); }
+  catch (e) { return showMessage(`<div class="big">♟</div><h2>Can't open the game</h2><p>${esc(e.message)}</p>`); }
+  poll();
+})();
+</script>
+</body>
+</html>

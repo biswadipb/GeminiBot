@@ -8,6 +8,7 @@ import operator
 import base64
 import datetime
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -19,16 +20,18 @@ import time
 import zlib
 from decimal import Decimal, getcontext
 from fractions import Fraction
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote
 
+import chess
 import httpx
+import tornado.web
 from ddgs import DDGS
 from dotenv import load_dotenv
 from google import genai
 from huggingface_hub import AsyncInferenceClient
 from PIL import Image
 from google.genai import errors, types
-from telegram import LinkPreviewOptions, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -530,6 +533,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
+        "/chessmatch [@someone] – play chess (or leave the slot open)\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -1783,6 +1787,351 @@ async def imitate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Could not imitate message")
 
 
+# ---------- /chessmatch: a private two-player chess game in a Telegram Mini App ----------
+
+CHESS_APP_NAME = os.getenv("CHESS_APP_NAME", "")  # BotFather /newapp short name; empty = the bot's Main Mini App
+CHESS_GAME_TTL = 7 * 86400  # seconds an unfinished game is kept
+CHESS_MAX_OPEN = 3  # unfinished games one person may have at once
+CHESS_REASONS = {
+    "CHECKMATE": "checkmate", "STALEMATE": "stalemate", "INSUFFICIENT_MATERIAL": "insufficient material",
+    "SEVENTYFIVE_MOVES": "the 75-move rule", "FIVEFOLD_REPETITION": "fivefold repetition",
+    "FIFTY_MOVES": "the 50-move rule", "THREEFOLD_REPETITION": "threefold repetition",
+}
+chess_games = {}  # game id -> game dict; cache of Redis chess:<id>
+chess_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
+
+
+def chess_link(bot_username, game_id):
+    if CHESS_APP_NAME:
+        return f"https://t.me/{bot_username}/{CHESS_APP_NAME}?startapp={game_id}"
+    return f"https://t.me/{bot_username}?startapp={game_id}"
+
+
+async def load_game(game_id):
+    if game_id not in chess_games and use_redis:
+        try:
+            raw = await redis("GET", f"chess:{game_id}")
+            if raw:
+                chess_games[game_id] = json.loads(raw)
+        except Exception:
+            log.exception("Could not load chess game %s", game_id)
+    return chess_games.get(game_id)
+
+
+async def save_game(game):
+    game["version"] = game.get("version", 0) + 1
+    chess_games[game["id"]] = game
+    if use_redis:
+        try:
+            await redis("SET", f"chess:{game['id']}", json.dumps(game), "EX", CHESS_GAME_TTL)
+        except Exception:
+            log.exception("Could not save chess game %s", game["id"])
+
+
+def game_board(game):
+    board = chess.Board()
+    for move in game["moves"]:
+        board.push_uci(move)
+    return board
+
+
+def player_color(game, user_id):
+    return next((c for c in ("white", "black") if (game.get(c) or {}).get("id") == user_id), None)
+
+
+def chess_pgn(game, board):
+    """Move list in standard notation, e.g. 1. e4 e5 2. Nf3 Nc6 1-0."""
+    replay, parts = chess.Board(), []
+    for i, move in enumerate(board.move_stack):
+        if i % 2 == 0:
+            parts.append(f"{i // 2 + 1}.")
+        parts.append(replay.san(move))
+        replay.push(move)
+    return " ".join(parts + [game.get("result") or "*"])
+
+
+async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chessmatch [@someone | name], or as a reply: start a game and post a button that opens the board."""
+    if await ignored_while_off(update) or await muted(update, context):
+        return
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return
+    msg, user, chat = update.message, update.effective_user, update.effective_chat
+    open_games = [g for g in chess_games.values() if g["status"] != "over" and user.id in
+                  ((g.get("white") or {}).get("id"), (g.get("black") or {}).get("id"))]
+    if len(open_games) >= CHESS_MAX_OPEN:
+        await msg.reply_text(f"You already have {len(open_games)} unfinished games. Finish or resign one first.",
+                             do_quote=True)
+        return
+
+    invited = None
+    quoted = msg.reply_to_message
+    if quoted and quoted.from_user and not quoted.from_user.is_bot:
+        invited = {"id": quoted.from_user.id, "name": quoted.from_user.full_name}
+    elif context.args:
+        group_members = await load_members(chat.id) if is_group(update) else {}
+        by_username = {m["username"].lower(): uid for uid, m in group_members.items() if m["username"]}
+        for entity, text in msg.parse_entities(["mention", "text_mention"]).items():
+            if entity.type == "text_mention" and entity.user:
+                invited = {"id": entity.user.id, "name": entity.user.full_name}
+            else:
+                username = text.lstrip("@")
+                uid = by_username.get(username.lower())
+                invited = {"id": uid, "username": username.lower(),
+                           "name": group_members[uid]["name"] if uid else f"@{username}"}
+            break
+        if not invited:
+            found = match_member_name(" ".join(context.args).lower(), group_members)
+            if not found:
+                await msg.reply_text("I don't know who that is. Reply to their message or @mention them.",
+                                     do_quote=True)
+                return
+            invited = {"id": found[0], "name": found[1]}
+        if invited.get("id") == context.bot.id or (invited.get("username") or "") == context.bot.username.lower():
+            await msg.reply_text("I'd win too easily. Pick a human. ♟", do_quote=True)
+            return
+    if invited and invited.get("id") == user.id:
+        await msg.reply_text("Playing yourself? Leave the slot open instead.", do_quote=True)
+        return
+
+    game_id = base64.urlsafe_b64encode(os.urandom(9)).decode()
+    me = {"id": user.id, "name": user.full_name}
+    my_color = random.choice(["white", "black"])
+    game = {"id": game_id, "chat_id": chat.id, "message_id": None, "creator": user.id, "invited": invited,
+            "white": me if my_color == "white" else None, "black": me if my_color == "black" else None,
+            "moves": [], "status": "waiting", "result": None, "reason": None, "draw_offer": None,
+            "created": int(time.time())}
+    if invited:
+        text = f"♟ <b>{html.escape(user.full_name)}</b> challenges <b>{html.escape(invited['name'])}</b> to chess!"
+    else:
+        text = f"♟ <b>{html.escape(user.full_name)}</b> wants to play chess. The slot is open: anyone can join!"
+    text += "\n\nMoves stay private until the game ends; then I'll post the result and the notation here."
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game_id))]])
+    sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=button, do_quote=is_group(update))
+    game["message_id"] = sent.message_id
+    await save_game(game)
+
+
+async def edit_chess_message(game, text):
+    """Update the group post (keeping the button while the game is still on)."""
+    markup = None
+    if game["status"] != "over":
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "♟ Open board", url=chess_link(chess_bot.username, game["id"]))]])
+    try:
+        await chess_bot.edit_message_text(text, chat_id=game["chat_id"], message_id=game["message_id"],
+                                          parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception as e:
+        log.info("Could not edit chess message: %s", e)
+
+
+async def finish_game(game, board, result, reason):
+    game.update(status="over", result=result, reason=reason, draw_offer=None, ended=int(time.time()))
+    white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
+    moves = (len(game["moves"]) + 1) // 2
+    if result == "1-0":
+        headline = f"🏆 <b>{white}</b> (White) beat <b>{black}</b> by {reason}"
+    elif result == "0-1":
+        headline = f"🏆 <b>{black}</b> (Black) beat <b>{white}</b> by {reason}"
+    else:
+        headline = f"🤝 <b>{white}</b> and <b>{black}</b> drew by {reason}"
+    text = (f"♟ <b>Chess result</b>\n{headline} after {moves} move{'s' * (moves != 1)}.\n\n"
+            f"<b>Notation</b>\n<blockquote expandable>{html.escape(chess_pgn(game, board))}</blockquote>")
+    try:
+        await chess_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
+                                     reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
+    except Exception:
+        log.exception("Could not post the chess result")
+    await edit_chess_message(game, f"♟ {white} vs {black}: game over ({result}). The result is below.")
+
+
+def check_init_data(init_data):
+    """Verify that Telegram signed this Mini App launch data; returns the user dict or None."""
+    pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+    received = pairs.pop("hash", "")
+    data_check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", TELEGRAM_TOKEN.encode(), hashlib.sha256).digest()
+    expected = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
+    if not received or not hmac.compare_digest(expected, received):
+        return None
+    if time.time() - int(pairs.get("auth_date", 0)) > 86400:
+        return None
+    try:
+        return json.loads(pairs["user"])
+    except Exception:
+        return None
+
+
+def chess_view(game, user_id):
+    """What this person may see. Only the two players see the board while the game is on."""
+    color = player_color(game, user_id)
+    names = {c: (game.get(c) or {}).get("name") for c in ("white", "black")}
+    view = {"status": game["status"], "version": game.get("version", 0), "you": color}
+    if game["status"] == "waiting":
+        invited = game.get("invited")
+        view.update(host=names["white"] or names["black"], invited=invited and invited["name"],
+                    can_join=color is None, can_cancel=user_id == game["creator"])
+        return view
+    if not color and game["status"] != "over":
+        view["status"] = "private"
+        view.update(white=names["white"], black=names["black"])
+        return view
+    board = game_board(game)
+    view.update(white=names["white"], black=names["black"], fen=board.fen(), turn="white" if board.turn else "black",
+                last=game["moves"][-1] if game["moves"] else None, result=game["result"], reason=game["reason"],
+                check=chess.square_name(board.king(board.turn)) if board.is_check() else None,
+                pgn=chess_pgn(game, board))
+    if color and game["status"] == "playing":
+        mine = (color == "white") == board.turn
+        view["legal"] = [m.uci() for m in board.legal_moves] if mine else []
+        offer = game.get("draw_offer")
+        view["draw_offer"] = None if offer is None else ("you" if offer == user_id else "them")
+    return view
+
+
+def same_person(invited, user):
+    if invited.get("id"):
+        return invited["id"] == user["id"]
+    return invited.get("username") and invited["username"] == (user.get("username") or "").lower()
+
+
+async def chess_action(body):
+    """Handle one request from the Mini App. Returns (http status, response dict)."""
+    user = check_init_data(body.get("initData"))
+    if not user:
+        return 401, {"error": "Please open the board from the button in Telegram."}
+    game = await load_game(str(body.get("game", "")))
+    if not game:
+        return 404, {"error": "This game doesn't exist (games are kept for 7 days)."}
+    action, uid = body.get("action", "state"), user["id"]
+    name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
+    async with chess_locks.setdefault(game["id"], asyncio.Lock()):
+        color = player_color(game, uid)
+        if color and game[color]["name"] != name and game["status"] != "over":
+            game[color]["name"] = name  # names follow the Telegram profile, tied to the user id
+        if action == "join":
+            if game["status"] != "waiting" or color:
+                return 200, chess_view(game, uid)
+            invited = game.get("invited")
+            if invited and not same_person(invited, user):
+                return 403, {"error": f"This game is reserved for {invited['name']}."}
+            try:
+                member = await chess_bot.get_chat_member(game["chat_id"], uid)
+                if member.status in ("left", "kicked"):
+                    return 403, {"error": "Only members of the group can join."}
+            except Exception:
+                return 403, {"error": "Only members of the group can join."}
+            free = "white" if game["white"] is None else "black"
+            game[free] = {"id": uid, "name": name}
+            game["status"] = "playing"
+            await save_game(game)
+            white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
+            await edit_chess_message(game, f"♟ <b>{white}</b> (White) vs <b>{black}</b> (Black)\n"
+                                           "Game in progress. Moves stay private until it ends.")
+        elif action == "cancel":
+            if game["status"] == "waiting" and uid == game["creator"]:
+                game["status"], game["result"], game["reason"] = "over", "cancelled", "cancelled"
+                await save_game(game)
+                await edit_chess_message(game, "♟ Chess game cancelled.")
+        elif action in ("move", "resign", "offer_draw", "accept_draw", "decline_draw"):
+            if game["status"] != "playing" or not color:
+                return 403, {"error": "You're not playing in this game."}
+            board = game_board(game)
+            if action == "move":
+                try:
+                    move = chess.Move.from_uci(str(body.get("move", "")))
+                except ValueError:
+                    move = None
+                if (color == "white") != board.turn or move not in board.legal_moves:
+                    return 400, {"error": "That move isn't allowed.", **chess_view(game, uid)}
+                board.push(move)
+                game["moves"].append(move.uci())
+                game["draw_offer"] = None  # moving declines a pending offer
+                outcome = board.outcome(claim_draw=True)
+                if outcome:
+                    await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
+            elif action == "resign":
+                await finish_game(game, board, "0-1" if color == "white" else "1-0", "resignation")
+            elif action == "offer_draw":
+                game["draw_offer"] = uid
+            elif action == "accept_draw" and game.get("draw_offer") not in (None, uid):
+                await finish_game(game, board, "1/2-1/2", "agreement")
+            elif action == "decline_draw" and game.get("draw_offer") not in (None, uid):
+                game["draw_offer"] = None
+            await save_game(game)
+        return 200, chess_view(game, uid)
+
+
+CHESS_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "chess.html")
+
+
+class ChessPageHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_header("Content-Type", "text/html; charset=utf-8")
+        self.set_header("Cache-Control", "no-cache")
+        with open(CHESS_PAGE, encoding="utf-8") as f:
+            self.write(f.read())
+
+
+class ChessApiHandler(tornado.web.RequestHandler):
+    async def post(self):
+        try:
+            body = json.loads(self.request.body or b"{}")
+            status, data = await chess_action(body)
+        except Exception:
+            log.exception("Chess request failed")
+            status, data = 500, {"error": "Something went wrong. Try again."}
+        self.set_status(status)
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(data))
+
+
+class TelegramWebhookHandler(tornado.web.RequestHandler):
+    """Telegram pushes updates here; the secret header proves they come from Telegram."""
+
+    def initialize(self, app, secret):
+        self.app, self.secret = app, secret
+
+    async def post(self):
+        if self.request.headers.get("X-Telegram-Bot-Api-Secret-Token") != self.secret:
+            self.set_status(403)
+            return
+        await self.app.update_queue.put(Update.de_json(json.loads(self.request.body), self.app.bot))
+
+
+class AliveHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write("Laden is awake.")
+
+
+chess_bot = None  # the Bot, set at startup so web requests can post to the group
+
+
+async def run_web(app, public_url):
+    """Webhook mode with our own web server, so the same port also serves the chess Mini App."""
+    global chess_bot
+    secret = hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()
+    web = tornado.web.Application([
+        (r"/telegram", TelegramWebhookHandler, {"app": app, "secret": secret}),
+        (r"/chess", ChessPageHandler),
+        (r"/chess/api", ChessApiHandler),
+        (r"/", AliveHandler),
+    ])
+    async with app:
+        chess_bot = app.bot
+        await on_startup(app)
+        await app.start()
+        web.listen(int(os.getenv("PORT", "8443")), "0.0.0.0")
+        # Telegram sends the secret back on every request so strangers can't post fake updates
+        await app.bot.set_webhook(f"{public_url.rstrip('/')}/telegram", secret_token=secret)
+        log.info("Chess Mini App: %s/chess", public_url.rstrip("/"))
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await app.stop()
+
+
 async def on_startup(app):
     await register_commands(app)
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
@@ -1804,6 +2153,7 @@ async def register_commands(app):
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
+        ("chessmatch", "Play chess (@someone, reply, or leave it open)"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
@@ -1925,6 +2275,7 @@ def main():
     app.add_handler(CommandHandler("mock", mock))
     app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
+    app.add_handler(CommandHandler("chessmatch", chessmatch))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
@@ -1949,15 +2300,10 @@ def main():
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if public_url:
         log.info("Webhook mode: %s", public_url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.getenv("PORT", "8443")),
-            url_path="telegram",
-            webhook_url=f"{public_url.rstrip('/')}/telegram",
-            # Telegram sends this back on every request so strangers can't post fake updates
-            secret_token=hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest(),
-        )
+        asyncio.run(run_web(app, public_url))
     else:
+        global chess_bot
+        chess_bot = app.bot
         app.run_polling()
 
 

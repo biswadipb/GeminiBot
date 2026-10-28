@@ -56,6 +56,7 @@ All settings live in `.env`:
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
 | `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word) |
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
+| `CHESS_APP_NAME` | no | – | Short name of a BotFather `/newapp` Mini App for `/chessmatch`; empty uses the bot's Main Mini App |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
 | `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
@@ -91,6 +92,7 @@ If both allowlists are empty, anyone can use the bot.
 - Very rarely (about 0.1% of messages) Laden replies with emojis: usually one emoji repeated (laughs like 😂😂😂 come in bursts, sometimes long ones), occasionally a mixed combo (😏🍆💦). Set `EMOJI_REPLY_RATE` (`0` to disable).
 - `/calc 2+2*3` or "Laden what's 15% of 80" – exact arithmetic computed by code with Python's `fractions` (0.1+0.2 = 0.3 exactly, 1/3 kept as an exact fraction) and 50-digit `decimal` for roots, logs and pi (no Gemini quota used); supports + - * / ^ %, `x`, `×`, `÷`, `% of`, sqrt, abs, round, log, ln, sin/cos/tan (degrees), pi, e
 - `/ppcheck [name]` (or as a reply; with no name it picks a random member other than the sender) – "name's pp is like this 8===D" with a random length: 2–4 common, 5+ rare, up to 20
+- `/chessmatch [@someone | name]` (or as a reply) – a chess game in a Telegram Mini App. Invite someone or leave the slot open for any group member. Only the two players can see the board while it's on; when it ends, Laden posts the winner and the full notation in the group. Players are tied to their user IDs and shown by their Telegram profile names. Needs a one-time BotFather setup (see below)
 - `/off`, `/on` – admins only: silence the bot for everyone else, or switch it back on (remembered across restarts with Upstash)
 
 In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`), mention it (`@YourBot question`), or reply to one of its messages.
@@ -110,6 +112,12 @@ In groups, call the bot by name (`Laden, what's the height of the Eiffel Tower?`
 On Render the bot switches to webhook mode automatically (it reads `RENDER_EXTERNAL_URL`), so Telegram
 delivers messages to it. The free instance sleeps after ~15 minutes idle; the next message wakes it,
 so the first reply after a quiet spell can take up to a minute.
+
+### Chess Mini App (one-time BotFather setup)
+
+In @BotFather: **/mybots → your bot → Bot Settings → Configure Mini App → Enable Mini App**, and set the URL to
+`https://<your-render-address>/chess`. The `/chessmatch` button then opens `t.me/<bot>?startapp=<game>`.
+If you'd rather create a named app with **/newapp**, set `CHESS_APP_NAME` to its short name.
 
 ### Keeping memory across restarts
 
