@@ -2311,6 +2311,12 @@ def chess_view(game, user_id):
                 last=game["moves"][-1] if game["moves"] else None, result=game["result"], reason=game["reason"],
                 check=chess.square_name(board.king(board.turn)) if board.is_check() else None,
                 pgn=chess_pgn(game, board))
+    replay, fens, sans = chess.Board(), [], []
+    for move in board.move_stack:  # every earlier position, for stepping back through the game
+        fens.append(replay.board_fen())
+        sans.append(replay.san(move))
+        replay.push(move)
+    view.update(fens=fens + [board.board_fen()], sans=sans, moves=game["moves"])
     if game.get("clock"):
         view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))
     if color and game["status"] == "playing":

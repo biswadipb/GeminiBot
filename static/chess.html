@@ -30,7 +30,13 @@
   .player .dot { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--hint); }
   .player .dot.white { background: #fff; }
   .player .dot.black { background: #222; }
-  .player .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .player .info { flex: 1; min-width: 0; }
+  .player .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .taken { display: flex; align-items: center; height: 20px; margin-top: 1px; }
+  .taken .cap { position: relative; width: 20px; height: 20px; margin-right: -6px; filter: drop-shadow(0 0 1px var(--hint)); }
+  .taken .cap.gap { margin-left: 7px; }
+  .taken .cap svg { display: block; width: 100%; height: 100%; }
+  .taken .adv { margin-left: 9px; font-size: 12px; font-weight: 600; color: var(--hint); }
   .player .turn { font-size: 13px; font-weight: 500; color: var(--button); }
   .clock {
     min-width: 64px; padding: 3px 8px; border-radius: 7px; text-align: center; background: var(--card);
@@ -75,7 +81,24 @@
   .card h2 { margin: 0 0 6px; font-size: 20px; }
   .card p { margin: 6px 0 14px; color: var(--hint); }
   .big { font-size: 48px; line-height: 1; margin-bottom: 8px; }
-  .moves { margin-top: 12px; font-size: 13px; color: var(--hint); word-spacing: 2px; max-height: 96px; overflow-y: auto; }
+  .nav { display: flex; gap: 8px; margin-top: 10px; }
+  .nav button { padding: 8px 10px; font-size: 18px; line-height: 1; }
+  .nav .step { flex: 0 0 56px; }
+  .nav .list { font-size: 15px; }
+  .review { color: var(--button); font-weight: 600; }
+  .review a { color: var(--button); text-decoration: underline; cursor: pointer; }
+  .sheet { position: fixed; inset: 0; z-index: 6; display: none; background: rgba(0,0,0,.45); }
+  .sheet.open { display: flex; align-items: flex-end; }
+  .sheet .panel {
+    width: 100%; max-width: 480px; margin: 0 auto; max-height: 70vh; display: flex; flex-direction: column;
+    background: var(--bg); border-radius: 16px 16px 0 0; padding: 14px 16px 18px;
+  }
+  .sheet h3 { margin: 0 0 10px; font-size: 17px; text-align: center; }
+  .movelist { overflow-y: auto; display: grid; grid-template-columns: 34px 1fr 1fr; row-gap: 2px; margin-bottom: 12px; }
+  .movelist .no { color: var(--hint); padding: 7px 0; font-size: 14px; }
+  .movelist .mv { padding: 7px 8px; border-radius: 7px; cursor: pointer; font-weight: 500; }
+  .movelist .mv.on { background: var(--button); color: var(--button-text); }
+  .movelist .empty { grid-column: 1 / -1; text-align: center; color: var(--hint); padding: 16px 0; }
   .promo { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; z-index: 5; }
   .promo.open { display: flex; }
   .promo div { background: var(--bg); border-radius: 14px; padding: 14px; display: flex; gap: 8px; }
@@ -90,9 +113,20 @@
     <div class="player" id="topPlayer"></div>
     <div class="board" id="board"></div>
     <div class="player" id="bottomPlayer"></div>
+    <div class="nav">
+      <button class="step" id="prev" onclick="step(-1)" aria-label="Previous move">◀</button>
+      <button class="list" onclick="openMoves()">📜&nbsp; Moves</button>
+      <button class="step" id="next" onclick="step(1)" aria-label="Next move">▶</button>
+    </div>
     <div class="status" id="status"></div>
     <div class="actions" id="actions"></div>
-    <div class="moves" id="moves"></div>
+  </div>
+</div>
+<div class="sheet" id="sheet" onclick="if (event.target === this) closeMoves()">
+  <div class="panel">
+    <h3>Moves</h3>
+    <div class="movelist" id="movelist"></div>
+    <button onclick="closeMoves()">Close</button>
   </div>
 </div>
 <div class="promo" id="promo"><div id="promoChoices"></div></div>
@@ -118,6 +152,9 @@ const PIECES = {
   wR: "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"45\" height=\"45\" viewBox=\"0 0 45 45\"><g fill=\"#fff\" fill-rule=\"evenodd\" stroke=\"#000\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"1.5\"><path stroke-linecap=\"butt\" d=\"M9 39h27v-3H9zm3-3v-4h21v4zm-1-22V9h4v2h5V9h5v2h5V9h4v5\"/><path d=\"m34 14-3 3H14l-3-3\"/><path stroke-linecap=\"butt\" stroke-linejoin=\"miter\" d=\"M31 17v12.5H14V17\"/><path d=\"m31 29.5 1.5 2.5h-20l1.5-2.5\"/><path fill=\"none\" stroke-linejoin=\"miter\" d=\"M11 14h23\"/></g></svg>",
 };
 let state = null, selected = null, busy = false;
+let viewPly = null;  // null = the live position; otherwise how many moves in we're looking back at
+const VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9 };
+const START = { p: 8, n: 2, b: 2, r: 2, q: 1 };
 
 function haptic(kind) { try { tg.HapticFeedback.impactOccurred(kind || "light"); } catch (e) {} }
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
@@ -174,7 +211,11 @@ function render() {
   document.getElementById("game").classList.remove("hidden");
 
   const flip = s.you === "black";
-  const grid = parseFen(s.fen);
+  if (viewPly !== null && viewPly >= s.fens.length - 1) viewPly = null;  // caught up with the live position
+  const reviewing = viewPly !== null;
+  const grid = parseFen(reviewing ? s.fens[viewPly] : s.fen);
+  const last = reviewing ? (viewPly > 0 ? s.moves[viewPly - 1] : null) : s.last;
+  if (reviewing) selected = null;
   const myTurn = s.status === "playing" && s.you === s.turn;
   const targets = selected ? s.legal.filter(m => m.startsWith(selected)).map(m => m.slice(2, 4)) : [];
   const board = document.getElementById("board");
@@ -184,9 +225,9 @@ function render() {
       const file = "abcdefgh"[flip ? 7 - f : f], rank = flip ? r + 1 : 8 - r, sq = file + rank;
       const el = document.createElement("div");
       el.className = "sq " + ((f + r) % 2 ? "d" : "l");
-      if (s.last && (s.last.slice(0, 2) === sq || s.last.slice(2, 4) === sq)) el.classList.add("last");
+      if (last && (last.slice(0, 2) === sq || last.slice(2, 4) === sq)) el.classList.add("last");
       if (sq === selected) el.classList.add("sel");
-      if (sq === s.check) el.classList.add("check");
+      if (sq === s.check && !reviewing) el.classList.add("check");
       if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
       const p = grid[sq];
       if (p) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
@@ -199,7 +240,8 @@ function render() {
 
   const me = s.you, them = me === "white" ? "black" : "white";
   const bottom = me || "white", top = me ? them : "black";
-  const line = c => `<span class="dot ${c}"></span><span class="name">${esc(s[c])}</span>` +
+  const taken = takenPieces(grid);
+  const line = c => `<span class="dot ${c}"></span><span class="info"><span class="name">${esc(s[c])}</span>${taken[c]}</span>` +
     (s.status === "playing" && s.turn === c && !s.running ? `<span class="turn">to move</span>` : "") +
     (s.clock ? `<span class="clock" data-color="${c}"></span>` : "");
   document.getElementById("topPlayer").innerHTML = line(top);
@@ -207,7 +249,12 @@ function render() {
 
   const status = document.getElementById("status");
   status.className = "status";
-  if (s.status === "over") {
+  document.getElementById("prev").disabled = (reviewing ? viewPly : s.sans.length) === 0;
+  document.getElementById("next").disabled = !reviewing;
+  if (reviewing) {
+    status.innerHTML = `<span class="review">${viewPly ? `After ${esc(moveLabel(viewPly))}` : "Starting position"}` +
+      ` · <a onclick="goLive()">back to the game</a></span>`;
+  } else if (s.status === "over") {
     const winner = s.result === "1-0" ? s.white : s.result === "0-1" ? s.black : null;
     status.textContent = winner ? `${winner} won by ${s.reason}.` : `Draw by ${s.reason}.`;
     status.classList.add("strong");
@@ -219,7 +266,7 @@ function render() {
     status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" : `Waiting for ${s[them]}…`;
   }
 
-  if (s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
+  if (!reviewing && s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
   tickClocks();
 
   const actions = document.getElementById("actions");
@@ -229,14 +276,69 @@ function render() {
   else actions.innerHTML = (s.bot ? "" :
     `<button onclick="act('offer_draw')" ${s.draw_offer ? "disabled" : ""}>Offer draw</button>`) +
     `<button class="danger" onclick="resign()">Resign</button>`;
-
-  const moves = s.pgn.replace(/\s*(\*|1-0|0-1|1\/2-1\/2)$/, "");
-  document.getElementById("moves").textContent = moves || "No moves yet.";
-  const mv = document.getElementById("moves"); mv.scrollTop = mv.scrollHeight;
+  if (document.getElementById("sheet").classList.contains("open")) fillMoves();
 }
+
+function takenPieces(grid) {
+  // What each side has captured = the opponent's pieces missing from the board (promotions can't go below 0)
+  const left = { w: {}, b: {} };
+  for (const p of Object.values(grid)) {
+    const side = p === p.toUpperCase() ? "w" : "b", t = p.toLowerCase();
+    left[side][t] = (left[side][t] || 0) + 1;
+  }
+  const material = side => Object.entries(left[side]).reduce((sum, [t, n]) => sum + (VALUES[t] || 0) * n, 0);
+  const diff = material("w") - material("b");
+  const row = (victim, adv) => {
+    let html = "", prev = null;
+    for (const t of ["p", "n", "b", "r", "q"]) {
+      const n = Math.max(0, START[t] - (left[victim][t] || 0));
+      for (let i = 0; i < n; i++) {
+        html += `<span class="cap${prev && prev !== t ? " gap" : ""}">${PIECES[victim + t.toUpperCase()]}</span>`;
+        prev = t;
+      }
+    }
+    return `<span class="taken">${html}${adv > 0 ? `<span class="adv">+${adv}</span>` : ""}</span>`;
+  };
+  return { white: row("b", diff), black: row("w", -diff) };
+}
+
+function moveLabel(ply) {
+  const no = Math.ceil(ply / 2);
+  return `${no}${ply % 2 ? "." : "…"} ${state.sans[ply - 1]}`;
+}
+
+function step(delta) {
+  const total = state.sans.length;
+  const at = viewPly === null ? total : viewPly;
+  const next = Math.min(total, Math.max(0, at + delta));
+  viewPly = next >= total ? null : next;
+  haptic("light"); render();
+}
+
+function goLive() { viewPly = null; render(); }
+
+function showPly(ply) { viewPly = ply >= state.sans.length ? null : ply; closeMoves(); render(); }
+
+function fillMoves() {
+  const list = document.getElementById("movelist");
+  const at = viewPly === null ? state.sans.length : viewPly;
+  if (!state.sans.length) { list.innerHTML = `<div class="empty">No moves yet.</div>`; return; }
+  let html = "";
+  state.sans.forEach((san, i) => {
+    if (i % 2 === 0) html += `<span class="no">${i / 2 + 1}.</span>`;
+    html += `<span class="mv${i + 1 === at ? " on" : ""}" onclick="showPly(${i + 1})">${esc(san)}</span>`;
+  });
+  list.innerHTML = html;
+  const on = list.querySelector(".on");
+  if (on) on.scrollIntoView({ block: "center" });
+}
+
+function openMoves() { fillMoves(); document.getElementById("sheet").classList.add("open"); }
+function closeMoves() { document.getElementById("sheet").classList.remove("open"); }
 
 function tap(sq, grid) {
   const s = state;
+  if (viewPly !== null) return goLive();  // tapping the board while looking back returns to the game
   if (busy || s.status !== "playing" || s.you !== s.turn) return;
   const mine = p => p && (p === p.toUpperCase()) === (s.you === "white");
   if (selected) {
