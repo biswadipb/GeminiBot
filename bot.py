@@ -1833,6 +1833,7 @@ async def imitate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 CHESS_APP_NAME = os.getenv("CHESS_APP_NAME", "")  # BotFather /newapp short name; empty = the bot's Main Mini App
 CHESS_GAME_TTL = 7 * 86400  # seconds an unfinished game is kept
 CHESS_MAX_OPEN = 3  # unfinished games one person may have at once
+CHESS_CLOCK = int(os.getenv("CHESS_CLOCK_MINUTES", "10")) * 60  # seconds on each player's clock
 CHESS_REASONS = {
     "CHECKMATE": "checkmate", "STALEMATE": "stalemate", "INSUFFICIENT_MATERIAL": "insufficient material",
     "SEVENTYFIVE_MOVES": "the 75-move rule", "FIVEFOLD_REPETITION": "fivefold repetition",
@@ -2005,13 +2006,64 @@ def is_bot_turn(game, board):
     return bot_color is not None and (bot_color == "white") == board.turn
 
 
+def clock_running(game):
+    """Whose clock is ticking: the side to move, once both sides have made their first move (like lichess)."""
+    if not game.get("clock") or game["status"] != "playing" or len(game["moves"]) < 2:
+        return None
+    return "white" if len(game["moves"]) % 2 == 0 else "black"
+
+
+def time_left(game, color):
+    left = game["clock"][color]
+    if clock_running(game) == color:
+        left -= time.time() - game["turn_started"]
+    return max(0.0, left)
+
+
+def record_move(game, uci):
+    """Charge the mover's clock for this turn, then start the opponent's."""
+    color = clock_running(game)
+    if color:
+        game["clock"][color] = time_left(game, color)
+    game["moves"].append(uci)
+    game["turn_started"] = time.time()
+
+
+async def check_flag(game):
+    """End the game if the side to move has run out of time. Returns True if it did."""
+    color = clock_running(game)
+    if not color or time_left(game, color) > 0:
+        return False
+    board = game_board(game)
+    winner = chess.BLACK if color == "white" else chess.WHITE
+    if board.has_insufficient_material(winner):  # the opponent couldn't have mated anyway
+        await finish_game(game, board, "1/2-1/2", "timeout vs insufficient material")
+    else:
+        await finish_game(game, board, "0-1" if color == "white" else "1-0", "timeout")
+    await save_game(game)
+    return True
+
+
+async def watch_chess_clocks():
+    """Flag players who run out of time even when nobody has the board open."""
+    while True:
+        await asyncio.sleep(10)
+        for game in list(chess_games.values()):
+            if clock_running(game):
+                try:
+                    async with chess_locks.setdefault(game["id"], asyncio.Lock()):
+                        await check_flag(game)
+                except Exception:
+                    log.exception("Chess clock check failed")
+
+
 async def play_bot_move(game, board):
     """If it's Laden's turn in a game against it, make its move (and end the game if that finishes it)."""
     if game["status"] != "playing" or not is_bot_turn(game, board):
         return
     move = await engine_move(board, game["bot_level"])
     board.push(move)
-    game["moves"].append(move.uci())
+    record_move(game, move.uci())
     outcome = board.outcome(claim_draw=True)
     if outcome:
         await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
@@ -2056,7 +2108,7 @@ async def start_bot_game(update, context, level, menu=None):
             "creator": user.id, "invited": None, "bot_level": level,
             "white": me if my_color == "white" else laden, "black": laden if my_color == "white" else me,
             "moves": [], "status": "playing", "result": None, "reason": None, "draw_offer": None,
-            "created": int(time.time())}
+            "clock": {"white": CHESS_CLOCK, "black": CHESS_CLOCK}, "created": int(time.time())}
     text = (f"♟ <b>{html.escape(user.full_name)}</b> ({my_color.capitalize()}) takes on <b>Laden 🤖</b> "
             f"at level {level}/8 (Stockfish).")
     await post_game(update, context, game, text, menu)
@@ -2129,7 +2181,7 @@ async def start_open_game(update, context, invited, menu=None):
     game = {"id": game_id, "chat_id": chat.id, "message_id": None, "creator": user.id, "invited": invited,
             "white": me if my_color == "white" else None, "black": me if my_color == "black" else None,
             "moves": [], "status": "waiting", "result": None, "reason": None, "draw_offer": None,
-            "created": int(time.time())}
+            "clock": {"white": CHESS_CLOCK, "black": CHESS_CLOCK}, "created": int(time.time())}
     if invited:
         text = f"♟ <b>{html.escape(user.full_name)}</b> challenges <b>{html.escape(invited['name'])}</b> to chess!"
     else:
@@ -2201,6 +2253,9 @@ async def edit_chess_message(game, text):
 
 
 async def finish_game(game, board, result, reason):
+    ticking = clock_running(game)
+    if ticking:  # stop the clock where it is
+        game["clock"][ticking] = time_left(game, ticking)
     game.update(status="over", result=result, reason=reason, draw_offer=None, ended=int(time.time()))
     white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
     moves = (len(game["moves"]) + 1) // 2
@@ -2256,6 +2311,8 @@ def chess_view(game, user_id):
                 last=game["moves"][-1] if game["moves"] else None, result=game["result"], reason=game["reason"],
                 check=chess.square_name(board.king(board.turn)) if board.is_check() else None,
                 pgn=chess_pgn(game, board))
+    if game.get("clock"):
+        view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))
     if color and game["status"] == "playing":
         mine = (color == "white") == board.turn
         view["legal"] = [m.uci() for m in board.legal_moves] if mine else []
@@ -2284,6 +2341,8 @@ async def chess_action(body):
         color = player_color(game, uid)
         if color and game[color]["name"] != name and game["status"] != "over":
             game[color]["name"] = name  # names follow the Telegram profile, tied to the user id
+        if game["status"] == "playing" and await check_flag(game):
+            return 200, chess_view(game, uid)  # out of time: nothing else to do
         if action == "join":
             if game["status"] != "waiting" or color:
                 return 200, chess_view(game, uid)
@@ -2298,7 +2357,7 @@ async def chess_action(body):
                 return 403, {"error": "Only members of the group can join."}
             free = "white" if game["white"] is None else "black"
             game[free] = {"id": uid, "name": name}
-            game["status"] = "playing"
+            game["status"], game["turn_started"] = "playing", time.time()
             await save_game(game)
             white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
             await edit_chess_message(game, f"♟ <b>{white}</b> (White) vs <b>{black}</b> (Black)\n"
@@ -2320,7 +2379,7 @@ async def chess_action(body):
                 if (color == "white") != board.turn or move not in board.legal_moves:
                     return 400, {"error": "That move isn't allowed.", **chess_view(game, uid)}
                 board.push(move)
-                game["moves"].append(move.uci())
+                record_move(game, move.uci())
                 game["draw_offer"] = None  # moving declines a pending offer
                 outcome = board.outcome(claim_draw=True)
                 if outcome:
@@ -2411,6 +2470,7 @@ async def run_web(app, public_url):
 
 async def on_startup(app):
     await register_commands(app)
+    asyncio.create_task(watch_chess_clocks())
     asyncio.create_task(find_stockfish())  # fetch the chess engine now, so the first game against Laden is quick
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if public_url:

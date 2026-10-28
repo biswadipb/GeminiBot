@@ -30,7 +30,14 @@
   .player .dot { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--hint); }
   .player .dot.white { background: #fff; }
   .player .dot.black { background: #222; }
-  .player .turn { margin-left: auto; font-size: 13px; font-weight: 500; color: var(--button); }
+  .player .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .player .turn { font-size: 13px; font-weight: 500; color: var(--button); }
+  .clock {
+    min-width: 64px; padding: 3px 8px; border-radius: 7px; text-align: center; background: var(--card);
+    font-variant-numeric: tabular-nums; font-size: 17px;
+  }
+  .clock.running { background: var(--button); color: var(--button-text); }
+  .clock.low.running { background: var(--danger); color: #fff; }
   .board {
     display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; aspect-ratio: 1;
     border-radius: 6px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.15);
@@ -123,6 +130,7 @@ async function api(action, extra) {
   const data = await r.json().catch(() => ({ error: "Connection problem. Try again." }));
   if (data.error && !data.status) throw new Error(data.error);
   if (data.error && tg) tg.showAlert(data.error);
+  data.receivedAt = performance.now();  // clocks count down locally from here
   return data;
 }
 
@@ -191,7 +199,9 @@ function render() {
 
   const me = s.you, them = me === "white" ? "black" : "white";
   const bottom = me || "white", top = me ? them : "black";
-  const line = c => `<span class="dot ${c}"></span>${esc(s[c])}${s.status === "playing" && s.turn === c ? `<span class="turn">to move</span>` : ""}`;
+  const line = c => `<span class="dot ${c}"></span><span class="name">${esc(s[c])}</span>` +
+    (s.status === "playing" && s.turn === c && !s.running ? `<span class="turn">to move</span>` : "") +
+    (s.clock ? `<span class="clock" data-color="${c}"></span>` : "");
   document.getElementById("topPlayer").innerHTML = line(top);
   document.getElementById("bottomPlayer").innerHTML = line(bottom);
 
@@ -208,6 +218,9 @@ function render() {
   } else {
     status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" : `Waiting for ${s[them]}…`;
   }
+
+  if (s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
+  tickClocks();
 
   const actions = document.getElementById("actions");
   if (s.status !== "playing") actions.innerHTML = "";
@@ -273,6 +286,31 @@ async function act(action) {
   busy = false; render();
 }
 
+function clockText(t) {
+  if (t < 10) return `0:0${t.toFixed(1)}`;
+  const secs = Math.ceil(t);
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+}
+
+let flagCheck = 0;
+function tickClocks() {
+  const s = state;
+  if (!s || !s.clock) return;
+  const elapsed = (performance.now() - s.receivedAt) / 1000;
+  for (const el of document.querySelectorAll(".clock")) {
+    const c = el.dataset.color, running = s.running === c && s.status === "playing";
+    const left = Math.max(0, s.clock[c] - (running ? elapsed : 0));
+    el.textContent = clockText(left);
+    el.classList.toggle("running", running);
+    el.classList.toggle("low", left < 30);
+    if (running && left === 0 && !busy && performance.now() - flagCheck > 1500) {
+      flagCheck = performance.now();  // time's up here: ask the server to end the game
+      api("state").then(fresh => { state = fresh; render(); }).catch(() => {});
+    }
+  }
+}
+setInterval(tickClocks, 200);
+
 async function poll() {
   if (!busy && !document.hidden && state && state.status !== "over") {
     try {
@@ -280,6 +318,8 @@ async function poll() {
       if (fresh.version !== state.version || fresh.status !== state.status) {
         if (state.status === "playing" && fresh.turn === fresh.you && state.turn !== fresh.turn) haptic("medium");
         state = fresh; selected = null; render();
+      } else {
+        state.clock = fresh.clock; state.receivedAt = fresh.receivedAt;  // stay in sync with the server's clock
       }
     } catch (e) {}
   }

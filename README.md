@@ -59,6 +59,7 @@ All settings live in `.env`:
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
 | `CHESS_APP_NAME` | no | – | Short name of a BotFather `/newapp` Mini App for `/chessmatch`; empty uses the bot's Main Mini App |
 | `STOCKFISH_PATH` | no | – | Path to a Stockfish binary for `/chessmatch bot`; empty = download the official release on first start |
+| `CHESS_CLOCK_MINUTES` | no | `10` | Minutes on each player's chess clock |
 | `ADMIN_USER_IDS` | no | – | Comma-separated user IDs exempt from usage limits |
 | `LIMIT_CHAT_DAILY` | no | `150` | Messages per person per day (`0` = unlimited) |
 | `LIMIT_SEARCH_DAILY` | no | `10` | `/search` uses per person per day |
@@ -94,6 +95,7 @@ If both allowlists are empty, anyone can use the bot.
 - Very rarely (about 0.1% of messages) Laden replies with emojis: usually one emoji repeated (laughs like 😂😂😂 come in bursts, sometimes long ones), occasionally a mixed combo (😏🍆💦). Set `EMOJI_REPLY_RATE` (`0` to disable).
 - `/calc 2+2*3` or "Laden what's 15% of 80" – exact arithmetic computed by code with Python's `fractions` (0.1+0.2 = 0.3 exactly, 1/3 kept as an exact fraction) and 50-digit `decimal` for roots, logs and pi (no Gemini quota used); supports + - * / ^ %, `x`, `×`, `÷`, `% of`, sqrt, abs, round, log, ln, sin/cos/tan (degrees), pi, e
 - `/ppcheck [name]` (or as a reply; with no name it picks a random member other than the sender) – "name's pp is like this 8===D" with a random length: 2–4 common, 5+ rare, up to 20
+- Chess games have a 10-minute clock per player (set `CHESS_CLOCK_MINUTES`). Clocks start after both sides' first moves; running out of time loses (or draws if the opponent can't checkmate). The server keeps time, so it can't be cheated
 - `/chessmatch` alone shows buttons: **👥 Anyone (open slot)** or **🤖 Laden**, then Laden's level 1–8 (only the person who asked can press them)
 - `/chessmatch [@someone | name]` (or as a reply) – a chess game in a Telegram Mini App. Invite someone or leave the slot open for any group member. Only the two players can see the board while it's on; when it ends, Laden posts the winner and the full notation in the group. Players are tied to their user IDs and shown by their Telegram profile names. Needs a one-time BotFather setup (see below)
 - `/chessmatch bot [1-8]` (or `laden 5`, `@DaLadenBot 5`, or as a reply to Laden) – play Laden 🤖, powered by the open-source [Stockfish](https://stockfishchess.org) engine. Level 1 is a beginner, 8 is very strong (default 3). The engine is downloaded once on first start (set `STOCKFISH_PATH` to use your own); if it's unavailable Laden plays a simple capture-happy fallback. No draw offers against Laden. Board pieces are the cburnett set (GPLv2+) by Colin M.L. Burnett, as on lichess.org
