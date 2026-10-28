@@ -688,4 +688,284 @@ class Go(Rules):
         return go_point(best[1])
 
 
-GAMES = {rules.kind: rules for rules in (Chess(), Othello(), Checkers(), Go())}
+# ---------------------------------------------------------------- games on points joined by lines (alquerque, 16 beads)
+
+def alquerque_lines(n, row0=0):
+    """Rows, columns and the alquerque diagonals (through points whose row + column is even) of an n x n grid."""
+    rows = [[(r, c) for c in range(n)] for r in range(row0, row0 + n)]
+    cols = [[(r, c) for r in range(row0, row0 + n)] for c in range(n)]
+    diagonals = []
+    for k in range(-(n - 1), n):
+        if k % 2 == 0:
+            diagonals.append([(r, r - row0 + k) for r in range(row0, row0 + n) if 0 <= r - row0 + k < n])
+    for k in range(0, 2 * n - 1):
+        if k % 2 == 0:
+            diagonals.append([(r, k - (r - row0)) for r in range(row0, row0 + n) if 0 <= k - (r - row0) < n])
+    return [line for line in rows + cols + diagonals if len(line) > 1]
+
+
+def sixteen_beads_lines():
+    """A 5x5 alquerque square (rows 0-4) with a triangle of six points beyond the middle of each end."""
+    lines = []
+    for line in alquerque_lines(5):
+        if line == [(r, 2) for r in range(5)]:
+            line = [(-2, 2), (-1, 2)] + line + [(5, 2), (6, 2)]  # the middle column runs through both triangles
+        elif line == [(0, 2), (1, 3), (2, 4)]:
+            line = [(-2, 0), (-1, 1)] + line
+        elif line == [(0, 2), (1, 1), (2, 0)]:
+            line = [(-2, 4), (-1, 3)] + line
+        elif line == [(2, 0), (3, 1), (4, 2)]:
+            line = line + [(5, 3), (6, 4)]
+        elif line == [(2, 4), (3, 3), (4, 2)]:
+            line = line + [(5, 1), (6, 0)]
+        lines.append(line)
+    lines += [[(-1, 1), (-1, 2), (-1, 3)], [(-2, 0), (-2, 2), (-2, 4)],
+              [(5, 1), (5, 2), (5, 3)], [(6, 0), (6, 2), (6, 4)]]
+    return lines
+
+
+class LineBoard:
+    """Points (numbered 1.. in reading order) joined by straight lines: who's next to whom, what can be jumped."""
+
+    def __init__(self, lines):
+        coords = sorted({p for line in lines for p in line})
+        self.coords = coords
+        self.index = {p: i for i, p in enumerate(coords)}
+        self.lines = [[self.index[p] for p in line] for line in lines]
+        self.steps = {i: [] for i in range(len(coords))}  # neighbours
+        self.jumps = {i: [] for i in range(len(coords))}  # (over, land)
+        self.rays = {i: [] for i in range(len(coords))}  # points along each line, nearest first
+        self.between = {}  # (a, b) on one line -> points strictly between them
+        for line in self.lines:
+            for seq in (line, line[::-1]):
+                for i, a in enumerate(seq):
+                    if i + 1 < len(seq):
+                        self.steps[a].append(seq[i + 1])
+                        self.rays[a].append(seq[i + 1:])
+                    if i + 2 < len(seq):
+                        self.jumps[a].append((seq[i + 1], seq[i + 2]))
+                    for j in range(i + 1, len(seq)):
+                        self.between[a, seq[j]] = seq[i + 1:j]
+        self.top, self.bottom = coords[0][0], coords[-1][0]
+
+    def row(self, i):
+        return self.coords[i][0]
+
+    def segments(self):
+        return sorted({tuple(sorted((a, b))) for line in self.lines for a, b in zip(line, line[1:])})
+
+
+class LineGameState:
+    __slots__ = ("board", "turn", "quiet")
+
+    def __init__(self, board, turn, quiet):
+        self.board, self.turn, self.quiet = board, turn, quiet  # board: list of "." "b" "w" "B" "W" per point
+
+
+class LineGame(Rules):
+    """Alquerque-family games: pieces move along the lines and capture by jumping over an enemy piece."""
+    men_move = "any"  # "any" direction, "forward_sideways", or "forward"
+    frozen_back_row = False  # men on the far row may only capture
+    kings = False  # men reaching the far row become flying kings
+    compulsory = True  # must capture when possible (and finish the whole chain)
+    quiet_limit = 60  # 30 moves each without a capture: draw
+
+    def __init__(self, lines, black_rows, white_rows, middle_split=None):
+        self.grid = LineBoard(lines)
+        board = ["."] * len(self.grid.coords)
+        for i, (r, c) in enumerate(self.grid.coords):
+            if r in black_rows:
+                board[i] = "b"
+            elif r in white_rows:
+                board[i] = "w"
+            elif middle_split and r == middle_split[0]:  # the middle row is shared: each side gets half
+                board[i] = "w" if c < middle_split[1] else "b" if c > middle_split[1] else "."
+        self.start = board
+        self.pieces = board.count("b")
+
+    def new(self):
+        return LineGameState(self.start[:], "black", 0)
+
+    def turn(self, state):
+        return state.turn
+
+    def name(self, i):
+        return str(i + 1)
+
+    def far_row(self, piece):
+        return self.grid.bottom if piece.lower() == "b" else self.grid.top
+
+    def step_ok(self, piece, a, b):
+        if piece.isupper() or self.men_move == "any":
+            return True
+        dr = self.grid.row(b) - self.grid.row(a)
+        forward = dr > 0 if piece == "b" else dr < 0
+        return forward or (dr == 0 and self.men_move == "forward_sideways")
+
+    def capture_options(self, board, pos, piece, taken, start):
+        """(captured point, [landing points]) for one more jump from pos."""
+        mine = piece.lower()
+        free = lambda p: board[p] == "." or p == start
+        options = []
+        if piece.isupper() and self.kings:  # flying king: any distance up to the enemy, any free point beyond
+            for ray in self.grid.rays[pos]:
+                k = 0
+                while k < len(ray) and free(ray[k]) and ray[k] not in taken:
+                    k += 1
+                if k < len(ray) and ray[k] not in taken and board[ray[k]] != "." and board[ray[k]].lower() != mine:
+                    lands = []
+                    for p in ray[k + 1:]:
+                        if not free(p) or p in taken:
+                            break
+                        lands.append(p)
+                    if lands:
+                        options.append((ray[k], lands))
+            return options
+        for over, land in self.grid.jumps[pos]:
+            if board[over] != "." and board[over].lower() != mine and over not in taken and free(land):
+                options.append((over, [land]))
+        return options
+
+    def capture_paths(self, board, start, piece):
+        paths = []
+
+        def extend(pos, path, taken):
+            grew = False
+            for over, lands in self.capture_options(board, pos, piece, taken, start):
+                for land in lands:
+                    grew = True
+                    extend(land, path + [land], taken | {over})
+            if len(path) > 1 and (not grew or not self.compulsory):
+                paths.append(path)  # optional captures may stop after any jump
+
+        extend(start, [start], frozenset())
+        return paths
+
+    def moves_for(self, state):
+        mine = state.turn[0]
+        captures, steps = [], []
+        for i, piece in enumerate(state.board):
+            if piece.lower() != mine:
+                continue
+            for path in self.capture_paths(state.board, i, piece):
+                captures.append("x".join(self.name(p) for p in path))
+            if self.frozen_back_row and piece.islower() and self.grid.row(i) == self.far_row(piece):
+                continue
+            if piece.isupper() and self.kings:
+                for ray in self.grid.rays[i]:
+                    for p in ray:
+                        if state.board[p] != ".":
+                            break
+                        steps.append(f"{self.name(i)}-{self.name(p)}")
+            else:
+                steps += [f"{self.name(i)}-{self.name(b)}" for b in self.grid.steps[i]
+                          if state.board[b] == "." and self.step_ok(piece, i, b)]
+        if captures and self.compulsory:
+            return captures
+        return captures + steps
+
+    def legal(self, state):
+        if state.quiet >= self.quiet_limit:
+            return []
+        return self.moves_for(state)
+
+    def play(self, state, move):
+        if move not in self.legal(state):
+            raise ValueError("illegal move")
+        points = [int(p) - 1 for p in move.replace("x", "-").split("-")]
+        board = state.board[:]
+        piece = board[points[0]]
+        board[points[0]] = "."
+        captured = "x" in move
+        if captured:
+            for a, b in zip(points, points[1:]):
+                for p in self.grid.between[a, b]:
+                    board[p] = "."
+        end = points[-1]
+        if self.kings and piece.islower() and self.grid.row(end) == self.far_row(piece):
+            piece = piece.upper()
+        board[end] = piece
+        return LineGameState(board, OTHER[state.turn], 0 if captured else state.quiet + 1)
+
+    def outcome(self, state):
+        if state.quiet >= self.quiet_limit:
+            return None, f"{self.quiet_limit // 2} moves each without a capture"
+        if self.moves_for(state):
+            return None
+        mine = state.turn[0]
+        how = "capturing every piece" if not any(p.lower() == mine for p in state.board) else "leaving no moves"
+        return OTHER[state.turn], how
+
+    def snapshot(self, state):
+        return "".join(state.board)
+
+    def score(self, state):
+        left = {c: sum(1 for p in state.board if p.lower() == c[0]) for c in ("black", "white")}
+        return {"black": self.pieces - left["white"], "white": self.pieces - left["black"]}  # pieces captured
+
+    def layout(self):
+        return {"points": [[c, r] for r, c in self.grid.coords], "segments": self.grid.segments(), "pieces": self.pieces}
+
+    # computer opponent
+    def ordered_moves(self, state):
+        return sorted(self.moves_for(state), key=lambda m: -m.count("x"))
+
+    def evaluate(self, state):
+        result = self.outcome(state)
+        if result:
+            return 0 if result[0] is None else (10000 if result[0] == state.turn else -10000)
+        mine, total = state.turn[0], 0
+        span = self.grid.bottom - self.grid.top
+        for i, piece in enumerate(state.board):
+            if piece == ".":
+                continue
+            if piece.isupper():
+                value = 300
+            else:
+                value = 100
+                if self.kings:  # heading for the far row
+                    advanced = self.grid.row(i) - self.grid.top if piece == "b" else self.grid.bottom - self.grid.row(i)
+                    value += 20 * advanced // max(span, 1)
+            value += 2 * len(self.grid.steps[i])  # well-connected points are stronger
+            total += value if piece.lower() == mine else -value
+        return total
+
+    def bot_move(self, state, level):
+        moves = self.legal(state)
+        if len(moves) == 1:
+            return moves[0]
+        if level == 1:
+            return random.choice(moves)
+        depth, seconds = {2: (2, 0.4), 3: (3, 0.8), 4: (5, 1.4), 5: (8, 2.0)}[level]
+        return negamax_search(self, state, depth, seconds)
+
+
+class Alquerque(LineGame):
+    kind, title, emoji, clock_minutes = "alquerque", "Alquerque (5×5)", "⚪", 5  # about 15 moves each
+    level_note = "1 = beginner · 3 = casual · 5 = strongest"
+    men_move, frozen_back_row, size = "forward_sideways", True, 5
+
+    def __init__(self):
+        super().__init__(alquerque_lines(5), black_rows={0, 1}, white_rows={3, 4}, middle_split=(2, 2))
+
+
+class BigAlquerque(LineGame):
+    kind, title, emoji, clock_minutes = "alquerque9", "Alquerque (9×9)", "⚪", 10  # about 60 moves each
+    level_note = "1 = beginner · 3 = casual · 5 = strongest"
+    men_move, kings, size = "forward", True, 9
+
+    def __init__(self):
+        super().__init__(alquerque_lines(9), black_rows={0, 1, 2, 3}, white_rows={5, 6, 7, 8}, middle_split=(4, 4))
+
+
+class SixteenBeads(LineGame):
+    kind, title, emoji, clock_minutes = "beads", "16 Beads", "🔴", 10
+    level_note = "1 = beginner · 3 = casual · 5 = strongest"
+    compulsory = False
+
+    def __init__(self):
+        super().__init__(sixteen_beads_lines(), black_rows={-2, -1, 0, 1}, white_rows={3, 4, 5, 6})
+
+
+GAMES = {rules.kind: rules for rules in (Chess(), Othello(), Checkers(), Go(), Alquerque(), BigAlquerque(),
+                                       SixteenBeads())}

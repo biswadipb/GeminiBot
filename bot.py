@@ -630,7 +630,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
-        "/chessmatch · /othello · /checkers · /go – board games: challenge someone, leave the slot open, or play Laden\n"
+        "/chessmatch · /othello · /checkers · /go · /16beads · /alquerque – board games: challenge someone, "
+        "leave the slot open, or play Laden\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -1928,7 +1929,9 @@ GAME_MAX_OPEN = 3  # unfinished games one person may have at once (all games tog
 CHESS_CLOCK_MINUTES = os.getenv("CHESS_CLOCK_MINUTES")  # overrides chess's 10 minutes; other games use their own
 BOT_DEFAULT_LEVEL = 3
 BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
-GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go"}
+GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go", "beads": "16beads",
+                 "alquerque": "alquerque", "alquerque9": "alquerque"}  # /alquerque asks for the board size first
+BIG_BOARD_WORDS = {"9x9", "9×9", "big", "bigger", "large"}
 board_games = {}  # game id -> game dict; cache of Redis game:<id>
 game_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
 
@@ -2266,6 +2269,15 @@ def game_command(kind):
             return
 
         quoted = msg.reply_to_message
+        if kind == "alquerque" and not context.args and not quoted:  # board size first
+            await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, which alquerque board?",
+                                 parse_mode=ParseMode.HTML, reply_markup=size_menu(user.id), do_quote=is_group(update))
+            return
+        if kind == "alquerque" and any(a.lower() in BIG_BOARD_WORDS for a in context.args):
+            context.args = [a for a in context.args if a.lower() not in BIG_BOARD_WORDS and a.lower() not in ("5x5", "5×5")]
+            await game_command("alquerque9")(update, context)
+            return
+        context.args = [a for a in context.args if a.lower() not in ("5x5", "5×5")]
         if not context.args and not quoted:  # nothing specified: let them pick with buttons
             await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, who do you want to play "
                                  f"{rules.title.lower()} with?\n\n<i>To challenge someone specific: /{command} @name, "
@@ -2314,6 +2326,13 @@ def game_command(kind):
 LEVEL_LABELS = {1: "1 🐣", 3: "3 🙂", 5: "5 😤", 7: "7 🔥", 8: "8 💀"}
 
 
+def size_menu(user_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("5×5 (standard)", callback_data=f"game|alquerque|size|{user_id}"),
+        InlineKeyboardButton("9×9 (bigger)", callback_data=f"game|alquerque9|size|{user_id}"),
+    ]])
+
+
 def opponent_menu(kind, user_id):
     rules = GAMES[kind]
     return InlineKeyboardMarkup([
@@ -2344,6 +2363,11 @@ async def game_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
     name = html.escape(update.effective_user.full_name)
+    if choice == "size":  # alquerque board picked: on to the opponent
+        await query.answer()
+        await query.edit_message_text(f"{rules.emoji} <b>{name}</b>, who do you want to play {rules.title.lower()} with?",
+                                      parse_mode=ParseMode.HTML, reply_markup=opponent_menu(kind, update.effective_user.id))
+        return
     if choice == "bot":
         await query.answer()
         await query.edit_message_text(f"🤖 <b>{name}</b>, how strong should Laden be?\n\n{rules.level_note}",
@@ -2424,6 +2448,8 @@ def game_view(game, user_id):
     names = {c: (game.get(c) or {}).get("name") for c in ("white", "black")}
     view = {"kind": rules.kind, "title": rules.title, "first": game.get("first", "white"), "status": game["status"],
             "version": game.get("version", 0), "you": color, "bot": bool(game.get("bot_level"))}
+    if hasattr(rules, "layout"):
+        view["layout"] = rules.layout()  # boards made of points and lines
     if game["status"] == "waiting":
         invited = game.get("invited")
         view.update(host=names["white"] or names["black"], invited=invited and invited["name"],
@@ -2618,6 +2644,8 @@ async def register_commands(app):
         ("othello", "Play othello: @someone, open slot, or Laden"),
         ("checkers", "Play checkers: @someone, open slot, or Laden"),
         ("go", "Play go (9×9): @someone, open slot, or Laden"),
+        ("16beads", "Play 16 beads: @someone, open slot, or Laden"),
+        ("alquerque", "Play alquerque (5×5 or 9×9): @someone, open slot, or Laden"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
@@ -2744,7 +2772,9 @@ def main():
     app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
     for kind, command in GAME_COMMANDS.items():
-        app.add_handler(CommandHandler(command, game_command(kind)))
+        if kind != "alquerque9":  # reached through /alquerque
+            app.add_handler(CommandHandler(command, game_command(kind)))
+    app.add_handler(CommandHandler("beads", game_command("beads")))
     app.add_handler(CallbackQueryHandler(game_menu, pattern=r"^game\|"))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
