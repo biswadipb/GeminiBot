@@ -362,7 +362,8 @@ function render() {
     if (theyPassed) text = s.kind === "go" ? `${s[them]} passed. Pass too to end the game, or play on.` : `${s[them]} had no moves and passed. Your move.`;
     status.textContent = text; status.classList.add("strong");
   } else {
-    status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" : `Waiting for ${s[them]}…`;
+    status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" :
+      s.bot ? `${s[them]} is thinking…` : `Waiting for ${s[them]}…`;
   }
   if (!reviewing && s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
   tickClocks();
@@ -716,6 +717,69 @@ function closeMoves() { document.getElementById("sheet").classList.remove("open"
 
 // ---------- dice games: snakes and ladders, ludo
 
+let slide = {};  // player -> [x, y] while their counter slides along a snake or ladder
+let animating = false, queuedState = null;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function showParty(fresh) {
+  // Show a new dice-game state, moving counters and tokens step by step instead of jumping
+  if (!state || !state.party || !state.state || !fresh.state || fresh.kind !== state.kind) { state = fresh; return render(); }
+  if (animating) { queuedState = fresh; return; }
+  animating = true;
+  const old = state;
+  try {
+    if (fresh.kind === "snakes") await animateSnakes(old, fresh);
+    else await animateLudo(old, fresh);
+  } catch (e) {}
+  slide = {}; state = fresh; animating = false; render();
+  if (queuedState) { const next = queuedState; queuedState = null; showParty(next); }
+}
+
+function frame(fresh, changes) {
+  // draw the new state (log, dice, turn) with pieces where the animation has got to
+  state = { ...fresh, movable: [], state: { ...fresh.state, ...changes } };
+  renderParty();
+}
+
+async function animateSnakes(old, fresh) {
+  const L = fresh.layout, pos = [...old.state.pos], dice = fresh.state.dice;
+  frame(fresh, { pos: [...pos] });
+  for (let i = 0; i < pos.length; i++) {
+    const a = old.state.pos[i], b = fresh.state.pos[i];
+    if (a === b) continue;
+    const landed = a + dice, jump = landed <= 100 && landed !== b && (L.ladders[landed] === b || L.snakes[landed] === b);
+    const end = jump ? landed : (b > a && b - a <= 6 ? b : null);
+    if (end !== null) {
+      for (let sq = a + 1; sq <= end; sq++) { pos[i] = sq; frame(fresh, { pos: [...pos] }); await sleep(180); }
+    }
+    if (jump) {  // slide along the ladder or snake
+      await sleep(150);
+      const [x1, y1] = snakesCell(landed), [x2, y2] = snakesCell(b);
+      for (let k = 1; k <= 12; k++) { slide = { [i]: [x1 + (x2 - x1) * k / 12, y1 + (y2 - y1) * k / 12] }; frame(fresh, { pos: [...pos] }); await sleep(45); }
+      slide = {};
+    }
+    pos[i] = b; frame(fresh, { pos: [...pos] });
+  }
+}
+
+async function animateLudo(old, fresh) {
+  const tokens = old.state.tokens.map(t => [...t]);
+  frame(fresh, { tokens: tokens.map(t => [...t]) });
+  const captured = [];
+  for (let i = 0; i < tokens.length; i++) for (let t = 0; t < 4; t++) {
+    const a = old.state.tokens[i][t], b = fresh.state.tokens[i][t];
+    if (a === b) continue;
+    if (b === -1) { captured.push([i, t]); continue; }  // knocked back: shown after the move that did it
+    if (a === -1) { tokens[i][t] = 0; frame(fresh, { tokens: tokens.map(x => [...x]) }); await sleep(250); continue; }
+    for (let p = a + 1; p <= b; p++) { tokens[i][t] = p; frame(fresh, { tokens: tokens.map(x => [...x]) }); await sleep(150); }
+  }
+  if (captured.length) {
+    await sleep(200);
+    for (const [i, t] of captured) tokens[i][t] = -1;
+    frame(fresh, { tokens: tokens.map(x => [...x]) });
+  }
+}
+
 const PARTY_COLOURS = ["#e53935", "#43a047", "#fbc02d", "#1e88e5", "#8e24aa", "#fb8c00"];
 const LUDO_COLOURS = { red: "#e53935", green: "#43a047", yellow: "#fbc02d", blue: "#1e88e5" };
 const DICE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
@@ -832,7 +896,9 @@ function snakesBoard() {
       `<circle cx="${x1}" cy="${y1}" r=".2" fill="#2e7d32"/><circle cx="${x1 - .07}" cy="${y1 - .05}" r=".04" fill="#fff"/><circle cx="${x1 + .07}" cy="${y1 - .05}" r=".04" fill="#fff"/>`;
   }
   const spots = {};
-  s.state.pos.forEach((p, i) => { if (p) (spots[p] = spots[p] || []).push(i); });
+  s.state.pos.forEach((p, i) => { if (p && !(i in slide)) (spots[p] = spots[p] || []).push(i); });
+  for (const [i, [x, y]] of Object.entries(slide))  // a counter sliding along a snake or ladder
+    svg += `<circle cx="${x}" cy="${y}" r=".24" fill="${playerColour(+i)}" stroke="#222" stroke-width=".05"/>`;
   for (const [square, who] of Object.entries(spots)) {
     const [x, y] = snakesCell(+square);
     who.forEach((i, k) => {
@@ -895,15 +961,19 @@ function leaveParty() {
 async function roll() {
   if (busy) return;
   busy = true; document.getElementById("rollBtn").disabled = true;
-  try { state = await api("roll"); haptic("heavy"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
-  busy = false; render();
+  let fresh = null;
+  try { fresh = await api("roll"); haptic("heavy"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false;
+  if (fresh) showParty(fresh); else render();
 }
 
 async function moveToken(token) {
   if (busy) return;
   busy = true;
-  try { state = await api("move", { token }); haptic("medium"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
-  busy = false; render();
+  let fresh = null;
+  try { fresh = await api("move", { token }); haptic("medium"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false;
+  if (fresh) showParty(fresh); else render();
 }
 
 // ---------- clocks and staying in sync
@@ -933,20 +1003,28 @@ function tickClocks() {
 }
 setInterval(tickClocks, 200);
 
+function botToMove() {
+  const s = state;
+  if (!s || s.status !== "playing") return false;
+  if (s.party) return !!(s.state && s.players[s.state.turn] && s.players[s.state.turn].bot);
+  return s.bot && s.turn !== s.you;
+}
+
 async function poll() {
-  if (!busy && !document.hidden && state && state.status !== "over") {
+  if (!busy && !animating && !document.hidden && state && state.status !== "over") {
     try {
       const fresh = await api("state");
       if (fresh.version !== state.version || fresh.status !== state.status) {
         if (state.status === "playing" && fresh.turn === fresh.you && state.turn !== fresh.turn) haptic("medium");
-        state = fresh; selected = null; fpath = []; fkinds = []; render();
+        selected = null; fpath = []; fkinds = [];
+        if (fresh.party) showParty(fresh); else { state = fresh; render(); }
       } else {
         state.clock = fresh.clock; state.seconds_left = fresh.seconds_left;  // stay in sync with the server's clock
         state.receivedAt = fresh.receivedAt;
       }
     } catch (e) {}
   }
-  setTimeout(poll, 2000);
+  setTimeout(poll, botToMove() || animating ? 500 : 2000);  // check often while a bot is playing
 }
 
 (async () => {

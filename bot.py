@@ -2127,8 +2127,8 @@ def record_move(game, move):
 
 
 async def advance(game, rules, state):
-    """After a move: end the game if it's over, play forced moves (like a pass in othello) and Laden's
-    moves, until it's a person's turn."""
+    """After a move: end the game if it's over and play forced moves (like a pass in othello). Laden's own
+    moves are played separately by bot_turns, at a human pace."""
     while game["status"] == "playing":
         result = rules.outcome(state)
         if result:
@@ -2136,13 +2136,69 @@ async def advance(game, rules, state):
             break
         move = rules.forced(state)
         if not move:
-            player = game.get(rules.turn(state)) or {}
-            if not player.get("bot"):
-                break
-            move = await laden_move(game, rules, state)
+            break
         state = rules.play(state, move)
         record_move(game, move)
     return state
+
+
+# Bots (Laden in two-player games, the dice-game bots) move in the background, one action at a time with a
+# pause first, so people can see each move instead of everything happening at once.
+BOT_PAUSE = {"party": 1.3, "board": 1.1}  # seconds before each bot action: always over a second
+bot_tasks = {}  # game id -> the task playing that game's bot turns
+
+
+def bot_to_move(game):
+    if game["status"] != "playing":
+        return False
+    if game.get("party"):
+        state = game["state"]
+        return state["winner"] is None and bool(game["players"][state["turn"]].get("bot"))
+    rules = game_rules(game)
+    state = rules.replay(game["moves"])
+    return not rules.outcome(state) and bool((game.get(rules.turn(state)) or {}).get("bot"))
+
+
+def schedule_bots(game):
+    """Start playing this game's bot turns, unless that's already under way."""
+    task = bot_tasks.get(game["id"])
+    if bot_to_move(game) and not (task and not task.done()):
+        bot_tasks[game["id"]] = asyncio.create_task(bot_turns(game["id"]))
+
+
+async def bot_turns(game_id):
+    while True:
+        game = board_games.get(game_id)
+        if not game:
+            bot_tasks.pop(game_id, None)
+            return
+        await asyncio.sleep(BOT_PAUSE["party" if game.get("party") else "board"])
+        try:
+            async with game_locks.setdefault(game_id, asyncio.Lock()):
+                if not bot_to_move(game):
+                    bot_tasks.pop(game_id, None)  # under the lock, so a new move can schedule again
+                    return
+                await bot_step(game)
+        except Exception:
+            log.exception("A bot turn failed")
+            bot_tasks.pop(game_id, None)
+            return
+
+
+async def bot_step(game):
+    """One action by whichever bot is to play: a roll or token move in dice games, a move in board games."""
+    if game.get("party"):
+        rules, state = PARTY_GAMES[game["kind"]], game["state"]
+        party_log(game, rules.auto(state))
+        if state["winner"] is not None:
+            await finish_party(game)
+    else:
+        rules = game_rules(game)
+        state = rules.replay(game["moves"])
+        move = await laden_move(game, rules, state)
+        record_move(game, move)
+        await advance(game, rules, rules.play(state, move))
+    await save_game(game)
 
 
 async def check_flag(game):
@@ -2172,6 +2228,8 @@ async def watch_game_clocks():
                 except Exception:
                     log.exception("Waiting room check failed")
                 continue
+            if game["status"] == "playing" and not (bot_tasks.get(game["id"]) and not bot_tasks[game["id"]].done()):
+                schedule_bots(game)
             if clock_running(game) or (game.get("party") and game["status"] == "playing"):
                 try:
                     async with game_locks.setdefault(game["id"], asyncio.Lock()):
@@ -2247,8 +2305,8 @@ async def start_bot_game(update, context, kind, level, menu=None):
             f"<b>Laden 🤖</b> at {rules.title.lower()}, level {level}/{rules.levels}. "
             f"{clock_seconds(rules) // 60} minutes each.")
     await post_game(update, context, game, text, menu)
-    await advance(game, rules, rules.new())  # Laden opens when it moves first
     await save_game(game)
+    schedule_bots(game)  # Laden opens when it moves first
 
 
 async def start_open_game(update, context, kind, invited, menu=None):
@@ -2523,6 +2581,7 @@ async def game_action(body):
     game = await load_game(str(body.get("game", "")))
     if not game:
         return 404, {"error": "This game doesn't exist (games are kept for 7 days)."}
+    schedule_bots(game)  # e.g. after a restart, pick up a bot turn that was under way
     action, uid = body.get("action", "state"), user["id"]
     name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
     rules = game_rules(game)
@@ -2575,6 +2634,8 @@ async def game_action(body):
                 record_move(game, move)
                 game["draw_offer"] = None  # moving declines a pending offer
                 await advance(game, rules, state)
+                await save_game(game)
+                schedule_bots(game)
             elif action == "resign":
                 await finish_game(game, OTHER[color], "resignation")
             elif action == "offer_draw" and game.get("bot_level"):
@@ -2615,16 +2676,10 @@ def bot_count(words):
 
 
 async def run_bots(game):
-    """Play every bot turn in a row until it's a person's turn or someone has won."""
-    rules, state = PARTY_GAMES[game["kind"]], game["state"]
-    for _ in range(500):
-        if game["status"] != "playing" or state["winner"] is not None:
-            break
-        if not game["players"][state["turn"]].get("bot"):
-            break
-        party_log(game, rules.auto(state))
-    if game["status"] == "playing" and state["winner"] is not None:
+    """Hand over to the bots if it's their turn (they play in the background, one action at a time)."""
+    if game["status"] == "playing" and game["state"]["winner"] is not None:
         await finish_party(game)
+    schedule_bots(game)
 
 
 def party_names(game):
