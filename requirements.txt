@@ -6,3 +6,6 @@ ddgs>=9.0
 huggingface_hub>=0.30
 pillow>=10.0
 chess>=1.10
+fonttools>=4.0
+arabic-reshaper>=3.0
+python-bidi>=0.4

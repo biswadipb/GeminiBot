@@ -1,11 +1,16 @@
 """Pictures of finished games for the result post: the final position, the players and who won."""
 
 import io
+import logging
 import math
 import os
 import unicodedata
+import urllib.request
 
-from PIL import Image, ImageDraw, ImageFont
+import arabic_reshaper
+from bidi.algorithm import get_display
+from fontTools.ttLib import TTFont
+from PIL import Image, ImageDraw, ImageFont, features
 
 from boardgames import (GAMES, GO_SIZE, GO_STAR_POINTS, LADDERS, LUDO_HOME_COLUMNS, LUDO_OFFSET, LUDO_SAFE,
                         LUDO_TRACK, SNAKES, checkers_coords)
@@ -23,14 +28,108 @@ PARTY = [(229, 57, 53), (67, 160, 71), (251, 192, 45), (30, 136, 229), (142, 36,
 _pieces = {}
 
 
-def font(size):
-    return ImageFont.load_default(size=size * SCALE)
+# Text in the pictures can contain anything people put in their names, so each character is drawn with the
+# first of these fonts that has it: Noto for most writing, symbols, maths, currencies and emoji, then GNU Unifont,
+# which has a glyph for virtually every Unicode character. They're downloaded once at startup (fonts/ folder).
+log = logging.getLogger("gemini-bot")
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+NOTO = "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/"
+UNIFONT = "https://ftp.gnu.org/gnu/unifont/unifont-18.0.01/"
+FONT_SOURCES = [
+    ("NotoSans.ttf", NOTO + "notosans/NotoSans%5Bwdth,wght%5D.ttf"),
+    ("NotoSansSymbols.ttf", NOTO + "notosanssymbols/NotoSansSymbols%5Bwght%5D.ttf"),
+    ("NotoSansSymbols2.ttf", NOTO + "notosanssymbols2/NotoSansSymbols2-Regular.ttf"),
+    ("NotoSansMath.ttf", NOTO + "notosansmath/NotoSansMath-Regular.ttf"),
+    ("NotoSansBengali.ttf", NOTO + "notosansbengali/NotoSansBengali%5Bwdth,wght%5D.ttf"),
+    ("NotoSansDevanagari.ttf", NOTO + "notosansdevanagari/NotoSansDevanagari%5Bwdth,wght%5D.ttf"),
+    ("NotoSansArabic.ttf", NOTO + "notosansarabic/NotoSansArabic%5Bwdth,wght%5D.ttf"),
+    ("NotoEmoji.ttf", NOTO + "notoemoji/NotoEmoji%5Bwght%5D.ttf"),
+    ("NotoSansEgyptianHieroglyphs.ttf", NOTO + "notosansegyptianhieroglyphs/NotoSansEgyptianHieroglyphs-Regular.ttf"),
+    ("unifont.otf", UNIFONT + "unifont-18.0.01.otf"),
+    ("unifont_upper.otf", UNIFONT + "unifont_upper-18.0.01.otf"),
+]
+_stack = None  # [(font path, set of characters it has)], in FONT_SOURCES order
+_fonts = {}
+
+
+def download_fonts():
+    """Fetch any missing fonts (about 15 MB in all). Runs in the background at startup; until it's done,
+    pictures use whatever fonts are already there."""
+    global _stack
+    os.makedirs(FONT_DIR, exist_ok=True)
+    for name, url in FONT_SOURCES:
+        path = os.path.join(FONT_DIR, name)
+        if os.path.exists(path):
+            continue
+        try:
+            urllib.request.urlretrieve(url, path + ".part")
+            os.replace(path + ".part", path)
+        except Exception as e:
+            log.warning("Could not download font %s: %s", name, e)
+    _stack = None  # re-read the fonts on next use
+
+
+def font_stack():
+    global _stack
+    if _stack is None:
+        stack = []
+        for name, _ in FONT_SOURCES:
+            path = os.path.join(FONT_DIR, name)
+            if os.path.exists(path):
+                try:
+                    with TTFont(path, lazy=True) as f:
+                        stack.append((path, set(f.getBestCmap())))
+                except Exception:
+                    log.exception("Unreadable font %s", name)
+        _stack = stack
+    return _stack
+
+
+def font(size, path=None):
+    key = (size, path)
+    if key not in _fonts:
+        if path:
+            engine = ImageFont.Layout.RAQM if SHAPING else ImageFont.Layout.BASIC
+            _fonts[key] = ImageFont.truetype(path, size * SCALE, layout_engine=engine)
+        else:
+            _fonts[key] = ImageFont.load_default(size=size * SCALE)
+    return _fonts[key]
+
+
+SHAPING = features.check("raqm")  # Pillow can lay out Arabic, Bengali etc. itself when it has libraqm
+
+
+def visual_order(words):
+    """Without libraqm, put right-to-left text (Arabic, Hebrew) in display order and join Arabic letters."""
+    if SHAPING or not any(unicodedata.bidirectional(ch) in ("R", "AL") for ch in words):
+        return words
+    return get_display(arabic_reshaper.reshape(words))
+
+
+def runs(words):
+    """Split text into pieces that can each be drawn with one font: [(font path or None, text)]."""
+    stack, pieces = font_stack(), []
+    words = visual_order(words)
+    for ch in words:
+        if pieces and unicodedata.category(ch).startswith("M"):  # accents stay with their letter
+            pieces[-1][1] += ch
+            continue
+        path = next((p for p, has in stack if ord(ch) in has), None)
+        if pieces and pieces[-1][0] == path:
+            pieces[-1][1] += ch
+        else:
+            pieces.append([path, ch])
+    return pieces
+
+
+def text_width(words, size):
+    return sum(font(size, path).getlength(piece) for path, piece in runs(words)) / SCALE
 
 
 def clean(text):
-    """Drop emoji and symbols the built-in font can't draw (names like "Laden 🤖")."""
-    text = str(text).replace("–", "-").replace("—", "-").replace("×", "x")  # dashes the font lacks
-    kept = "".join(ch for ch in text if unicodedata.category(ch)[0] in "LNPZM" or ch in "+-")
+    """Keep every visible character; drop control characters, zero-width joiners and emoji style selectors."""
+    kept = "".join(ch for ch in str(text) if unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn")
+                   and not 0xFE00 <= ord(ch) <= 0xFE0F)
     return " ".join(kept.split()) or "Player"
 
 
@@ -62,8 +161,13 @@ def piece_image(code, size):
     return _pieces[key]
 
 
-def text(draw, x, y, words, size, colour=INK, anchor="la"):
-    draw.text((s(x), s(y)), words, font=font(size), fill=colour, anchor=anchor)
+def text(draw, x, y, words, size, colour=INK):
+    """Draw text whose top-left is at x, y, switching fonts as needed but sharing one baseline."""
+    baseline = y + size * .95
+    for path, piece in runs(words):
+        f = font(size, path)
+        draw.text((s(x), s(baseline)), piece, font=f, fill=colour, anchor="ls")
+        x += f.getlength(piece) / SCALE
 
 
 # ---------------------------------------------------------------- boards (each draws into a box: x, y, width)
@@ -271,8 +375,7 @@ def compose(title, headline, players, draw_board, board_height):
         disc(draw, PAD + 10, y + 12, 10, colour, (60, 60, 60), 2)
         text(draw, PAD + 30, y + 1, label, 19)
         if winner:
-            width = draw.textlength(label, font=font(19)) / SCALE
-            crown(draw, PAD + 30 + width + 18, y + 12, 9)
+            crown(draw, PAD + 30 + text_width(label, 19) + 18, y + 12, 9)
         y += 34
     img = img.resize((WIDTH, height), Image.LANCZOS).convert("RGB")
     out = io.BytesIO()

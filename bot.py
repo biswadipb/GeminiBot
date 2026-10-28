@@ -3096,6 +3096,7 @@ async def run_web(app, public_url):
 async def on_startup(app):
     await register_commands(app)
     asyncio.create_task(watch_game_clocks())
+    asyncio.create_task(asyncio.to_thread(gameimages.download_fonts))  # fonts for names in result pictures
     asyncio.create_task(find_stockfish())  # fetch the chess engine now, so the first game against Laden is quick
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if public_url:
