@@ -37,7 +37,7 @@ from google import genai
 from huggingface_hub import AsyncInferenceClient
 from PIL import Image
 from google.genai import errors, types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, ReplyParameters, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -2350,11 +2350,16 @@ def game_command(kind):
             await game_command("alquerque9")(update, context)
             return
         context.args = [a for a in context.args if a.lower() not in ("5x5", "5×5")]
-        if not context.args and not quoted:  # nothing specified: let them pick with buttons
-            await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, who do you want to play "
-                                 f"{rules.title.lower()} with?\n\n<i>To challenge someone specific: /{command} @name, "
-                                 f"or reply to them with /{command}.</i>", parse_mode=ParseMode.HTML,
-                                 reply_markup=opponent_menu(kind, user.id), do_quote=is_group(update))
+        if not context.args and not quoted:  # nothing specified: ask them to mention someone
+            await ask_for_opponent(update, context, kind)
+            return
+        words = [a.lower() for a in context.args]
+        if words[0] in OPEN_WORDS:
+            await start_open_game(update, context, kind, None)
+            return
+        if len(words) == 1 and words[0] in BOT_WORDS:  # "bot" without a level: pick one
+            await msg.reply_text(f"🤖 <b>{html.escape(user.full_name)}</b>, how strong should Laden be?\n\n{rules.level_note}",
+                                 parse_mode=ParseMode.HTML, reply_markup=level_menu(kind, user.id), do_quote=is_group(update))
             return
         level = bot_level_from(context.args, rules.levels)
         if quoted and quoted.from_user and quoted.from_user.id == context.bot.id and not context.args:
@@ -2398,6 +2403,58 @@ def game_command(kind):
 LEVEL_LABELS = {1: "1 🐣", 3: "3 🙂", 5: "5 😤", 7: "7 🔥", 8: "8 💀"}
 
 
+OPEN_WORDS = {"anyone", "anybody", "open", "everyone", "any"}
+PROMPT_SECONDS = 10 * 60
+opponent_prompts = {}  # (chat id, prompt message id) -> {"kind", "party", "user", "time"}
+
+
+async def ask_for_opponent(update, context, kind, party=False, reply_to=None):
+    """Ask who to play, with Telegram's reply box opening for the person who asked (ForceReply)."""
+    rules = PARTY_GAMES[kind] if party else GAMES[kind]
+    user = update.effective_user
+    who = f'<a href="tg://user?id={user.id}">{html.escape(user.full_name)}</a>'
+    if party:
+        text = (f"{rules.emoji} {who}, who do you want to play {rules.title.lower()} with? Mention them in your reply "
+                f"(you can tag several).\n\n<i>Or reply <b>anyone</b> for open seats, or <b>bot 1–3</b> to play bots "
+                f"(mix them, e.g. @name bot 1).</i>")
+    else:
+        text = (f"{rules.emoji} {who}, who do you want to play {rules.title.lower()} with? Mention them in your reply.\n\n"
+                f"<i>Or reply <b>anyone</b> for an open slot, or <b>bot</b> (or bot 1–{rules.levels}) to play Laden.</i>")
+    target = reply_to or update.effective_message
+    sent = await context.bot.send_message(
+        update.effective_chat.id, text, parse_mode=ParseMode.HTML,
+        reply_parameters=ReplyParameters(target.message_id, allow_sending_without_reply=True),
+        reply_markup=ForceReply(selective=True, input_field_placeholder="@name, anyone, or bot"))
+    now = time.time()
+    for key in [k for k, p in opponent_prompts.items() if now - p["time"] > PROMPT_SECONDS]:
+        del opponent_prompts[key]
+    opponent_prompts[(update.effective_chat.id, sent.message_id)] = {"kind": kind, "party": party, "user": user.id, "time": now}
+
+
+class OpponentPromptReply(filters.MessageFilter):
+    """A message answering one of Laden's "who do you want to play?" prompts."""
+
+    def filter(self, message):
+        quoted = message.reply_to_message
+        return bool(quoted and (message.chat.id, quoted.message_id) in opponent_prompts)
+
+
+async def answer_opponent_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    key = (msg.chat.id, msg.reply_to_message.message_id)
+    prompt = opponent_prompts.get(key)
+    if not prompt or prompt["user"] != update.effective_user.id:
+        return  # someone else replied: not theirs to answer
+    if time.time() - prompt["time"] > PROMPT_SECONDS:
+        del opponent_prompts[key]
+        await msg.reply_text("That question timed out. Send the game command again.", do_quote=True)
+        return
+    del opponent_prompts[key]
+    context.args = (msg.text or "").split()
+    handler = party_command(prompt["kind"]) if prompt["party"] else game_command(prompt["kind"])
+    await handler(update, context)
+
+
 def size_menu(user_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("5×5 (standard)", callback_data=f"game|alquerque|size|{user_id}"),
@@ -2437,8 +2494,8 @@ async def game_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = html.escape(update.effective_user.full_name)
     if choice == "size":  # alquerque board picked: on to the opponent
         await query.answer()
-        await query.edit_message_text(f"{rules.emoji} <b>{name}</b>, who do you want to play {rules.title.lower()} with?",
-                                      parse_mode=ParseMode.HTML, reply_markup=opponent_menu(kind, update.effective_user.id))
+        await query.edit_message_text(f"{rules.emoji} <b>{name}</b> picked the {rules.title} board.", parse_mode=ParseMode.HTML)
+        await ask_for_opponent(update, context, kind, reply_to=query.message)
         return
     if choice == "bot":
         await query.answer()
@@ -2719,12 +2776,11 @@ def party_command(kind):
             await msg.reply_text(refusal, do_quote=True)
             return
         quoted = msg.reply_to_message
-        if not context.args and not quoted:  # nothing specified: pick with buttons
-            await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, who's playing "
-                                 f"{rules.title.lower()}?\n\n<i>To invite people: /{command} @name @name. "
-                                 f"Mix in bots with e.g. /{command} @name bot 1.</i>",
-                                 parse_mode=ParseMode.HTML, reply_markup=bot_menu(kind, user.id), do_quote=is_group(update))
+        if not context.args and not quoted:  # nothing specified: ask them to mention people
+            await ask_for_opponent(update, context, kind, party=True)
             return
+        if context.args and context.args[0].lower() in OPEN_WORDS:
+            context.args = context.args[1:]  # "anyone (bot 1)": open seats, maybe with bots
         bots = bot_count(context.args)
         if bots:
             context.args = [a for a in context.args if not a.isdigit() and a.lower() not in
@@ -3326,6 +3382,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
     # stickers and GIFs are only looked at when someone replies to one
     pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & OpponentPromptReply(), answer_opponent_prompt))
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     app.add_error_handler(on_error)
