@@ -1419,11 +1419,54 @@ class Ludo(PartyGame):
         return events
 
     def auto(self, state):
-        """The player ran out of time: roll for them, or move their most advanced token."""
+        """Play the turn for a bot (or a player who ran out of time): roll, then pick the best token."""
         if state["phase"] == "roll":
             return self.roll(state)
-        best = max(self.movable(state, state["turn"]), key=lambda t: state["tokens"][state["turn"]][t])
-        return self.move(state, best)
+        return self.move(state, self.choose(state))
+
+    def threats(self, state, player, square):
+        """How many opponent tokens could land on this track square with their next roll."""
+        if square is None or square in LUDO_SAFE:
+            return 0
+        count = 0
+        for other, tokens in enumerate(state["tokens"]):
+            if other == player:
+                continue
+            colour = state["colours"][other]
+            for p in tokens:
+                there = self.square(colour, p)
+                if there is not None and 1 <= (square - there) % 52 <= 6 and p + (square - there) % 52 <= 50:
+                    count += 1
+        return count
+
+    def choose(self, state):
+        """A quick judgement of each token's move: capture, get home, come out, reach safety, flee danger."""
+        me, dice = state["turn"], state["dice"]
+        colour, tokens = state["colours"][me], state["tokens"][me]
+
+        def value(token):
+            old = tokens[token]
+            new = 0 if old == -1 else old + dice
+            square, before = self.square(colour, new), self.square(colour, old)
+            score = new / 10  # a little progress
+            if old == -1:
+                score += 50  # a new token in play
+            if new == LUDO_HOME:
+                score += 80
+            elif new > 50 and old <= 50:
+                score += 40  # safe in the home column
+            if square is not None and square not in LUDO_SAFE:
+                for other, theirs in enumerate(state["tokens"]):
+                    if other != me and any(self.square(state["colours"][other], p) == square for p in theirs):
+                        score += 100  # knock them back to base
+            if square in LUDO_SAFE:
+                score += 15
+            score -= 30 * self.threats(state, me, square)  # landing in front of someone
+            if before is not None:
+                score += 25 * self.threats(state, me, before)  # getting away from someone
+            return score + random.random()
+
+        return max(self.movable(state, me), key=value)
 
     def layout(self):
         return {"track": LUDO_TRACK, "home_columns": LUDO_HOME_COLUMNS, "offset": LUDO_OFFSET, "safe": sorted(LUDO_SAFE)}

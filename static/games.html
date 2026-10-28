@@ -738,6 +738,7 @@ function renderParty() {
       (waiting.length ? `<br>Waiting for: ${waiting.map(esc).join(", ")}` : s.invited.length ? "" : "<br>Anyone in the group can join.") + "</p>";
     if (s.can_join) html += `<button class="primary" onclick="act('join')">Join the game</button>`;
     else if (s.you !== null && !s.can_start) html += `<p>Waiting for ${esc(s.host)} to start…</p>`;
+    if (s.can_add_bot) html += `<div class="actions"><button onclick="act('add_bot')">🤖 Add a bot</button></div>`;
     if (s.can_start) html += `<div class="actions"><button class="primary" onclick="act('start')">Start with ${s.players.length} players</button></div>`;
     if (s.can_cancel) html += `<div class="actions"><button class="danger" onclick="act('cancel')">Cancel game</button></div>`;
     return showMessage(html);
