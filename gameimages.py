@@ -35,6 +35,8 @@ log = logging.getLogger("gemini-bot")
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 NOTO = "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/"
 UNIFONT = "https://ftp.gnu.org/gnu/unifont/unifont-18.0.01/"
+NOTO_EXTRA = "https://cdn.jsdelivr.net/gh/notofonts/notofonts.github.io/fonts/"
+PLANGOTHIC = "https://github.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic_Project/releases/download/V2.9.5795/"
 FONT_SOURCES = [
     ("NotoSans.ttf", NOTO + "notosans/NotoSans%5Bwdth,wght%5D.ttf"),
     ("NotoSansSymbols.ttf", NOTO + "notosanssymbols/NotoSansSymbols%5Bwght%5D.ttf"),
@@ -45,15 +47,22 @@ FONT_SOURCES = [
     ("NotoSansArabic.ttf", NOTO + "notosansarabic/NotoSansArabic%5Bwdth,wght%5D.ttf"),
     ("NotoEmoji.ttf", NOTO + "notoemoji/NotoEmoji%5Bwght%5D.ttf"),
     ("NotoSansEgyptianHieroglyphs.ttf", NOTO + "notosansegyptianhieroglyphs/NotoSansEgyptianHieroglyphs-Regular.ttf"),
-    ("unifont.otf", UNIFONT + "unifont-18.0.01.otf"),
-    ("unifont_upper.otf", UNIFONT + "unifont_upper-18.0.01.otf"),
+    ("unifont.otf", UNIFONT + "unifont-18.0.01.otf"),  # nearly every character in the first 65,536
+    ("unifont_upper.otf", UNIFONT + "unifont_upper-18.0.01.otf"),  # most of the rest
+    # writing systems Unifont leaves out
+    ("NotoSansCuneiform.ttf", NOTO + "notosanscuneiform/NotoSansCuneiform-Regular.ttf"),
+    ("NotoSansAnatolianHieroglyphs.ttf", NOTO + "notosansanatolianhieroglyphs/NotoSansAnatolianHieroglyphs-Regular.ttf"),
+    ("NotoSansBamum.ttf", NOTO + "notosansbamum/NotoSansBamum%5Bwght%5D.ttf"),
+    ("NotoSerifTangut.ttf", NOTO_EXTRA + "NotoSerifTangut/hinted/ttf/NotoSerifTangut-Regular.ttf"),
+    ("PlangothicP1.ttf", PLANGOTHIC + "PlangothicP1-Regular.ttf"),  # rare Chinese characters (CJK extensions B-I)
+    ("PlangothicP2.ttf", PLANGOTHIC + "PlangothicP2-Regular.ttf"),
 ]
 _stack = None  # [(font path, set of characters it has)], in FONT_SOURCES order
 _fonts = {}
 
 
 def download_fonts():
-    """Fetch any missing fonts (about 15 MB in all). Runs in the background at startup; until it's done,
+    """Fetch any missing fonts (about 60 MB in all). Runs in the background at startup; until it's done,
     pictures use whatever fonts are already there."""
     global _stack
     os.makedirs(FONT_DIR, exist_ok=True)
@@ -129,7 +138,7 @@ def text_width(words, size):
 def clean(text):
     """Keep every visible character; drop control characters, zero-width joiners and emoji style selectors."""
     kept = "".join(ch for ch in str(text) if unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn")
-                   and not 0xFE00 <= ord(ch) <= 0xFE0F)
+                   and not 0xFE00 <= ord(ch) <= 0xFE0F and not 0xE0100 <= ord(ch) <= 0xE01EF)  # style selectors
     return " ".join(kept.split()) or "Player"
 
 
