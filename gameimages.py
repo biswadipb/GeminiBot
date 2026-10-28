@@ -317,6 +317,8 @@ def party_picture(game, headline):
         else:
             colour = PARTY[i % len(PARTY)]
             info = f"square {state['pos'][i]}"
+        if (state.get("left") or [False] * len(game["players"]))[i]:
+            info += " (left)"
         players.append((colour, f"{clean(p['name'])} - {info}", state["winner"] == i))
     draw_board = (lambda img, d, x, y, w: ludo_board(d, x, y, w, state)) if game["kind"] == "ludo" else \
         (lambda img, d, x, y, w: snakes_board(d, x, y, w, state))

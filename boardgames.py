@@ -1275,8 +1275,38 @@ class PartyGame:
     min_players, max_players = 2, 4
 
     def next_turn(self, state):
-        state["turn"] = (state["turn"] + 1) % len(state["players_done"])
+        """The next player who hasn't left the game."""
+        count = len(state["players_done"])
+        left = state.get("left") or [False] * count
+        for step in range(1, count + 1):
+            following = (state["turn"] + step) % count
+            if not left[following]:
+                state["turn"] = following
+                break
         state["phase"] = "roll"
+
+    def leave(self, state, player):
+        """The player leaves: their pieces stay frozen where they are, their turns are skipped, and they're
+        ranked last. If only one player is left, they win."""
+        count = len(state["players_done"])
+        state.setdefault("left", [False] * count)[player] = True
+        state.setdefault("left_order", []).append(player)
+        events = [f"🚪 {{{player}}} left the game"]
+        active = [i for i in range(count) if not state["left"][i]]
+        if len(active) == 1:
+            state["winner"] = active[0]
+            events.append(f"🏆 {{{active[0]}}} is the last one standing!")
+        elif state["turn"] == player:
+            state["sixes"] = 0
+            self.next_turn(state)
+        return events
+
+    def standings(self, state, progress):
+        """Players still in, best first (winner on top), then those who left - the earliest leaver last."""
+        count = len(state["players_done"])
+        left = state.get("left") or [False] * count
+        playing = sorted((i for i in range(count) if not left[i]), key=lambda i: (i != state["winner"], -progress(i)))
+        return playing + list(reversed(state.get("left_order", [])))
 
 
 SNAKES = {16: 6, 47: 26, 49: 11, 56: 53, 62: 19, 64: 60, 87: 24, 93: 73, 95: 75, 98: 78}
@@ -1288,7 +1318,7 @@ class SnakesAndLadders(PartyGame):
 
     def new(self, players):
         return {"pos": [0] * players, "turn": 0, "phase": "roll", "dice": None, "rolls": 0, "winner": None,
-                "players_done": [False] * players}
+                "players_done": [False] * players, "left": [False] * players, "left_order": []}
 
     def roll(self, state, dice=None):
         """Roll for the player to move. Returns a list of event strings ("{0}" stands for that player's name)."""
@@ -1350,7 +1380,8 @@ class Ludo(PartyGame):
 
     def new(self, players):
         return {"tokens": [[-1] * 4 for _ in range(players)], "colours": self.colours(players), "turn": 0,
-                "phase": "roll", "dice": None, "sixes": 0, "winner": None, "players_done": [False] * players}
+                "phase": "roll", "dice": None, "sixes": 0, "winner": None, "players_done": [False] * players,
+                "left": [False] * players, "left_order": []}
 
     @staticmethod
     def square(colour, progress):

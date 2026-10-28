@@ -197,6 +197,7 @@
   <div class="dicebar"><div class="die" id="die">🎲</div><div class="status" id="pstatus"></div>
     <button class="primary" id="rollBtn" onclick="roll()">Roll</button></div>
   <div class="plog" id="plog"></div>
+  <div class="actions"><button class="danger hidden" id="leaveBtn" onclick="leaveParty()">Leave game</button></div>
 </div>
 <div class="promo" id="promo"><div id="promoChoices"></div></div>
 <div class="sheet" id="sheet" onclick="if (event.target === this) closeMoves()">
@@ -757,8 +758,9 @@ function renderParty() {
 
   document.getElementById("plist").innerHTML = s.players.map((p, i) => {
     const info = s.kind === "ludo" ? `${st.tokens[i].filter(t => t === 56).length}/4 home` : (st.pos[i] ? `on ${st.pos[i]}` : "at start");
-    return `<span class="pchip${i === st.turn && s.status === "playing" ? " turn" : ""}"><span class="pdot" style="background:${playerColour(i)}"></span>` +
-      `${esc(p.name)}${i === s.you ? " (you)" : ""} <span class="pinfo">${info}</span></span>`;
+    const gone = (s.left || [])[i];
+    return `<span class="pchip${i === st.turn && s.status === "playing" ? " turn" : ""}"${gone ? ' style="opacity:.5"' : ""}><span class="pdot" style="background:${playerColour(i)}"></span>` +
+      `${esc(p.name)}${i === s.you ? " (you)" : ""} <span class="pinfo">${gone ? "left" : info}</span></span>`;
   }).join("");
 
   document.getElementById("pboard").innerHTML = s.kind === "ludo" ? ludoBoard() : snakesBoard();
@@ -773,6 +775,8 @@ function renderParty() {
   btn.classList.toggle("hidden", s.status !== "playing");
   partyStatus();
   document.getElementById("plog").innerHTML = s.log.slice(-8).reverse().map(e => `<div>${esc(e)}</div>`).join("");
+  const iLeft = s.you !== null && (s.left || [])[s.you];
+  document.getElementById("leaveBtn").classList.toggle("hidden", s.status !== "playing" || s.you === null || iLeft);
 }
 
 function partyStatus() {
@@ -784,7 +788,9 @@ function partyStatus() {
     el.classList.add("strong"); return;
   }
   const left = Math.max(0, Math.round(s.seconds_left - (performance.now() - s.receivedAt) / 1000));
-  if (s.you === st.turn) {
+  if (s.you !== null && (s.left || [])[s.you]) {
+    el.textContent = `You left the game. ${s.players[st.turn].name}'s turn ⏱ ${left}s`;
+  } else if (s.you === st.turn) {
     el.textContent = (st.phase === "roll" ? "Your turn: roll!" : `You rolled ${st.dice}: tap a token to move.`) + ` ⏱ ${left}s`;
     el.classList.add("strong");
   } else {
@@ -878,6 +884,12 @@ function ludoBoard() {
     });
   }
   return svg + "</svg>";
+}
+
+function leaveParty() {
+  const go = ok => ok && act("leave");
+  const text = "Leave the game? Your pieces stay where they are, the others play on, and you'll be ranked last.";
+  tg ? tg.showConfirm(text, go) : go(confirm(text));
 }
 
 async function roll() {

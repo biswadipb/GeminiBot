@@ -2781,13 +2781,16 @@ async def finish_party(game):
     rules, state = PARTY_GAMES[game["kind"]], game["state"]
     game.update(status="over", result=state["winner"], ended=int(time.time()))
     names = party_names(game)
+    left = state.get("left") or [False] * len(names)
     if game["kind"] == "ludo":
-        standings = sorted(range(len(names)), key=lambda i: -sum(p == 56 for p in state["tokens"][i]))
-        detail = "\n".join(f"{n}. {html.escape(names[i])} – {sum(p == 56 for p in state['tokens'][i])}/4 tokens home"
-                           for n, i in enumerate(standings, 1))
+        home = lambda i: sum(p == 56 for p in state["tokens"][i])
+        standings = rules.standings(state, lambda i: home(i) * 1000 + sum(max(p, 0) for p in state["tokens"][i]))
+        info = lambda i: f"{home(i)}/4 tokens home"
     else:
-        standings = sorted(range(len(names)), key=lambda i: -state["pos"][i])
-        detail = "\n".join(f"{n}. {html.escape(names[i])} – square {state['pos'][i]}" for n, i in enumerate(standings, 1))
+        standings = rules.standings(state, lambda i: state["pos"][i])
+        info = lambda i: f"square {state['pos'][i]}"
+    detail = "\n".join(f"{n}. {html.escape(names[i])} – {info(i)}{' (left)' if left[i] else ''}"
+                       for n, i in enumerate(standings, 1))
     summary = f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!"
     picture = await asyncio.to_thread(gameimages.party_picture, game, f"{names[state['winner']]} won!")
     await post_result(game, picture, summary, f"<blockquote expandable>{detail}</blockquote>")
@@ -2803,7 +2806,8 @@ async def party_turn_timeout(game):
     idle = game.setdefault("idle", {})
     seat = str(state["turn"])
     idle[seat] = idle.get(seat, 0) + 1
-    people = [str(i) for i, p in enumerate(game["players"]) if not p.get("bot")]
+    gone = state.get("left") or []
+    people = [str(i) for i, p in enumerate(game["players"]) if not p.get("bot") and not (gone and gone[i])]
     if all(idle.get(i, 0) >= ABANDON_AFTER for i in people):
         await abandon_party(game)
         return True
@@ -2817,15 +2821,16 @@ async def party_turn_timeout(game):
     return True
 
 
-async def abandon_party(game):
-    """Everyone has wandered off: end the game quietly instead of letting it play itself for hours."""
+async def abandon_party(game, why=None):
+    """Everyone has wandered off (or left): end the game quietly instead of letting it play itself for hours."""
     rules = PARTY_GAMES[game["kind"]]
     game.update(status="over", result="abandoned", ended=int(time.time()))
     await save_game(game)
     names = ", ".join(html.escape(n) for n in party_names(game))
+    why = why or f"nobody has played for {ABANDON_AFTER} turns"
     try:
-        await game_bot.send_message(game["chat_id"], f"{rules.emoji} {rules.title} abandoned: nobody has played for "
-                                    f"{ABANDON_AFTER} turns.", reply_parameters=ReplyParameters(
+        await game_bot.send_message(game["chat_id"], f"{rules.emoji} {rules.title} abandoned: {why}.",
+                                    reply_parameters=ReplyParameters(
                                         game["message_id"], allow_sending_without_reply=True))
     except Exception:
         log.exception("Could not post the abandoned note")
@@ -2866,6 +2871,7 @@ def party_view(game, user):
         return view
     state = game["state"]
     view.update(state=state, layout=rules.layout(), log=game["log"], turn=state["turn"],
+                left=state.get("left") or [False] * len(game["players"]),
                 seconds_left=max(0, round(TURN_SECONDS - (time.time() - game.get("turn_started", time.time())))))
     if game["kind"] == "ludo" and me == state["turn"] and state["phase"] == "move":
         view["movable"] = rules.movable(state, me)
@@ -2920,6 +2926,23 @@ async def party_action(game, user, action, body):
             game["status"], game["result"] = "over", "cancelled"
             await save_game(game)
             await edit_game_message(game, f"{rules.emoji} {rules.title} game cancelled.")
+    elif action == "leave":
+        state = game["state"]
+        if game["status"] != "playing" or me is None or (state.get("left") or [False] * 9)[me]:
+            return 400, {"error": "You're not in this game.", **party_view(game, user)}
+        party_log(game, rules.leave(state, me))
+        still_here = [i for i, p in enumerate(game["players"]) if not p.get("bot") and not state["left"][i]]
+        if state["winner"] is not None:
+            await finish_party(game)
+        elif not still_here:
+            await save_game(game)
+            await abandon_party(game, "everyone left")
+            return 200, party_view(game, user)
+        else:
+            await run_bots(game)
+            if state["winner"] is not None and game["status"] == "playing":
+                await finish_party(game)
+        await save_game(game)
     elif action in ("roll", "move"):
         state = game["state"]
         if game["status"] != "playing" or me is None:
