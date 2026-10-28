@@ -634,7 +634,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
         "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
         "leave the slot open, or play Laden\n"
-        "/snakesandladders · /ludo [@people] – dice games for several players (ludo: add 'bot 1-3' to play bots)\n"
+        "/snakesandladders · /ludo [@people] [bot 1-3] – dice games for several players, with bots if you like\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -2596,22 +2596,22 @@ TURN_SECONDS = 60  # after this, Laden rolls or moves for whoever's turn it is, 
 ABANDON_AFTER = 5  # a game ends as abandoned once every person has had this many turns in a row played for them
 WAITING_ROOM_SECONDS = 30 * 60  # a game nobody started is closed after this
 PARTY_LOG = 30  # recent events shown on the board
-LUDO_BOTS = ["Laden 🤖", "Laden's bro 🤖", "Laden's sis 🤖"]  # computer players for ludo, in the order they join
+PARTY_BOTS = ["Laden 🤖", "Laden's bro 🤖", "Laden's sis 🤖"]  # computer players, in the order they join
 
 
-def add_ludo_bots(game, count):
+def add_bots(game, count):
     taken = {p["name"] for p in game["players"]}
-    for name in [n for n in LUDO_BOTS if n not in taken][:count]:
-        if len(game["players"]) < PARTY_GAMES["ludo"].max_players:
-            game["players"].append({"id": -1 - LUDO_BOTS.index(name), "name": name, "bot": True})
+    for name in [n for n in PARTY_BOTS if n not in taken][:count]:
+        if len(game["players"]) < PARTY_GAMES[game["kind"]].max_players:
+            game["players"].append({"id": -1 - PARTY_BOTS.index(name), "name": name, "bot": True})
 
 
-def ludo_bot_count(words):
+def bot_count(words):
     """('bot', '2') -> 2, ('bots',) -> 1; 0 if no bots were asked for."""
     words = [w.lower() for w in words]
     if not any(w in ("bot", "bots", "laden", "computer", "ai") for w in words):
         return 0
-    return min(max(next((int(w) for w in words if w.isdigit()), 1), 1), len(LUDO_BOTS))
+    return min(max(next((int(w) for w in words if w.isdigit()), 1), 1), len(PARTY_BOTS))
 
 
 async def run_bots(game):
@@ -2664,12 +2664,13 @@ def party_command(kind):
             await msg.reply_text(refusal, do_quote=True)
             return
         quoted = msg.reply_to_message
-        if kind == "ludo" and not context.args and not quoted:  # nothing specified: pick with buttons
-            await msg.reply_text(f"🎲 <b>{html.escape(user.full_name)}</b>, who's playing ludo?\n\n<i>To invite people: "
-                                 f"/ludo @name @name. Mix in bots with e.g. /ludo @name bot 1.</i>",
-                                 parse_mode=ParseMode.HTML, reply_markup=ludo_menu(user.id), do_quote=is_group(update))
+        if not context.args and not quoted:  # nothing specified: pick with buttons
+            await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, who's playing "
+                                 f"{rules.title.lower()}?\n\n<i>To invite people: /{command} @name @name. "
+                                 f"Mix in bots with e.g. /{command} @name bot 1.</i>",
+                                 parse_mode=ParseMode.HTML, reply_markup=bot_menu(kind, user.id), do_quote=is_group(update))
             return
-        bots = ludo_bot_count(context.args) if kind == "ludo" else 0
+        bots = bot_count(context.args)
         if bots:
             context.args = [a for a in context.args if not a.isdigit() and a.lower() not in
                             ("bot", "bots", "laden", "computer", "ai")]
@@ -2715,7 +2716,7 @@ async def start_party_game(update, context, kind, invited, bots=0, menu=None):
             "chat_id": chat.id, "message_id": None, "creator": user.id, "invited": invited,
             "players": [{"id": user.id, "name": user.full_name, "username": (user.username or "").lower()}],
             "status": "waiting", "state": None, "log": [], "result": None, "created": int(time.time())}
-    add_ludo_bots(game, bots)
+    add_bots(game, bots)
     if bots and not invited:
         start_party(game)  # just you and the bots: no one to wait for
         await run_bots(game)
@@ -2730,20 +2731,21 @@ async def start_party_game(update, context, kind, invited, bots=0, menu=None):
     await save_game(game)
 
 
-def ludo_menu(user_id):
+def bot_menu(kind, user_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Open seats (anyone can join)", callback_data=f"party|ludo|open|{user_id}")],
-        [InlineKeyboardButton(f"🤖 vs {n} bot{'s' * (n > 1)}", callback_data=f"party|ludo|bots{n}|{user_id}")
+        [InlineKeyboardButton("👥 Open seats (anyone can join)", callback_data=f"party|{kind}|open|{user_id}")],
+        [InlineKeyboardButton(f"🤖 vs {n} bot{'s' * (n > 1)}", callback_data=f"party|{kind}|bots{n}|{user_id}")
          for n in (1, 2, 3)],
     ])
 
 
 async def party_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buttons under /ludo: open seats, or play against 1-3 bots. Only the asker can press them."""
+    """Buttons under /ludo and /snakesandladders: open seats, or 1-3 bots. Only the asker can press them."""
     query = update.callback_query
     _, kind, choice, owner = query.data.split("|")
     if update.effective_user.id != int(owner):
-        await query.answer("This menu isn't yours. Start your own with /ludo 🎲", show_alert=True)
+        await query.answer(f"This menu isn't yours. Start your own with /{PARTY_COMMANDS[kind]} "
+                           f"{PARTY_GAMES[kind].emoji}", show_alert=True)
         return
     if await ignored_while_off(update) or await muted(update, context):
         await query.answer()
@@ -2854,7 +2856,7 @@ def party_view(game, user):
                     can_join=me is None and allowed and len(game["players"]) < rules.max_players,
                     can_start=user_id == game["creator"] and len(game["players"]) >= rules.min_players,
                     can_cancel=user_id == game["creator"],
-                    can_add_bot=user_id == game["creator"] and game["kind"] == "ludo"
+                    can_add_bot=user_id == game["creator"] and len(PARTY_BOTS) > sum(p.get("bot", False) for p in game["players"])
                     and len(game["players"]) < rules.max_players)
         return view
     if game.get("result") == "cancelled":
@@ -2905,9 +2907,9 @@ async def party_action(game, user, action, body):
             await save_game(game)
             await edit_game_message(game, party_text(game))
     elif action == "add_bot":
-        if game["status"] == "waiting" and uid == game["creator"] and game["kind"] == "ludo" \
+        if game["status"] == "waiting" and uid == game["creator"] \
                 and len(game["players"]) < rules.max_players:
-            add_ludo_bots(game, 1)
+            add_bots(game, 1)
             if len(game["players"]) == rules.max_players:
                 start_party(game)
                 await run_bots(game)
@@ -3045,7 +3047,7 @@ async def register_commands(app):
         ("alquerque", "Play alquerque (5×5 or 9×9): @someone, open slot, or Laden"),
         ("fanorona", "Play fanorona: @someone, open slot, or Laden"),
         ("draughts", "Play Turkish draughts: @someone, open slot, or Laden"),
-        ("snakesandladders", "Snakes and Ladders for 2-6: @tag people or leave seats open"),
+        ("snakesandladders", "Snakes and Ladders for 2-6: @tag people, open seats, or play bots"),
         ("ludo", "Ludo for 2-4: @tag people, open seats, or play bots"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
