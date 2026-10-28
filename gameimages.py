@@ -150,17 +150,101 @@ def disc(draw, cx, cy, r, colour, outline, width=2):
     draw.ellipse([s(cx - r), s(cy - r), s(cx + r), s(cy + r)], fill=colour, outline=outline, width=int(s(width)))
 
 
-def stone(draw, cx, cy, r, side):
-    """A black or white playing piece ("b"/"w", upper case = king)."""
-    fill, edge = BLACK_DISC if side.lower() == "b" else WHITE_DISC
-    disc(draw, cx, cy, r, fill, edge, max(1, int(r // 9)))
+# ---------------------------------------------------------------- shading helpers (the same looks as the Mini App)
+
+def rgb(hex_colour):
+    return tuple(int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(a, b, t):
+    t = max(0.0, min(1.0, t))
+    return tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def gradient(img, box, start, end, radius=0):
+    """A diagonal gradient (top left to bottom right) in a rounded box."""
+    x0, y0, x1, y1 = (int(s(v)) for v in box)
+    w, h = max(1, x1 - x0), max(1, y1 - y0)
+    layer = Image.new("RGBA", (w, h))
+    paint = ImageDraw.Draw(layer)
+    for k in range(0, w + h, 2):
+        paint.line([(k, 0), (0, k)], fill=mix(start, end, k / (w + h)) + (255,), width=3)
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=int(s(radius)), fill=255)
+    img.paste(layer, (x0, y0), mask)
+
+
+def sphere(draw, cx, cy, r, light, mid, dark, outline=None):
+    """A shaded ball: dark at the edge, brightest towards the top left."""
+    steps = 18
+    for i in range(steps):
+        t = i / (steps - 1)
+        radius = r * (1 - .82 * t)
+        ox, oy = -.34 * r * t, -.38 * r * t
+        colour = mix(dark, mid, t * 2) if t < .5 else mix(mid, light, (t - .5) * 2)
+        disc(draw, cx + ox, cy + oy, radius, colour, None)
+    if outline:
+        disc(draw, cx, cy, r, None, outline, 1)
+
+
+def shadow(draw, cx, cy, rx, ry, alpha=70):
+    draw.ellipse([s(cx - rx), s(cy - ry), s(cx + rx), s(cy + ry)], fill=(0, 0, 0, alpha))
+
+
+def marble(draw, cx, cy, r, side, glossy=True):
+    """Black or white piece ("b"/"w", upper case = king) as a shaded marble with a shadow and shine."""
+    shadow(draw, cx + r * .12, cy + r * .85, r * .9, r * .3)
+    if side.lower() == "b":
+        sphere(draw, cx, cy, r, (138, 138, 138), (42, 42, 42), (5, 5, 5), (0, 0, 0))
+    else:
+        sphere(draw, cx, cy, r, (255, 255, 255), (241, 237, 228), (180, 172, 155), (150, 140, 120))
+    if glossy:
+        draw.ellipse([s(cx - r * .5), s(cy - r * .58), s(cx - r * .1), s(cy - r * .3)],
+                     fill=(255, 255, 255, 90 if side.lower() == "b" else 200))
     if side.isupper():
         crown(draw, cx, cy, r * .55)
+
+
+def ridged(draw, cx, cy, r, side):
+    """A draughts man with ridged rings."""
+    shadow(draw, cx + r * .1, cy + r * .9, r * .95, r * .3, 90)
+    rings = [(30, 30, 30), (12, 12, 12), (44, 44, 44), (12, 12, 12), (52, 52, 52)] if side.lower() == "b" else \
+        [(255, 248, 234), (205, 182, 140), (246, 236, 216), (212, 191, 152), (251, 243, 227)]
+    edge = (5, 5, 5) if side.lower() == "b" else (168, 141, 98)
+    for k, frac in enumerate((1, .56, .5, .34, .28)):
+        disc(draw, cx, cy, r * frac, rings[k], edge if k == 0 else None, 1.5 if k == 0 else 0)
+    if side.isupper():
+        crown(draw, cx, cy, r * .5)
+
+
+def stone(draw, cx, cy, r, side):
+    marble(draw, cx, cy, r, side)
 
 
 def crown(draw, cx, cy, size, colour=GOLD):
     pts = [(-1, .65), (-1.05, -.45), (-.5, .05), (0, -.75), (.5, .05), (1.05, -.45), (1, .65)]
     draw.polygon([(s(cx + x * size), s(cy + y * size)) for x, y in pts], fill=colour, outline=(122, 90, 0), width=s(1))
+
+
+def star_points(cx, cy, r, inner=.45):
+    return [(s(cx + math.cos(math.pi / 5 * k - math.pi / 2) * (r if k % 2 == 0 else r * inner)),
+             s(cy + math.sin(math.pi / 5 * k - math.pi / 2) * (r if k % 2 == 0 else r * inner))) for k in range(10)]
+
+
+def pawn(draw, x, y, r, colour, label=""):
+    """A glossy playing piece: shadow, base, body, head, shine and the player's initial."""
+    shadow(draw, x, y + r * .95, r * .95, r * .3, 80)
+    edge = mix(colour, (0, 0, 0), .45)
+    body = [(x - r * .78, y + r * .85)]
+    body += [(x - r * .78 + r * 1.56 * t, y + r * .85 + math.sin(math.pi * t) * r * .14) for t in (.25, .5, .75, 1)]
+    body += [(x + r * .42, y - r * .05), (x, y - r * .2), (x - r * .42, y - r * .05)]
+    draw.polygon([(s(px), s(py)) for px, py in body], fill=colour, outline=edge, width=max(1, int(s(r * .07))))
+    disc(draw, x, y - r * .48, r * .5, colour, edge, max(.5, r * .07))
+    draw.ellipse([s(x - r * .33), s(y - r * .78), s(x - r * .02), s(y - r * .55)], fill=(255, 255, 255, 190))
+    if label:
+        f = font(max(6, int(r * .62)), font_stack()[0][0] if font_stack() else None)
+        draw.text((s(x), s(y + r * .72)), label, font=f, fill=(255, 255, 255), anchor="ms",
+                  stroke_width=max(1, int(s(r * .05))), stroke_fill=edge)
 
 
 def piece_image(code, size):
@@ -186,12 +270,6 @@ def chess_board(img, draw, x0, y0, size, snapshot, last):
     rows = snapshot.split("/")
     lit = {last[:2], last[2:4]} if last else set()
     for r, row in enumerate(rows):
-        c = 0
-        for ch in row:
-            if ch.isdigit():
-                c += int(ch)
-                continue
-            c += 1
         for c in range(8):
             name = "abcdefgh"[c] + str(8 - r)
             colour = LAST if name in lit else (LIGHT if (r + c) % 2 == 0 else DARK)
@@ -202,94 +280,155 @@ def chess_board(img, draw, x0, y0, size, snapshot, last):
                 c += int(ch)
                 continue
             code = ("w" if ch.isupper() else "b") + ch.upper()
-            img.alpha_composite(piece_image(code, int(sq)), (int(s(x0 + c * sq)), int(s(y0 + r * sq))))
+            piece = piece_image(code, int(sq))
+            img.paste(piece, (int(s(x0 + c * sq)), int(s(y0 + r * sq))), piece)
             c += 1
     return size
 
 
-def square_board(draw, x0, y0, size, snapshot, kind):
-    """Othello, checkers and Turkish draughts: 8 x 8, one character per square, top row first."""
-    sq = size / 8
+def frame(img, draw, x0, y0, w, h, wood=((107, 68, 40), (59, 36, 20)), border=.034, radius=12):
+    """A wooden frame with a drop shadow; returns the inner box (x, y, w, h)."""
+    draw.rounded_rectangle([s(x0 + 3), s(y0 + 6), s(x0 + w + 3), s(y0 + h + 6)], radius=s(radius), fill=(0, 0, 0, 60))
+    gradient(img, (x0, y0, x0 + w, y0 + h), wood[0], wood[1], radius)
+    pad = w * border
+    return x0 + pad, y0 + pad, w - 2 * pad, h - 2 * pad
+
+
+def square_board(img, draw, x0, y0, size, snapshot, kind):
+    """Othello (felt, guide dots, discs) and checkers / Turkish draughts (wood squares, ridged men)."""
+    if kind == "othello":
+        bx, by, bw, _ = frame(img, draw, x0, y0, size, size)
+        sq = bw / 8
+        for r in range(8):
+            for c in range(8):
+                gradient(img, (bx + c * sq + 1, by + r * sq + 1, bx + (c + 1) * sq - 1, by + (r + 1) * sq - 1),
+                         (51, 165, 101), (35, 127, 74), 2)
+        for gx in (2, 6):
+            for gy in (2, 6):
+                disc(draw, bx + gx * sq, by + gy * sq, sq * .09, (15, 58, 32), None)
+        for i, piece in enumerate(snapshot):
+            if piece != ".":
+                r, c = divmod(i, 8)
+                marble(draw, bx + (c + .5) * sq, by + (r + .5) * sq, sq * .41, piece)
+        return size
+    bx, by, bw, _ = frame(img, draw, x0, y0, size, size, wood=((90, 52, 27), (45, 25, 11)))
+    sq = bw / 8
     for r in range(8):
         for c in range(8):
-            box = [s(x0 + c * sq), s(y0 + r * sq), s(x0 + (c + 1) * sq), s(y0 + (r + 1) * sq)]
-            if kind == "othello":
-                draw.rectangle(box, fill=(46, 139, 87), outline=(31, 107, 65), width=s(1))
+            box = (bx + c * sq, by + r * sq, bx + (c + 1) * sq, by + (r + 1) * sq)
+            if (r + c) % 2 == 0:
+                gradient(img, box, (246, 228, 195), (231, 203, 158))
             else:
-                draw.rectangle(box, fill=LIGHT if (r + c) % 2 == 0 else DARK)
-            piece = snapshot[r * 8 + c]
-            if piece != ".":
-                stone(draw, x0 + (c + .5) * sq, y0 + (r + .5) * sq, sq * .4, piece)
+                gradient(img, box, (138, 86, 48), (107, 63, 32))
+                for k in range(1, 5):  # grain
+                    gx = box[0] + sq * k / 5
+                    draw.line([s(gx), s(box[1]), s(gx + sq * .05), s(box[3])], fill=(0, 0, 0, 22), width=s(1))
+    for i, piece in enumerate(snapshot):
+        if piece != ".":
+            r, c = divmod(i, 8)
+            ridged(draw, bx + (c + .5) * sq, by + (r + .5) * sq, sq * .4, piece)
     return size
 
 
-def go_board(draw, x0, y0, size, snapshot, last):
-    cell = size / GO_SIZE
-    draw.rectangle([s(x0), s(y0), s(x0 + size), s(y0 + size)], fill=(220, 179, 92))
-    first, end = cell / 2, size - cell / 2
+def go_board(img, draw, x0, y0, size, snapshot, last):
+    draw.rounded_rectangle([s(x0 + 3), s(y0 + 6), s(x0 + size + 3), s(y0 + size + 6)], radius=s(10), fill=(0, 0, 0, 60))
+    draw.rounded_rectangle([s(x0), s(y0), s(x0 + size), s(y0 + size)], radius=s(10), fill=(110, 69, 32))
+    inner = 9
+    gradient(img, (x0 + inner, y0 + inner, x0 + size - inner, y0 + size - inner), (236, 199, 124), (216, 166, 75), 4)
+    for k in range(0, int(size), 7):  # grain
+        draw.line([s(x0 + inner), s(y0 + inner + k), s(x0 + size - inner), s(y0 + inner + k + 3)], fill=(110, 60, 15, 18), width=s(1))
+    area = size - 2 * inner
+    cell = area / GO_SIZE
+    bx, by = x0 + inner, y0 + inner
+    first, end = cell / 2, area - cell / 2
     for i in range(GO_SIZE):
-        draw.line([s(x0 + first), s(y0 + first + i * cell), s(x0 + end), s(y0 + first + i * cell)], fill=(107, 74, 27), width=s(1))
-        draw.line([s(x0 + first + i * cell), s(y0 + first), s(x0 + first + i * cell), s(y0 + end)], fill=(107, 74, 27), width=s(1))
+        edge = 2 if i in (0, GO_SIZE - 1) else 1
+        draw.line([s(bx + first), s(by + first + i * cell), s(bx + end), s(by + first + i * cell)], fill=(59, 40, 16), width=s(edge))
+        draw.line([s(bx + first + i * cell), s(by + first), s(bx + first + i * cell), s(by + end)], fill=(59, 40, 16), width=s(edge))
     for r, c in GO_STAR_POINTS:
-        disc(draw, x0 + first + c * cell, y0 + first + r * cell, 4, (107, 74, 27), (107, 74, 27))
+        disc(draw, bx + first + c * cell, by + first + r * cell, 4, (59, 40, 16), None)
     for i, p in enumerate(snapshot):
         if p != ".":
-            cx, cy = x0 + first + (i % GO_SIZE) * cell, y0 + first + (i // GO_SIZE) * cell
-            stone(draw, cx, cy, cell * .46, p)
+            cx, cy = bx + first + (i % GO_SIZE) * cell, by + first + (i // GO_SIZE) * cell
+            marble(draw, cx, cy, cell * .47, p, glossy=p == "b")
             if last and last != "pass" and i == "ABCDEFGHJ".index(last[0]) + (GO_SIZE - int(last[1:])) * GO_SIZE:
-                disc(draw, cx, cy, cell * .15, None, (220, 40, 40), 2)
+                disc(draw, cx, cy, cell * .17, None, (229, 57, 53), 2)
     return size
 
 
-def line_board(draw, x0, y0, width, snapshot, rules):
-    """Alquerque, 16 beads and fanorona: pieces on points joined by lines."""
+def line_board(img, draw, x0, y0, width, snapshot, rules):
+    """Alquerque, 16 beads and fanorona: a carved board with engraved lines, holes and marbles."""
     coords = rules.grid.coords
     rows = [r for r, _ in coords]
     cols = [c for _, c in coords]
     span_c, span_r = max(cols) - min(cols), max(rows) - min(rows)
-    gap = min(width / (span_c + 1), 520 / (span_r + 1))
-    w, h = gap * (span_c + 1), gap * (span_r + 1)
+    gap = min(width / (span_c + 1.5), 520 / (span_r + 1.5))
+    w, h = gap * (span_c + 1.5), gap * (span_r + 1.5)
     left = x0 + (width - w) / 2
-    at = lambda i: (left + (coords[i][1] - min(cols) + .5) * gap, y0 + (coords[i][0] - min(rows) + .5) * gap)
-    draw.rounded_rectangle([s(left), s(y0), s(left + w), s(y0 + h)], radius=s(10), fill=(233, 211, 166))
+    at = lambda i: (left + (coords[i][1] - min(cols) + .75) * gap, y0 + (coords[i][0] - min(rows) + .75) * gap)
+    draw.rounded_rectangle([s(left + 3), s(y0 + 6), s(left + w + 3), s(y0 + h + 6)], radius=s(14), fill=(0, 0, 0, 60))
+    gradient(img, (left, y0, left + w, y0 + h), (122, 74, 36), (78, 44, 18), 14)
+    rim = gap * .16
+    gradient(img, (left + rim, y0 + rim, left + w - rim, y0 + h - rim), (242, 220, 174), (221, 187, 130), 9)
     for a, b in rules.grid.segments():
         (xa, ya), (xb, yb) = at(a), at(b)
-        draw.line([s(xa), s(ya), s(xb), s(yb)], fill=(107, 74, 27), width=s(2))
+        draw.line([s(xa + .6), s(ya + 1), s(xb + .6), s(yb + 1)], fill=(255, 244, 220), width=s(2))
+        draw.line([s(xa), s(ya), s(xb), s(yb)], fill=(92, 58, 23), width=s(2))
     for i, p in enumerate(snapshot):
+        x, y = at(i)
+        disc(draw, x, y, gap * .1, (74, 46, 18), None)
         if p != ".":
-            stone(draw, *at(i), gap * .34, p)
+            marble(draw, x, y, gap * .34, p)
     return h
 
 
-def ludo_board(draw, x0, y0, size, state):
-    cell = size / 15
-    box = lambda r, c, w=1, h=1: [s(x0 + c * cell), s(y0 + r * cell), s(x0 + (c + w) * cell), s(y0 + (r + h) * cell)]
-    draw.rectangle(box(0, 0, 15, 15), fill=(255, 255, 255))
+def ludo_board(img, draw, x0, y0, size, state):
+    draw.rounded_rectangle([s(x0 + 3), s(y0 + 6), s(x0 + size + 3), s(y0 + size + 6)], radius=s(16), fill=(0, 0, 0, 60))
+    draw.rounded_rectangle([s(x0), s(y0), s(x0 + size), s(y0 + size)], radius=s(16), fill=(62, 39, 35))
+    inner = size * .015
+    draw.rounded_rectangle([s(x0 + inner), s(y0 + inner), s(x0 + size - inner), s(y0 + size - inner)], radius=s(10), fill=(255, 250, 240))
+    bx, by = x0 + inner, y0 + inner
+    cell = (size - 2 * inner) / 15
+    pt = lambda r, c: (bx + c * cell, by + r * cell)
+    dark = {"red": (183, 28, 28), "green": (27, 94, 32), "yellow": (245, 127, 23), "blue": (13, 71, 161)}
     corners = {"red": (0, 0), "green": (0, 9), "yellow": (9, 9), "blue": (9, 0)}
     spots = [(2, 2), (2, 4), (4, 2), (4, 4)]
     for colour, (r, c) in corners.items():
-        draw.rectangle(box(r, c, 6, 6), fill=LUDO[colour])
-        draw.rounded_rectangle(box(r + 1, c + 1, 4, 4), radius=s(cell * .4), fill=(255, 255, 255))
+        x, y = pt(r, c)
+        gradient(img, (x + cell * .05, y + cell * .05, x + cell * 5.95, y + cell * 5.95), LUDO[colour], dark[colour], cell * .35)
+        draw.rounded_rectangle([s(x + cell * 1.05), s(y + cell * 1.12), s(x + cell * 5), s(y + cell * 5.07)], radius=s(cell * .5), fill=(0, 0, 0, 45))
+        draw.rounded_rectangle([s(x + cell), s(y + cell), s(x + cell * 5), s(y + cell * 5)], radius=s(cell * .5), fill=(255, 255, 255))
         for dr, dc in spots:
-            disc(draw, x0 + (c + dc) * cell, y0 + (r + dr) * cell, cell * .42, None, LUDO[colour], 2)
+            sx, sy = pt(r + dr, c + dc)
+            disc(draw, sx, sy, cell * .62, LUDO[colour] + (56,), LUDO[colour], cell * .07)
     starts = {offset: colour for colour, offset in LUDO_OFFSET.items()}
     for i, (r, c) in enumerate(LUDO_TRACK):
-        draw.rectangle(box(r, c), fill=LUDO[starts[i]] if i in starts else (255, 255, 255), outline=(190, 190, 190), width=s(1))
-        if i in LUDO_SAFE and i not in starts:
-            star_points = [(x0 + (c + .5 + .3 * math.sin(k * math.pi / 5)) * cell if k % 2 == 0 else
-                            x0 + (c + .5 + .13 * math.sin(k * math.pi / 5)) * cell,
-                            y0 + (r + .5 - .3 * math.cos(k * math.pi / 5)) * cell if k % 2 == 0 else
-                            y0 + (r + .5 - .13 * math.cos(k * math.pi / 5)) * cell) for k in range(10)]
-            draw.polygon([(s(x), s(y)) for x, y in star_points], fill=(170, 170, 170))
+        x, y = pt(r, c)
+        draw.rounded_rectangle([s(x + cell * .03), s(y + cell * .03), s(x + cell * .97), s(y + cell * .97)], radius=s(cell * .1),
+                               fill=LUDO[starts[i]] if i in starts else (255, 255, 255), outline=(214, 207, 194), width=s(1))
+        if i in starts:
+            draw.polygon(star_points(x + cell / 2, y + cell / 2, cell * .3), fill=(255, 255, 255))
+        elif i in LUDO_SAFE:
+            draw.polygon(star_points(x + cell / 2, y + cell / 2, cell * .32), fill=(255, 193, 7), outline=(180, 130, 0))
     for colour, cells in LUDO_HOME_COLUMNS.items():
         for r, c in cells:
-            draw.rectangle(box(r, c), fill=LUDO[colour], outline=(190, 190, 190), width=s(1))
-    centre = lambda pts: [(s(x0 + x * cell), s(y0 + y * cell)) for x, y in pts]
-    draw.polygon(centre([(6, 6), (7.5, 7.5), (6, 9)]), fill=LUDO["red"])
-    draw.polygon(centre([(6, 6), (9, 6), (7.5, 7.5)]), fill=LUDO["green"])
-    draw.polygon(centre([(9, 6), (9, 9), (7.5, 7.5)]), fill=LUDO["yellow"])
-    draw.polygon(centre([(6, 9), (9, 9), (7.5, 7.5)]), fill=LUDO["blue"])
-    home = {"red": (6.6, 7.5), "green": (7.5, 6.6), "yellow": (8.4, 7.5), "blue": (7.5, 8.4)}
+            x, y = pt(r, c)
+            gradient(img, (x + cell * .03, y + cell * .03, x + cell * .97, y + cell * .97), LUDO[colour], dark[colour], cell * .1)
+        er, ec = LUDO_TRACK[(LUDO_OFFSET[colour] + 50) % 52]
+        hr, hc = cells[0]
+        ang = math.atan2(hr - er, hc - ec)
+        cx, cy = pt(er + .5, ec + .5)
+        tip = [(.2, 0), (-.22, -.2), (-.22, .2)]
+        draw.polygon([(s(cx + (px * math.cos(ang) - py * math.sin(ang)) * cell), s(cy + (px * math.sin(ang) + py * math.cos(ang)) * cell))
+                      for px, py in tip], fill=LUDO[colour])
+    tri = lambda pts: [(s(bx + px * cell), s(by + py * cell)) for px, py in pts]
+    draw.polygon(tri([(6, 6), (7.5, 7.5), (6, 9)]), fill=LUDO["red"])
+    draw.polygon(tri([(6, 6), (9, 6), (7.5, 7.5)]), fill=LUDO["green"])
+    draw.polygon(tri([(9, 6), (9, 9), (7.5, 7.5)]), fill=LUDO["yellow"])
+    draw.polygon(tri([(6, 9), (9, 9), (7.5, 7.5)]), fill=LUDO["blue"])
+    disc(draw, bx + 7.5 * cell, by + 7.5 * cell, cell * .62, (255, 255, 255), (200, 200, 200), 1)
+    draw.polygon(star_points(bx + 7.5 * cell, by + 7.5 * cell, cell * .45), fill=(255, 193, 7), outline=(180, 130, 0))
+    home = {"red": (6.55, 7.5), "green": (7.5, 6.55), "yellow": (8.45, 7.5), "blue": (7.5, 8.45)}
     places = {}
     for player, tokens in enumerate(state["tokens"]):
         colour = state["colours"][player]
@@ -310,7 +449,8 @@ def ludo_board(draw, x0, y0, size, state):
         for k, colour in enumerate(colours):
             spread = .2 if len(colours) > 1 else 0
             ox, oy = spread * (1 if k % 2 else -1), spread * (1 if k > 1 else -1) * (len(colours) > 2)
-            disc(draw, x0 + (x + ox) * cell, y0 + (y + oy) * cell, cell * (.3 if len(colours) > 1 else .36), LUDO[colour], (30, 30, 30), 2)
+            radius = .27 if len(colours) > 1 else .36
+            pawn(draw, bx + (x + ox) * cell, by + (y + oy - radius * .1) * cell, cell * radius, LUDO[colour])
     return size
 
 
@@ -321,50 +461,101 @@ def snakes_cell(n):
     return col + .5, 9 - row + .5
 
 
-def snakes_board(draw, x0, y0, size, state):
-    cell = size / 10
-    pt = lambda x, y: (s(x0 + x * cell), s(y0 + y * cell))
+SNAKE_COLOURS = [("#2e7d32", "#a5d6a7"), ("#6a1b9a", "#e1bee7"), ("#e65100", "#ffcc80"), ("#c62828", "#ffcdd2"),
+                 ("#00695c", "#b2dfdb"), ("#4e342e", "#d7ccc8"), ("#283593", "#c5cae9"), ("#9e9d24", "#f0f4c3"),
+                 ("#ad1457", "#f8bbd0"), ("#1565c0", "#bbdefb")]
+TILE_COLOURS = ["#ff8a80", "#ffd180", "#ffff8d", "#b9f6ca", "#80d8ff", "#cf9fff"]
+
+
+def snakes_board(img, draw, x0, y0, size, state, players):
+    border = size * .032
+    draw.rounded_rectangle([s(x0 + 3), s(y0 + 6), s(x0 + size + 3), s(y0 + size + 6)], radius=s(16), fill=(0, 0, 0, 60))
+    gradient(img, (x0, y0, x0 + size, y0 + size), (46, 125, 50), (27, 94, 32), 16)
+    draw.rounded_rectangle([s(x0 + border * .65), s(y0 + border * .65), s(x0 + size - border * .65), s(y0 + size - border * .65)],
+                           radius=s(6), fill=(255, 253, 231))
+    bx, by = x0 + border, y0 + border
+    cell = (size - 2 * border) / 10
+    pt = lambda x, y: (s(bx + x * cell), s(by + y * cell))
     for n in range(1, 101):
         x, y = snakes_cell(n)
-        shade = (255, 243, 214) if (((n - 1) // 10) + n) % 2 else (255, 224, 163)
-        draw.rectangle([*pt(x - .5, y - .5), *pt(x + .5, y + .5)], fill=(255, 213, 79) if n == 100 else shade)
-        text(draw, x0 + (x - .44) * cell, y0 + (y - .46) * cell, str(n), 11, (154, 123, 79))
-    for start, end in LADDERS.items():
+        row, col = (n - 1) // 10, int(x - .5)
+        tile = rgb(TILE_COLOURS[(row + col) % len(TILE_COLOURS)])
+        gradient(img, (bx + (x - .47) * cell, by + (y - .47) * cell, bx + (x + .47) * cell, by + (y + .47) * cell),
+                 mix(tile, (255, 255, 255), .45), tile, cell * .12)
+        text(draw, bx + (x - .42) * cell, by + (y - .45) * cell, str(n), max(8, int(cell * .2)), (90, 70, 50))
+        if n == 1:
+            f = font(max(7, int(cell * .22)), font_stack()[0][0] if font_stack() else None)
+            draw.text(pt(x, y + .16), "START", font=f, fill=(27, 94, 32), anchor="ms")
+        elif n == 100:  # chequered flag
+            px, py = bx + (x - .12) * cell, by + (y - .25) * cell
+            draw.line([s(px), s(py), s(px), s(py + cell * .55)], fill=(60, 60, 60), width=s(2))
+            sq = cell * .09
+            for a in range(4):
+                for b in range(3):
+                    draw.rectangle([s(px + a * sq), s(py + b * sq), s(px + (a + 1) * sq), s(py + (b + 1) * sq)],
+                                   fill=(20, 20, 20) if (a + b) % 2 else (255, 255, 255))
+    for start, end in LADDERS.items():  # wooden ladders with a shadow
         (x1, y1), (x2, y2) = snakes_cell(start), snakes_cell(end)
         length = math.hypot(x2 - x1, y2 - y1)
-        nx, ny = -(y2 - y1) / length * .16, (x2 - x1) / length * .16
-        for side in (1, -1):
-            draw.line([*pt(x1 + nx * side, y1 + ny * side), *pt(x2 + nx * side, y2 + ny * side)], fill=(141, 110, 99), width=s(4))
-        t = .12
-        while t < 1:
-            x, y = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
-            draw.line([*pt(x + nx, y + ny), *pt(x - nx, y - ny)], fill=(141, 110, 99), width=s(3))
-            t += .3 / length
-    for head, tail in SNAKES.items():
+        nx, ny = -(y2 - y1) / length * .17, (x2 - x1) / length * .17
+        rungs, t = [], .1
+        while t < .95:
+            rungs.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+            t += .32 / length
+        for dx, dy, colour, rail, rung in ((.06, .08, (0, 0, 0, 55), .1, .07), (0, 0, (109, 63, 23), .1, .07), (0, 0, (217, 160, 102), .04, .035)):
+            for x, y in rungs:
+                draw.line([*pt(x + nx + dx, y + ny + dy), *pt(x - nx + dx, y - ny + dy)], fill=colour, width=max(1, int(s(cell * rung))))
+            for side in (1, -1):
+                draw.line([*pt(x1 + nx * side + dx, y1 + ny * side + dy), *pt(x2 + nx * side + dx, y2 + ny * side + dy)],
+                          fill=colour, width=max(1, int(s(cell * rail))))
+    for k, (head, tail) in enumerate(SNAKES.items()):  # tapered, spotted snakes with eyes and a forked tongue
+        dark_c, light_c = (rgb(c) for c in SNAKE_COLOURS[k % len(SNAKE_COLOURS)])
         (x1, y1), (x2, y2) = snakes_cell(head), snakes_cell(tail)
         dx, dy = x2 - x1, y2 - y1
         length = math.hypot(dx, dy)
-        nx, ny, w = -dy / length, dx / length, min(.9, length / 4)
-        c1 = (x1 + dx * .33 + nx * w, y1 + dy * .33 + ny * w)
-        c2 = (x1 + dx * .66 - nx * w, y1 + dy * .66 - ny * w)
+        nx, ny, w = -dy / length, dx / length, min(1, length / 3.5)
+        c1 = (x1 + dx * .3 + nx * w, y1 + dy * .3 + ny * w)
+        c2 = (x1 + dx * .68 - nx * w, y1 + dy * .68 - ny * w)
         body = []
-        for k in range(41):
-            t = k / 40
-            bx = (1 - t) ** 3 * x1 + 3 * (1 - t) ** 2 * t * c1[0] + 3 * (1 - t) * t ** 2 * c2[0] + t ** 3 * x2
-            by = (1 - t) ** 3 * y1 + 3 * (1 - t) ** 2 * t * c1[1] + 3 * (1 - t) * t ** 2 * c2[1] + t ** 3 * y2
-            body.append(pt(bx, by))
-        draw.line(body, fill=(46, 125, 50), width=s(int(cell * .22)), joint="curve")
-        disc(draw, x0 + x1 * cell, y0 + y1 * cell, cell * .2, (46, 125, 50), (46, 125, 50))
+        for i in range(31):
+            t = i / 30
+            body.append(((1 - t) ** 3 * x1 + 3 * (1 - t) ** 2 * t * c1[0] + 3 * (1 - t) * t ** 2 * c2[0] + t ** 3 * x2,
+                         (1 - t) ** 3 * y1 + 3 * (1 - t) ** 2 * t * c1[1] + 3 * (1 - t) * t ** 2 * c2[1] + t ** 3 * y2))
+        for offset, colour in (((.07, .09), (0, 0, 0, 50)), ((0, 0), dark_c)):
+            for i in range(30):
+                width = (.34 - .26 * i / 30) * cell
+                (ax, ay), (bx2, by2) = body[i], body[i + 1]
+                draw.line([*pt(ax + offset[0], ay + offset[1]), *pt(bx2 + offset[0], by2 + offset[1])], fill=colour, width=max(1, int(s(width))))
+                disc(draw, bx + (bx2 + offset[0]) * cell, by + (by2 + offset[1]) * cell, width / 2, colour, None)
+        for i in range(1, 30, 3):
+            (ax, ay), (bx2, by2) = body[i], body[i + 1]
+            disc(draw, bx + (ax + bx2) / 2 * cell, by + (ay + by2) / 2 * cell, (.34 - .26 * i / 30) * cell * .22, light_c, None)
+        fx, fy = x1 - body[1][0], y1 - body[1][1]
+        fl = math.hypot(fx, fy)
+        fx, fy = fx / fl, fy / fl
+        px, py = -fy, fx
+        hx, hy = bx + x1 * cell, by + y1 * cell
+        draw.line([s(hx + fx * cell * .28), s(hy + fy * cell * .28), s(hx + fx * cell * .48), s(hy + fy * cell * .48)], fill=(229, 57, 53), width=3)
+        for side in (1, -1):
+            draw.line([s(hx + fx * cell * .48), s(hy + fy * cell * .48), s(hx + (fx * .56 + px * .06 * side) * cell), s(hy + (fy * .56 + py * .06 * side) * cell)],
+                      fill=(229, 57, 53), width=3)
+        disc(draw, hx + fx * cell * .04, hy + fy * cell * .04, cell * .25, dark_c, None)
+        for side in (1, -1):
+            ex, ey = hx + (fx * .12 + px * .1 * side) * cell, hy + (fy * .12 + py * .1 * side) * cell
+            disc(draw, ex, ey, cell * .07, (255, 255, 255), None)
+            disc(draw, ex + fx * cell * .02, ey + fy * cell * .02, cell * .035, (17, 17, 17), None)
     spots = {}
     for i, p in enumerate(state["pos"]):
         if p:
             spots.setdefault(p, []).append(i)
-    for square, players in spots.items():
+    for square, who in spots.items():
         x, y = snakes_cell(square)
-        for k, i in enumerate(players):
-            ox = (k % 2 - .5) * .36 if len(players) > 1 else 0
-            oy = (k // 2 - .3) * .3 if len(players) > 1 else 0
-            disc(draw, x0 + (x + ox) * cell, y0 + (y + oy) * cell, cell * .24, PARTY[i % len(PARTY)], (30, 30, 30), 2)
+        for k, i in enumerate(who):
+            ox = (k % 2 - .5) * .4 if len(who) > 1 else 0
+            oy = (k // 2 - .3) * .34 if len(who) > 1 else 0
+            name = clean(players[i]["name"]) if players else ""
+            pawn(draw, bx + (x + ox) * cell, by + (y + oy) * cell, cell * (.22 if len(who) > 1 else .3),
+                 PARTY[i % len(PARTY)], name[0] if name else "")
     return size
 
 
@@ -374,8 +565,8 @@ def compose(title, headline, players, draw_board, board_height):
     """players: [(swatch colour, label, is_winner)]. draw_board(img, draw, x, y, width) -> height used."""
     board_w = WIDTH - 2 * PAD
     height = int(PAD + 36 + 34 + 16 + board_height + 18 + 34 * len(players) + PAD)
-    img = Image.new("RGBA", (s(WIDTH), s(height)), PAPER)
-    draw = ImageDraw.Draw(img)
+    img = Image.new("RGB", (s(WIDTH), s(height)), PAPER)
+    draw = ImageDraw.Draw(img, "RGBA")  # on an RGB canvas, see-through shadows and highlights blend in
     text(draw, PAD, PAD, title, 28)
     text(draw, PAD, PAD + 40, headline, 20, HINT)
     used = draw_board(img, draw, PAD, PAD + 86, board_w)
@@ -405,15 +596,15 @@ def board_game_picture(game, snapshot, last, headline):
         coords = rules.grid.coords
         span_c = max(c for _, c in coords) - min(c for _, c in coords) + 1
         span_r = max(r for r, _ in coords) - min(r for r, _ in coords) + 1
-        gap = min(board_w / span_c, 520 / span_r)
-        height = gap * span_r
-        draw_board = lambda img, d, x, y, w: line_board(d, x, y, w, snapshot, rules)
+        gap = min(board_w / (span_c + .5), 520 / (span_r + .5))
+        height = gap * (span_r + .5)
+        draw_board = lambda img, d, x, y, w: line_board(img, d, x, y, w, snapshot, rules)
     elif rules.kind == "chess":
         height, draw_board = board_w, lambda img, d, x, y, w: chess_board(img, d, x, y, w, snapshot, last)
     elif rules.kind == "go":
-        height, draw_board = board_w, lambda img, d, x, y, w: go_board(d, x, y, w, snapshot, last)
+        height, draw_board = board_w, lambda img, d, x, y, w: go_board(img, d, x, y, w, snapshot, last)
     else:
-        height, draw_board = board_w, lambda img, d, x, y, w: square_board(d, x, y, w, snapshot, rules.kind)
+        height, draw_board = board_w, lambda img, d, x, y, w: square_board(img, d, x, y, w, snapshot, rules.kind)
     return compose(clean(rules.title) + " - final position", clean(headline), players, draw_board, height)
 
 
@@ -432,7 +623,7 @@ def party_picture(game, headline):
         if (state.get("left") or [False] * len(game["players"]))[i]:
             info += " (left)"
         players.append((colour, f"{clean(p['name'])} - {info}", state["winner"] == i))
-    draw_board = (lambda img, d, x, y, w: ludo_board(d, x, y, w, state)) if game["kind"] == "ludo" else \
-        (lambda img, d, x, y, w: snakes_board(d, x, y, w, state))
+    draw_board = (lambda img, d, x, y, w: ludo_board(img, d, x, y, w, state)) if game["kind"] == "ludo" else \
+        (lambda img, d, x, y, w: snakes_board(img, d, x, y, w, state, game["players"]))
     title = "Ludo" if game["kind"] == "ludo" else "Snakes and Ladders"
     return compose(f"{title} - final board", clean(headline), players, draw_board, board_w)
