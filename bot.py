@@ -626,6 +626,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/imagine <description> – generate a picture\n"
         "/fetch <search> – a picture from the web (add \"gif\" for a GIF)\n"
         "/serious – critical, logical mode (stays on until /unserious)\n"
+        "/tldrmode [on|off] – short, to-the-point answers (no word: switch it)\n"
         "/criticize [@someone] – a roast of today's behaviour\n"
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
@@ -2874,6 +2875,7 @@ async def register_commands(app):
         ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
         ("serious", "Serious mode on: critical, logical answers"),
         ("unserious", "Back to the usual Laden"),
+        ("tldrmode", "Short answers on/off (or /tldrmode on, /tldrmode off)"),
         ("criticize", "Get roasted for today's behaviour (or reply/@ someone)"),
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
@@ -2941,6 +2943,8 @@ async def system_prompt(chat_id=None):
         prompt += f"\n\n{LORE_INSTRUCTIONS}\n{facts}"
     if chat_id is not None and chat_id in await load_serious():
         prompt += f"\n\n{SERIOUS_PROMPT}"
+    if chat_id is not None and chat_id in await load_tldr():
+        prompt += f"\n\n{TLDR_PROMPT}"
     return prompt
 
 
@@ -2989,6 +2993,57 @@ async def unserious(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_serious(update, False)
 
 
+TLDR_PROMPT = (
+    "TL;DR MODE is on: keep every answer short and to the point – the answer first, in one to three short "
+    "sentences (or up to four brief bullet points if a list is really needed), about 60 words at most. "
+    "No preamble, background, caveats or follow-up offers unless they're essential. "
+    "Only go longer if the user explicitly asks for detail."
+)
+tldr_chats = None  # chat ids with TL;DR mode on; cached copy of the Redis set "tldr"
+
+
+async def load_tldr():
+    global tldr_chats
+    if tldr_chats is None:
+        tldr_chats = set()
+        if use_redis:
+            try:
+                tldr_chats = {int(c) for c in await redis("SMEMBERS", "tldr") or []}
+            except Exception:
+                log.exception("Could not load TL;DR mode")
+    return tldr_chats
+
+
+async def tldrmode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tldrmode switches short answers on or off for the chat; /tldrmode on or /tldrmode off sets it exactly."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    chats = await load_tldr()
+    chat_id = update.effective_chat.id
+    was_on = chat_id in chats
+    word = (context.args[0].lower() if context.args else "")
+    if word in ("on", "yes", "enable", "1"):
+        turn_on = True
+    elif word in ("off", "no", "disable", "0"):
+        turn_on = False
+    elif word:
+        await update.message.reply_text("Use /tldrmode, /tldrmode on or /tldrmode off.", do_quote=is_group(update))
+        return
+    else:
+        turn_on = not was_on  # no word: toggle
+    (chats.add if turn_on else chats.discard)(chat_id)
+    if use_redis and turn_on != was_on:
+        try:
+            await redis("SADD" if turn_on else "SREM", "tldr", str(chat_id))
+        except Exception:
+            log.exception("Could not save TL;DR mode")
+    if turn_on:
+        text = "✂️ TL;DR mode is already on." if was_on else "✂️ TL;DR mode ON: short, to-the-point answers. /tldrmode off to turn it off."
+    else:
+        text = "📜 TL;DR mode is already off." if not was_on else "📜 TL;DR mode OFF: answers can be longer again."
+    await update.message.reply_text(text, do_quote=is_group(update))
+
+
 def main():
     # concurrent_updates: handle messages in parallel, so one slow Gemini call (or an emoji reaction)
     # doesn't hold up every message behind it
@@ -3003,6 +3058,7 @@ def main():
     app.add_handler(CommandHandler("fetch", fetch))
     app.add_handler(CommandHandler("serious", serious))
     app.add_handler(CommandHandler("unserious", unserious))
+    app.add_handler(CommandHandler("tldrmode", tldrmode))
     app.add_handler(CommandHandler("criticize", criticize))
     app.add_handler(CommandHandler("criticise", criticize))
     app.add_handler(CommandHandler("on", power_on))
