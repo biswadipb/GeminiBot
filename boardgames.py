@@ -148,20 +148,22 @@ def negamax_search(rules, state, depth_limit, seconds):
                 break
         return value
 
+    random.shuffle(moves)  # equally good moves vary from game to game
     for depth in range(1, depth_limit + 1):
         try:
-            scored = []
-            alpha = -10 ** 9
+            best_here, best_value = None, -10 ** 9
             for move in moves:
-                value = -negamax(rules.play(state, move), depth - 1, -10 ** 9, -alpha)
-                scored.append((value + random.random() * 0.01, move))  # tiny noise varies equal moves
-                alpha = max(alpha, value)
-            scored.sort(reverse=True)
+                # Moves after the first are only searched far enough to prove they aren't better, so their
+                # scores are upper bounds: switch only to a move that is strictly better.
+                value = -negamax(rules.play(state, move), depth - 1, -10 ** 9, -best_value)
+                if best_here is None or value > best_value:
+                    best_here, best_value = move, value
             if depth == 1 or depth % 2 == 0:
                 # an odd depth ends on our own move and misses the opponent's reply (e.g. a recapture), so
                 # only trust searches that end on theirs
-                best = scored[0][1]
-            moves = [m for _, m in scored]  # search the best moves first next time
+                best = best_here
+            moves.remove(best_here)
+            moves.insert(0, best_here)  # search the best move first next time
         except OutOfTime:
             break
     return best
