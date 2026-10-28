@@ -5,6 +5,7 @@ replay it. Colours are "white" and "black"; boards are sent to the Mini App as o
 The opponents are plain Python with a time budget per move, so they stay quick on a tiny server."""
 
 import random
+import re
 import time
 
 import chess
@@ -156,7 +157,10 @@ def negamax_search(rules, state, depth_limit, seconds):
                 scored.append((value + random.random() * 0.01, move))  # tiny noise varies equal moves
                 alpha = max(alpha, value)
             scored.sort(reverse=True)
-            best = scored[0][1]
+            if depth == 1 or depth % 2 == 0:
+                # an odd depth ends on our own move and misses the opponent's reply (e.g. a recapture), so
+                # only trust searches that end on theirs
+                best = scored[0][1]
             moves = [m for _, m in scored]  # search the best moves first next time
         except OutOfTime:
             break
@@ -704,6 +708,18 @@ def alquerque_lines(n, row0=0):
     return [line for line in rows + cols + diagonals if len(line) > 1]
 
 
+def grid_lines(rows, cols):
+    """Rows, columns and alquerque-style diagonals (through points whose row + column is even) of a grid."""
+    lines = [[(r, c) for c in range(cols)] for r in range(rows)] + [[(r, c) for r in range(rows)] for c in range(cols)]
+    for k in range(-(rows - 1), cols):
+        if k % 2 == 0:
+            lines.append([(r, r + k) for r in range(rows) if 0 <= r + k < cols])
+    for k in range(0, rows + cols - 1):
+        if k % 2 == 0:
+            lines.append([(r, k - r) for r in range(rows) if 0 <= k - r < cols])
+    return [line for line in lines if len(line) > 1]
+
+
 def sixteen_beads_lines():
     """A 5x5 alquerque square (rows 0-4) with a triangle of six points beyond the middle of each end."""
     lines = []
@@ -967,5 +983,448 @@ class SixteenBeads(LineGame):
         super().__init__(sixteen_beads_lines(), black_rows={-2, -1, 0, 1}, white_rows={3, 4, 5, 6})
 
 
+class FanoronaState:
+    __slots__ = ("board", "turn", "quiet", "plies")
+
+    def __init__(self, board, turn, quiet, plies):
+        self.board, self.turn, self.quiet, self.plies = board, turn, quiet, plies
+
+
+class Fanorona(LineGame):
+    """Fanorona: capture by approaching or withdrawing from a line of enemy pieces; a capturing piece may keep
+    going, but not twice in the same direction or back to a point it has visited this turn.
+    A move is written as the points it passes, each step marked "a" (approach), "w" (withdrawal) or "-" (no capture),
+    e.g. "23a24w25"."""
+    kind, title, emoji, clock_minutes, first = "fanorona", "Fanorona", "⚫", 10, "white"
+    level_note = "1 = beginner · 3 = casual · 5 = strongest"
+    COLUMNS = "abcdefghi"
+
+    def __init__(self):
+        super().__init__(grid_lines(5, 9), black_rows={0, 1}, white_rows={3, 4})
+        for i, (r, c) in enumerate(self.grid.coords):  # middle row: alternating, centre empty
+            if r == 2:
+                self.start[i] = "." if c == 4 else ("b" if (c < 4) == (c % 2 == 0) else "w")
+        self.pieces = self.start.count("b")
+        self.at = {p: i for i, p in enumerate(self.grid.coords)}
+
+    def new(self):
+        return FanoronaState(self.start[:], "white", 0, 0)
+
+    def line_from(self, board, point, direction, enemy):
+        """The run of enemy pieces starting at point and continuing in direction."""
+        taken, (r, c) = [], self.grid.coords[point] if point is not None else (None, None)
+        while point is not None and board[point] == enemy:
+            taken.append(point)
+            r, c = r + direction[0], c + direction[1]
+            point = self.at.get((r, c))
+        return taken
+
+    def step_captures(self, board, a, b, enemy):
+        """{"a": [...], "w": [...]} pieces captured by approach / withdrawal when moving a -> b (empty lists dropped)."""
+        (ra, ca), (rb, cb) = self.grid.coords[a], self.grid.coords[b]
+        d = (rb - ra, cb - ca)
+        result = {}
+        ahead = self.at.get((rb + d[0], cb + d[1]))
+        if ahead is not None and board[ahead] == enemy:
+            result["a"] = self.line_from(board, ahead, d, enemy)
+        behind = self.at.get((ra - d[0], ca - d[1]))
+        if behind is not None and board[behind] == enemy:
+            result["w"] = self.line_from(board, behind, (-d[0], -d[1]), enemy)
+        return result
+
+    def moves_for(self, state):
+        mine, enemy = state.turn[0], OTHER[state.turn][0]
+        captures, paika = [], []
+        for start, piece in enumerate(state.board):
+            if piece != mine:
+                continue
+
+            def extend(board, pos, visited, last_dir, text):
+                for nxt in self.grid.steps[pos]:
+                    if board[nxt] != "." or nxt in visited:
+                        continue
+                    (r0, c0), (r1, c1) = self.grid.coords[pos], self.grid.coords[nxt]
+                    d = (r1 - r0, c1 - c0)
+                    if d == last_dir:
+                        continue
+                    for how, taken in self.step_captures(board, pos, nxt, enemy).items():
+                        move = f"{text}{how}{nxt + 1}"
+                        captures.append(move)
+                        if state.plies == 0:
+                            continue  # the opening turn is a single capture
+                        after = board[:]
+                        after[pos], after[nxt] = ".", mine
+                        for t in taken:
+                            after[t] = "."
+                        extend(after, nxt, visited | {nxt}, d, move)
+
+            extend(state.board, start, {start}, None, str(start + 1))
+            paika += [f"{start + 1}-{b + 1}" for b in self.grid.steps[start] if state.board[b] == "."]
+        return captures or paika
+
+    def play(self, state, move):
+        if move not in self.legal(state):
+            raise ValueError("illegal move")
+        board, enemy = state.board[:], OTHER[state.turn][0]
+        points = [int(p) - 1 for p in re.split(r"[aw-]", move)]
+        kinds = re.findall(r"[aw-]", move)
+        captured = False
+        for (a, b), how in zip(zip(points, points[1:]), kinds):
+            taken = self.step_captures(board, a, b, enemy).get(how, []) if how != "-" else []
+            board[b], board[a] = board[a], "."
+            for t in taken:
+                board[t] = "."
+            captured = captured or bool(taken)
+        return FanoronaState(board, OTHER[state.turn], 0 if captured else state.quiet + 1, state.plies + 1)
+
+    def label(self, state, move):
+        name = lambda n: self.COLUMNS[self.grid.coords[int(n) - 1][1]] + str(5 - self.grid.coords[int(n) - 1][0])
+        points = re.split(r"[aw-]", move)
+        kinds = re.findall(r"[aw-]", move)
+        text = name(points[0])
+        for point, how in zip(points[1:], kinds):
+            text += "-" + name(point) + {"-": "", "a": "A", "w": "W"}[how]  # A = approach, W = withdrawal
+        return text
+
+    def ordered_moves(self, state):
+        return sorted(self.moves_for(state), key=lambda m: -len(m))
+
+
+class DraughtsState:
+    __slots__ = ("board", "turn", "quiet")
+
+    def __init__(self, board, turn, quiet):
+        self.board, self.turn, self.quiet = board, turn, quiet  # board: 64 chars, top row first
+
+
+class Draughts(Rules):
+    """Turkish draughts: men move one square forward or sideways and capture the same way; kings fly along
+    ranks and files. Captured pieces vanish at once, capturing is compulsory and the longest capture must be taken."""
+    kind, title, emoji, clock_minutes, first = "draughts", "Turkish draughts", "⛀", 10, "white"
+    level_note = "1 = beginner · 3 = casual · 5 = strongest"
+    quiet_limit = 60
+    ORTHOGONAL = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    def new(self):
+        board = ["."] * 64
+        for c in range(8):
+            board[8 + c] = board[16 + c] = "b"
+            board[40 + c] = board[48 + c] = "w"
+        return DraughtsState(board, "white", 0)
+
+    @staticmethod
+    def name(i):
+        return "abcdefgh"[i % 8] + str(8 - i // 8)
+
+    @staticmethod
+    def index(name):
+        return "abcdefgh".index(name[0]) + (8 - int(name[1:])) * 8
+
+    def man_dirs(self, piece):
+        return [(1 if piece == "b" else -1, 0), (0, -1), (0, 1)]
+
+    def captures(self, board, start, piece):
+        """Every capture sequence from start: [(path of squares, number captured)]."""
+        enemy = "w" if piece.lower() == "b" else "b"
+        results = []
+
+        def extend(board, pos, path, count, last_dir):
+            grew = False
+            r0, c0 = divmod(pos, 8)
+            for dr, dc in (self.ORTHOGONAL if piece.isupper() else self.man_dirs(piece)):
+                if last_dir and (dr, dc) == (-last_dir[0], -last_dir[1]):
+                    continue  # no turning back
+                r, c = r0 + dr, c0 + dc
+                if piece.isupper():  # fly over empty squares to the enemy
+                    while 0 <= r < 8 and 0 <= c < 8 and board[r * 8 + c] == ".":
+                        r, c = r + dr, c + dc
+                if not (0 <= r < 8 and 0 <= c < 8) or board[r * 8 + c].lower() != enemy:
+                    continue
+                over = r * 8 + c
+                lands = []
+                r, c = r + dr, c + dc
+                while 0 <= r < 8 and 0 <= c < 8 and board[r * 8 + c] == ".":
+                    lands.append(r * 8 + c)
+                    if piece.islower():
+                        break  # men land right behind
+                    r, c = r + dr, c + dc
+                for land in lands:
+                    after = board[:]
+                    after[over], after[pos], after[land] = ".", ".", piece  # captured pieces vanish at once
+                    grew = True
+                    extend(after, land, path + [land], count + 1, (dr, dc))
+            if not grew and count:
+                results.append((path, count))
+
+        extend(board, start, [start], 0, None)
+        return results
+
+    def moves_for(self, state):
+        mine = state.turn[0]
+        captures, steps = [], []
+        for i, piece in enumerate(state.board):
+            if piece.lower() != mine:
+                continue
+            captures += self.captures(state.board, i, piece)
+            r0, c0 = divmod(i, 8)
+            for dr, dc in (self.ORTHOGONAL if piece.isupper() else self.man_dirs(piece)):
+                r, c = r0 + dr, c0 + dc
+                while 0 <= r < 8 and 0 <= c < 8 and state.board[r * 8 + c] == ".":
+                    steps.append(f"{self.name(i)}-{self.name(r * 8 + c)}")
+                    if piece.islower():
+                        break
+                    r, c = r + dr, c + dc
+        if captures:
+            most = max(count for _, count in captures)  # the longest capture is compulsory
+            return sorted({"x".join(self.name(p) for p in path) for path, count in captures if count == most})
+        return steps
+
+    def turn(self, state):
+        return state.turn
+
+    def legal(self, state):
+        if state.quiet >= self.quiet_limit:
+            return []
+        return self.moves_for(state)
+
+    def play(self, state, move):
+        if move not in self.legal(state):
+            raise ValueError("illegal move")
+        squares = [self.index(n) for n in move.replace("x", "-").split("-")]
+        board = state.board[:]
+        piece = board[squares[0]]
+        board[squares[0]] = "."
+        for a, b in zip(squares, squares[1:]):
+            if "x" in move:  # remove the one enemy piece between a and b
+                ra, ca = divmod(a, 8)
+                rb, cb = divmod(b, 8)
+                dr, dc = (rb > ra) - (rb < ra), (cb > ca) - (cb < ca)
+                r, c = ra + dr, ca + dc
+                while (r, c) != (rb, cb):
+                    board[r * 8 + c] = "."
+                    r, c = r + dr, c + dc
+        end = squares[-1]
+        if piece.islower() and end // 8 == (7 if piece == "b" else 0):
+            piece = piece.upper()
+        board[end] = piece
+        quiet = 0 if "x" in move else state.quiet + 1
+        return DraughtsState(board, OTHER[state.turn], quiet)
+
+    def outcome(self, state):
+        if state.quiet >= self.quiet_limit:
+            return None, f"{self.quiet_limit // 2} moves each without a capture"
+        if self.moves_for(state):
+            return None
+        mine = state.turn[0]
+        how = "capturing every piece" if not any(p.lower() == mine for p in state.board) else "leaving no moves"
+        return OTHER[state.turn], how
+
+    def snapshot(self, state):
+        return "".join(state.board)
+
+    def score(self, state):
+        left = {c: sum(1 for p in state.board if p.lower() == c[0]) for c in ("black", "white")}
+        return {"black": 16 - left["white"], "white": 16 - left["black"]}
+
+    # computer opponent
+    def ordered_moves(self, state):
+        return sorted(self.moves_for(state), key=lambda m: -m.count("x"))
+
+    def evaluate(self, state):
+        result = self.outcome(state)
+        if result:
+            return 0 if result[0] is None else (10000 if result[0] == state.turn else -10000)
+        mine, total = state.turn[0], 0
+        for i, piece in enumerate(state.board):
+            if piece == ".":
+                continue
+            row = i // 8
+            value = 400 if piece.isupper() else 100 + 4 * (row if piece == "b" else 7 - row)
+            total += value if piece.lower() == mine else -value
+        return total
+
+    def bot_move(self, state, level):
+        moves = self.legal(state)
+        if len(moves) == 1:
+            return moves[0]
+        if level == 1:
+            return random.choice(moves)
+        depth, seconds = {2: (2, 0.4), 3: (4, 0.8), 4: (6, 1.4), 5: (8, 2.0)}[level]
+        return negamax_search(self, state, depth, seconds)
+
+
 GAMES = {rules.kind: rules for rules in (Chess(), Othello(), Checkers(), Go(), Alquerque(), BigAlquerque(),
-                                       SixteenBeads())}
+                                       SixteenBeads(), Fanorona(), Draughts())}
+
+
+# ---------------------------------------------------------------- dice games for 2-6 people (no computer opponent)
+# State is a plain dict (stored as JSON). Dice come from secrets (the operating system's cryptographic random
+# source), so nobody - not even the server - can predict or influence a roll.
+
+import secrets
+
+
+def roll_die():
+    return secrets.randbelow(6) + 1
+
+
+class PartyGame:
+    kind = title = emoji = ""
+    min_players, max_players = 2, 4
+
+    def next_turn(self, state):
+        state["turn"] = (state["turn"] + 1) % len(state["players_done"])
+        state["phase"] = "roll"
+
+
+SNAKES = {16: 6, 47: 26, 49: 11, 56: 53, 62: 19, 64: 60, 87: 24, 93: 73, 95: 75, 98: 78}
+LADDERS = {1: 38, 4: 14, 9: 31, 21: 42, 28: 84, 36: 44, 51: 67, 71: 91, 80: 100}
+
+
+class SnakesAndLadders(PartyGame):
+    kind, title, emoji, min_players, max_players = "snakes", "Snakes and Ladders", "🐍", 2, 6
+
+    def new(self, players):
+        return {"pos": [0] * players, "turn": 0, "phase": "roll", "dice": None, "rolls": 0, "winner": None,
+                "players_done": [False] * players}
+
+    def roll(self, state, dice=None):
+        """Roll for the player to move. Returns a list of event strings ("{0}" stands for that player's name)."""
+        dice = dice or roll_die()
+        me = state["turn"]
+        state["dice"], state["rolls"] = dice, state["rolls"] + 1
+        here, target = state["pos"][me], state["pos"][me] + dice
+        if target > 100:
+            events = [f"{{{me}}} rolled {dice} but needs exactly {100 - here} to finish"]
+        else:
+            events = [f"{{{me}}} rolled {dice}: {here or 'start'} → {target}"]
+            if target in LADDERS:
+                events.append(f"🪜 {{{me}}} climbed a ladder to {LADDERS[target]}")
+                target = LADDERS[target]
+            elif target in SNAKES:
+                events.append(f"🐍 {{{me}}} slid down a snake to {SNAKES[target]}")
+                target = SNAKES[target]
+            state["pos"][me] = target
+            if target == 100:
+                state["winner"] = me
+                events.append(f"🏆 {{{me}}} reached 100!")
+                return events
+        self.next_turn(state)
+        return events
+
+    def auto(self, state):
+        return self.roll(state)
+
+    def layout(self):
+        return {"snakes": SNAKES, "ladders": LADDERS}
+
+
+# Ludo on the usual 15 x 15 board. Track squares are (row, col), clockwise from Red's start; each colour
+# starts 13 squares further on, walks 51 squares, then 5 squares up its own home column and into home (56).
+def ludo_track():
+    path = [(6, c) for c in range(1, 6)] + [(r, 6) for r in range(5, -1, -1)] + [(0, 7)] + \
+           [(r, 8) for r in range(0, 6)] + [(6, c) for c in range(9, 15)] + [(7, 14)] + \
+           [(8, c) for c in range(14, 8, -1)] + [(r, 8) for r in range(9, 15)] + [(14, 7)] + \
+           [(r, 6) for r in range(14, 8, -1)] + [(8, c) for c in range(5, -1, -1)] + [(7, 0), (6, 0)]
+    return path
+
+
+LUDO_TRACK = ludo_track()
+LUDO_COLOURS = ["red", "green", "yellow", "blue"]
+LUDO_HOME_COLUMNS = {
+    "red": [(7, c) for c in range(1, 6)], "green": [(r, 7) for r in range(1, 6)],
+    "yellow": [(7, c) for c in range(13, 8, -1)], "blue": [(r, 7) for r in range(13, 8, -1)],
+}
+LUDO_OFFSET = {colour: 13 * i for i, colour in enumerate(LUDO_COLOURS)}
+LUDO_SAFE = {0, 8, 13, 21, 26, 34, 39, 47}  # start squares and stars
+LUDO_HOME = 56
+
+
+class Ludo(PartyGame):
+    kind, title, emoji, min_players, max_players = "ludo", "Ludo", "🎲", 2, 4
+
+    def colours(self, players):
+        return {2: ["red", "yellow"], 3: ["red", "green", "yellow"], 4: LUDO_COLOURS}[players]
+
+    def new(self, players):
+        return {"tokens": [[-1] * 4 for _ in range(players)], "colours": self.colours(players), "turn": 0,
+                "phase": "roll", "dice": None, "sixes": 0, "winner": None, "players_done": [False] * players}
+
+    @staticmethod
+    def square(colour, progress):
+        """Track index (0-51) of a token, or None if it's in base, its home column or home."""
+        return (LUDO_OFFSET[colour] + progress) % 52 if 0 <= progress <= 50 else None
+
+    def movable(self, state, player):
+        dice = state["dice"]
+        return [t for t, p in enumerate(state["tokens"][player])
+                if (p == -1 and dice == 6) or (0 <= p and p + dice <= LUDO_HOME)]
+
+    def roll(self, state, dice=None):
+        dice = dice or roll_die()
+        me = state["turn"]
+        state["dice"] = dice
+        events = [f"{{{me}}} rolled {dice}"]
+        if dice == 6:
+            state["sixes"] += 1
+            if state["sixes"] == 3:
+                events.append(f"{{{me}}} rolled three 6s in a row and loses the turn")
+                self.pass_turn(state)
+                return events
+        options = self.movable(state, me)
+        if not options:
+            events.append(f"{{{me}}} can't move")
+            self.pass_turn(state)
+        elif len(options) == 1 or len({state["tokens"][me][t] for t in options}) == 1:
+            events += self.move(state, options[0])  # only one real choice: play it straight away
+        else:
+            state["phase"] = "move"
+        return events
+
+    def pass_turn(self, state):
+        state["sixes"] = 0
+        self.next_turn(state)
+
+    def move(self, state, token):
+        me, dice = state["turn"], state["dice"]
+        if state["phase"] not in ("move", "roll") or token not in self.movable(state, me):
+            raise ValueError("that token can't move")
+        colour = state["colours"][me]
+        tokens = state["tokens"][me]
+        events, again = [], dice == 6
+        tokens[token] = 0 if tokens[token] == -1 else tokens[token] + dice
+        if tokens[token] == LUDO_HOME:
+            events.append(f"🏠 {{{me}}} brought a token home")
+            again = True
+        square = self.square(colour, tokens[token])
+        if square is not None and square not in LUDO_SAFE:
+            for other, their in enumerate(state["tokens"]):
+                if other == me:
+                    continue
+                for t, p in enumerate(their):
+                    if self.square(state["colours"][other], p) == square:
+                        their[t] = -1
+                        events.append(f"💥 {{{me}}} knocked {{{other}}}'s token back to base")
+                        again = True
+        if all(p == LUDO_HOME for p in tokens):
+            state["winner"] = me
+            events.append(f"🏆 {{{me}}} got all four tokens home!")
+            return events
+        if again:
+            state["phase"] = "roll"  # a 6, a capture or a token home: roll again
+        else:
+            self.pass_turn(state)
+        return events
+
+    def auto(self, state):
+        """The player ran out of time: roll for them, or move their most advanced token."""
+        if state["phase"] == "roll":
+            return self.roll(state)
+        best = max(self.movable(state, state["turn"]), key=lambda t: state["tokens"][state["turn"]][t])
+        return self.move(state, best)
+
+    def layout(self):
+        return {"track": LUDO_TRACK, "home_columns": LUDO_HOME_COLUMNS, "offset": LUDO_OFFSET, "safe": sorted(LUDO_SAFE)}
+
+
+PARTY_GAMES = {rules.kind: rules for rules in (SnakesAndLadders(), Ludo())}

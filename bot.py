@@ -27,7 +27,7 @@ from urllib.parse import parse_qsl, quote, urlparse
 
 import chess
 import chess.engine
-from boardgames import GAMES, OTHER
+from boardgames import GAMES, OTHER, PARTY_GAMES
 import httpx
 import tornado.web
 from ddgs import DDGS
@@ -630,8 +630,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
-        "/chessmatch · /othello · /checkers · /go · /16beads · /alquerque – board games: challenge someone, "
+        "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
         "leave the slot open, or play Laden\n"
+        "/snakesandladders · /ludo [@people] – dice games for several players\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -1930,7 +1931,8 @@ CHESS_CLOCK_MINUTES = os.getenv("CHESS_CLOCK_MINUTES")  # overrides chess's 10 m
 BOT_DEFAULT_LEVEL = 3
 BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
 GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go", "beads": "16beads",
-                 "alquerque": "alquerque", "alquerque9": "alquerque"}  # /alquerque asks for the board size first
+                 "alquerque": "alquerque", "alquerque9": "alquerque",  # /alquerque asks for the board size first
+                 "fanorona": "fanorona", "draughts": "draughts"}
 BIG_BOARD_WORDS = {"9x9", "9×9", "big", "bigger", "large"}
 board_games = {}  # game id -> game dict; cache of Redis game:<id>
 game_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
@@ -1943,6 +1945,8 @@ def game_link(bot_username, game_id):
 
 
 def game_rules(game):
+    if game.get("party"):
+        return PARTY_GAMES[game["kind"]]
     return GAMES[game.get("kind", "chess")]
 
 
@@ -2159,10 +2163,10 @@ async def watch_game_clocks():
     while True:
         await asyncio.sleep(10)
         for game in list(board_games.values()):
-            if clock_running(game):
+            if clock_running(game) or (game.get("party") and game["status"] == "playing"):
                 try:
                     async with game_locks.setdefault(game["id"], asyncio.Lock()):
-                        await check_flag(game)
+                        await (party_turn_timeout(game) if game.get("party") else check_flag(game))
                 except Exception:
                     log.exception("Game clock check failed")
 
@@ -2194,8 +2198,9 @@ async def post_game(update, context, game, text, menu=None):
 
 
 def too_many_games(user_id):
-    open_games = [g for g in board_games.values() if g["status"] != "over" and user_id in
-                  ((g.get("white") or {}).get("id"), (g.get("black") or {}).get("id"))]
+    def ids(g):
+        return [p["id"] for p in g.get("players", [])] + [(g.get(c) or {}).get("id") for c in ("white", "black")]
+    open_games = [g for g in board_games.values() if g["status"] != "over" and user_id in ids(g)]
     if len(open_games) >= GAME_MAX_OPEN:
         return f"You already have {len(open_games)} unfinished games. Finish or resign one first."
     return None
@@ -2491,6 +2496,9 @@ async def game_action(body):
     action, uid = body.get("action", "state"), user["id"]
     name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
     rules = game_rules(game)
+    if game.get("party"):
+        async with game_locks.setdefault(game["id"], asyncio.Lock()):
+            return await party_action(game, user, action, body)
     async with game_locks.setdefault(game["id"], asyncio.Lock()):
         color = player_color(game, uid)
         if color and game[color]["name"] != name and game["status"] != "over":
@@ -2546,6 +2554,236 @@ async def game_action(body):
                 game["draw_offer"] = None
             await save_game(game)
         return 200, game_view(game, uid)
+
+
+# ---------- Dice games for 2-6 people (/snakesandladders, /ludo): invite several people, no computer opponent ----------
+
+PARTY_COMMANDS = {"snakes": "snakesandladders", "ludo": "ludo"}
+TURN_SECONDS = 60  # after this, Laden rolls or moves for whoever's turn it is, so nobody can stall the game
+PARTY_LOG = 30  # recent events shown on the board
+
+
+def party_names(game):
+    return [p["name"] for p in game["players"]]
+
+
+def party_text(game):
+    """The group post: who's playing and who's still expected."""
+    rules = PARTY_GAMES[game["kind"]]
+    joined = ", ".join(f"<b>{html.escape(n)}</b>" for n in party_names(game))
+    text = f"{rules.emoji} <b>{rules.title}</b> ({rules.min_players}–{rules.max_players} players)\nPlaying: {joined}"
+    if game["status"] == "waiting":
+        waiting = [i["name"] for i in game["invited"] if not any(same_person(i, p) for p in game["players"])]
+        if waiting:
+            text += "\nWaiting for: " + ", ".join(html.escape(n) for n in waiting)
+        elif not game["invited"]:
+            text += "\nOpen seats: anyone in the group can join."
+        text += f"\n\nJoin from the board. {html.escape(game['players'][0]['name'])} can start once 2 people are in."
+    else:
+        text += "\nGame in progress. The board stays private until it ends."
+    return text
+
+
+def party_command(kind):
+    """/snakesandladders or /ludo, optionally with @people (or as a reply) to invite them."""
+    rules, command = PARTY_GAMES[kind], PARTY_COMMANDS[kind]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if await ignored_while_off(update) or await muted(update, context):
+            return
+        if not is_allowed(update):
+            await update.message.reply_text("Sorry, this bot is private.")
+            return
+        msg, user, chat = update.message, update.effective_user, update.effective_chat
+        refusal = too_many_games(user.id)
+        if refusal:
+            await msg.reply_text(refusal, do_quote=True)
+            return
+        invited = []
+        quoted = msg.reply_to_message
+        if quoted and quoted.from_user and not quoted.from_user.is_bot:
+            invited.append({"id": quoted.from_user.id, "name": quoted.from_user.full_name})
+        group_members = await load_members(chat.id) if is_group(update) else {}
+        by_username = {m["username"].lower(): uid for uid, m in group_members.items() if m["username"]}
+        for entity, text in msg.parse_entities(["mention", "text_mention"]).items():
+            if entity.type == "text_mention" and entity.user:
+                if not entity.user.is_bot:
+                    invited.append({"id": entity.user.id, "name": entity.user.full_name})
+            elif text.lstrip("@").lower() != context.bot.username.lower():
+                username = text.lstrip("@")
+                uid = by_username.get(username.lower())
+                invited.append({"id": uid, "username": username.lower(),
+                                "name": group_members[uid]["name"] if uid else f"@{username}"})
+        if not invited and context.args:  # plain names: /ludo asya michael
+            for word in context.args:
+                found = match_member_name(word.lower(), group_members)
+                if found:
+                    invited.append({"id": found[0], "name": found[1]})
+        unique = []
+        for person in invited:
+            if person.get("id") != user.id and not any(same_person(person, u) for u in unique):
+                unique.append(person)
+        if len(unique) > rules.max_players - 1:
+            await msg.reply_text(f"{rules.title} takes at most {rules.max_players} players, so invite up to "
+                                 f"{rules.max_players - 1} people.", do_quote=True)
+            return
+        if context.args and not unique and not quoted:
+            await msg.reply_text(f"I don't know who that is. @mention them, e.g. /{command} @name @name.", do_quote=True)
+            return
+        game = {"id": base64.urlsafe_b64encode(os.urandom(9)).decode(), "kind": kind, "party": True,
+                "chat_id": chat.id, "message_id": None, "creator": user.id, "invited": unique,
+                "players": [{"id": user.id, "name": user.full_name, "username": (user.username or "").lower()}],
+                "status": "waiting", "state": None,
+                "log": [], "result": None, "created": int(time.time())}
+        sent = await msg.reply_text(party_text(game), parse_mode=ParseMode.HTML,
+                                    reply_markup=open_board_button(rules, game["id"], context.bot.username),
+                                    do_quote=is_group(update))
+        game["message_id"] = sent.message_id
+        await save_game(game)
+
+    return handler
+
+
+def start_party(game):
+    """Seat the players in a random order (the first seat goes first) and set up the board."""
+    rules = PARTY_GAMES[game["kind"]]
+    random.SystemRandom().shuffle(game["players"])
+    game["state"] = rules.new(len(game["players"]))
+    if game["kind"] == "ludo":
+        for player, colour in zip(game["players"], game["state"]["colours"]):
+            player["colour"] = colour
+    game["status"], game["turn_started"] = "playing", time.time()
+    game["log"] = [f"Game on! {game['players'][0]['name']} goes first."]
+
+
+def party_log(game, events):
+    names = party_names(game)
+    game["log"] = (game["log"] + [e.format(*names) for e in events])[-PARTY_LOG:]
+    game["turn_started"] = time.time()
+
+
+async def finish_party(game):
+    rules, state = PARTY_GAMES[game["kind"]], game["state"]
+    game.update(status="over", result=state["winner"], ended=int(time.time()))
+    names = party_names(game)
+    if game["kind"] == "ludo":
+        standings = sorted(range(len(names)), key=lambda i: -sum(p == 56 for p in state["tokens"][i]))
+        detail = "\n".join(f"{n}. {html.escape(names[i])} – {sum(p == 56 for p in state['tokens'][i])}/4 tokens home"
+                           for n, i in enumerate(standings, 1))
+    else:
+        standings = sorted(range(len(names)), key=lambda i: -state["pos"][i])
+        detail = "\n".join(f"{n}. {html.escape(names[i])} – square {state['pos'][i]}" for n, i in enumerate(standings, 1))
+    text = (f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!\n\n"
+            f"<blockquote expandable>{detail}</blockquote>")
+    try:
+        await game_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
+                                    reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
+    except Exception:
+        log.exception("Could not post the game result")
+    joined = ", ".join(f"<b>{html.escape(n)}</b>" for n in names)
+    await edit_game_message(game, f"{rules.emoji} {rules.title}: {joined}. Game over – the result is below.")
+
+
+async def party_turn_timeout(game):
+    """Play for whoever let their turn time run out. Returns True if it did."""
+    if game["status"] != "playing" or time.time() - game.get("turn_started", 0) < TURN_SECONDS:
+        return False
+    rules, state = PARTY_GAMES[game["kind"]], game["state"]
+    name = game["players"][state["turn"]]["name"]
+    events = [f"⏱ {name} took too long, so Laden played for them"] + rules.auto(state)
+    party_log(game, events)
+    if state["winner"] is not None:
+        await finish_party(game)
+    await save_game(game)
+    return True
+
+
+def party_view(game, user):
+    rules, user_id = PARTY_GAMES[game["kind"]], user["id"]
+    me = next((i for i, p in enumerate(game["players"]) if p["id"] == user_id), None)
+    view = {"kind": rules.kind, "party": True, "title": rules.title, "status": game["status"],
+            "version": game.get("version", 0), "you": me, "min": rules.min_players, "max": rules.max_players,
+            "players": [{"name": p["name"], "colour": p.get("colour")} for p in game["players"]]}
+    if game["status"] == "waiting":
+        invited = game["invited"]
+        allowed = not invited or any(same_person(i, user) for i in invited)
+        view.update(host=game["players"][0]["name"], invited=[i["name"] for i in invited],
+                    can_join=me is None and allowed and len(game["players"]) < rules.max_players,
+                    can_start=user_id == game["creator"] and len(game["players"]) >= rules.min_players,
+                    can_cancel=user_id == game["creator"])
+        return view
+    if game.get("result") == "cancelled":
+        return view
+    if me is None and game["status"] != "over":
+        view["status"] = "private"
+        return view
+    state = game["state"]
+    view.update(state=state, layout=rules.layout(), log=game["log"], turn=state["turn"],
+                seconds_left=max(0, round(TURN_SECONDS - (time.time() - game.get("turn_started", time.time())))))
+    if game["kind"] == "ludo" and me == state["turn"] and state["phase"] == "move":
+        view["movable"] = rules.movable(state, me)
+    return view
+
+
+async def party_action(game, user, action, body):
+    rules = PARTY_GAMES[game["kind"]]
+    uid = user["id"]
+    name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
+    me = next((i for i, p in enumerate(game["players"]) if p["id"] == uid), None)
+    if game["status"] == "playing" and await party_turn_timeout(game):
+        return 200, party_view(game, user)
+    if action == "join":
+        if game["status"] != "waiting" or me is not None:
+            return 200, party_view(game, user)
+        invited = game["invited"]
+        if invited and not any(same_person(i, user) for i in invited):
+            return 403, {"error": "This game is only for the people who were invited."}
+        if len(game["players"]) >= rules.max_players:
+            return 403, {"error": "The game is full."}
+        try:
+            member = await game_bot.get_chat_member(game["chat_id"], uid)
+            if member.status in ("left", "kicked"):
+                return 403, {"error": "Only members of the group can join."}
+        except Exception:
+            return 403, {"error": "Only members of the group can join."}
+        game["players"].append({"id": uid, "name": name, "username": (user.get("username") or "").lower()})
+        everyone = invited and all(any(same_person(i, p) for p in game["players"]) for i in invited)
+        if everyone or len(game["players"]) == rules.max_players:
+            start_party(game)  # everyone's here
+        await save_game(game)
+        await edit_game_message(game, party_text(game))
+    elif action == "start":
+        if game["status"] == "waiting" and uid == game["creator"] and len(game["players"]) >= rules.min_players:
+            start_party(game)
+            await save_game(game)
+            await edit_game_message(game, party_text(game))
+    elif action == "cancel":
+        if game["status"] == "waiting" and uid == game["creator"]:
+            game["status"], game["result"] = "over", "cancelled"
+            await save_game(game)
+            await edit_game_message(game, f"{rules.emoji} {rules.title} game cancelled.")
+    elif action in ("roll", "move"):
+        state = game["state"]
+        if game["status"] != "playing" or me is None:
+            return 403, {"error": "You're not playing in this game."}
+        if state["turn"] != me:
+            return 400, {"error": "It's not your turn.", **party_view(game, user)}
+        try:
+            if action == "roll":
+                if state["phase"] != "roll":
+                    raise ValueError("pick a token to move first")
+                events = rules.roll(state)
+            else:
+                if state["phase"] != "move":
+                    raise ValueError("roll the dice first")
+                events = rules.move(state, int(body.get("token", -1)))
+        except (ValueError, TypeError) as e:
+            return 400, {"error": str(e).capitalize() + ".", **party_view(game, user)}
+        party_log(game, events)
+        if state["winner"] is not None:
+            await finish_party(game)
+        await save_game(game)
+    return 200, party_view(game, user)
 
 
 GAME_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "games.html")
@@ -2646,6 +2884,10 @@ async def register_commands(app):
         ("go", "Play go (9×9): @someone, open slot, or Laden"),
         ("16beads", "Play 16 beads: @someone, open slot, or Laden"),
         ("alquerque", "Play alquerque (5×5 or 9×9): @someone, open slot, or Laden"),
+        ("fanorona", "Play fanorona: @someone, open slot, or Laden"),
+        ("draughts", "Play Turkish draughts: @someone, open slot, or Laden"),
+        ("snakesandladders", "Snakes and Ladders for 2-6: @tag people or leave seats open"),
+        ("ludo", "Ludo for 2-4: @tag people or leave seats open"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
@@ -2775,6 +3017,9 @@ def main():
         if kind != "alquerque9":  # reached through /alquerque
             app.add_handler(CommandHandler(command, game_command(kind)))
     app.add_handler(CommandHandler("beads", game_command("beads")))
+    for kind, command in PARTY_COMMANDS.items():
+        app.add_handler(CommandHandler(command, party_command(kind)))
+    app.add_handler(CommandHandler("snakes", party_command("snakes")))
     app.add_handler(CallbackQueryHandler(game_menu, pattern=r"^game\|"))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))

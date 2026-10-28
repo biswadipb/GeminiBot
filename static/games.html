@@ -90,9 +90,9 @@
   .disc.w { background: radial-gradient(circle at 35% 30%, #fff, #d6d6d6 75%); box-shadow: 0 2px 3px rgba(0,0,0,.4); }
   .disc svg { width: 58%; height: 58%; }
   /* checkers */
-  .board.checkers .disc { width: 78%; height: 78%; }
-  .board.checkers .disc.b { background: radial-gradient(circle at 35% 30%, #4a4a4a, #111 70%); border: 3px solid #333; }
-  .board.checkers .disc.w { background: radial-gradient(circle at 35% 30%, #fff8ee, #e6d6bf 75%); border: 3px solid #cbb89a; }
+  .board.checkers .disc, .board.draughts .disc { width: 78%; height: 78%; }
+  .board.checkers .disc.b, .board.draughts .disc.b { background: radial-gradient(circle at 35% 30%, #4a4a4a, #111 70%); border: 3px solid #333; }
+  .board.checkers .disc.w, .board.draughts .disc.w { background: radial-gradient(circle at 35% 30%, #fff8ee, #e6d6bf 75%); border: 3px solid #cbb89a; }
   /* go: wood board, lines through the middle of each cell, stones on the intersections */
   .board.go { background: var(--wood); padding: 2%; border-radius: 4px; }
   .board.go .sq { background: none; }
@@ -150,6 +150,28 @@
   .movelist .mv { padding: 7px 8px; border-radius: 7px; cursor: pointer; font-weight: 500; }
   .movelist .mv.on { background: var(--button); color: var(--button-text); }
   .movelist .empty { grid-column: 1 / -1; text-align: center; color: var(--hint); padding: 16px 0; }
+  /* dice games */
+  .plist { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+  .pchip {
+    display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 16px; background: var(--card);
+    font-size: 13px; font-weight: 600; border: 2px solid transparent;
+  }
+  .pchip.turn { border-color: var(--button); }
+  .pchip .pdot { width: 12px; height: 12px; border-radius: 50%; border: 1px solid #0005; }
+  .pchip .pinfo { font-weight: 500; color: var(--hint); }
+  #pboard svg { display: block; width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.15); }
+  .dicebar { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .die { width: 56px; height: 56px; flex: none; border-radius: 12px; background: var(--card); display: flex;
+         align-items: center; justify-content: center; font-size: 46px; line-height: 1; }
+  .die.rolling { animation: shake .35s; }
+  @keyframes shake { 25% { transform: rotate(-14deg); } 75% { transform: rotate(14deg); } }
+  .dicebar .status { flex: 1; margin: 0; text-align: left; }
+  .dicebar button { flex: 0 0 96px; }
+  .plog { margin-top: 12px; font-size: 13px; color: var(--hint); }
+  .plog div { padding: 3px 0; border-bottom: 1px solid var(--card); }
+  .plog div:first-child { color: var(--text); font-weight: 600; }
+  .token.can { animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .45; } }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -168,6 +190,13 @@
     <div class="status" id="status"></div>
     <div class="actions" id="actions"></div>
   </div>
+</div>
+<div id="party" class="hidden wrap">
+  <div class="plist" id="plist"></div>
+  <div id="pboard"></div>
+  <div class="dicebar"><div class="die" id="die">🎲</div><div class="status" id="pstatus"></div>
+    <button class="primary" id="rollBtn" onclick="roll()">Roll</button></div>
+  <div class="plog" id="plog"></div>
 </div>
 <div class="promo" id="promo"><div id="promoChoices"></div></div>
 <div class="sheet" id="sheet" onclick="if (event.target === this) closeMoves()">
@@ -199,7 +228,11 @@ const PIECES = {
   wR: "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"45\" height=\"45\" viewBox=\"0 0 45 45\"><g fill=\"#fff\" fill-rule=\"evenodd\" stroke=\"#000\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"1.5\"><path stroke-linecap=\"butt\" d=\"M9 39h27v-3H9zm3-3v-4h21v4zm-1-22V9h4v2h5V9h5v2h5V9h4v5\"/><path d=\"m34 14-3 3H14l-3-3\"/><path stroke-linecap=\"butt\" stroke-linejoin=\"miter\" d=\"M31 17v12.5H14V17\"/><path d=\"m31 29.5 1.5 2.5h-20l1.5-2.5\"/><path fill=\"none\" stroke-linejoin=\"miter\" d=\"M11 14h23\"/></g></svg>",
 };
 const CROWN = `<svg viewBox="0 0 24 24"><path fill="#e8b923" stroke="#7a5a00" stroke-width="1.2" stroke-linejoin="round" d="M3 18 2 7l5.5 4.5L12 4l4.5 7.5L22 7l-1 11z"/></svg>`;
-const EMOJI = { chess: "♟", othello: "⚫", checkers: "⛀", go: "⚪", alquerque: "⚪", alquerque9: "⚪", beads: "🔴" };
+const EMOJI = { chess: "♟", othello: "⚫", checkers: "⛀", go: "⚪", alquerque: "⚪", alquerque9: "⚪", beads: "🔴",
+                fanorona: "⚫", draughts: "⛀" };
+// the squares or points a move passes through, as strings ("11-15x24", "a3xa5", fanorona's "23a24w25")
+const pathOf = m => m.split(state.kind === "fanorona" ? /[aw-]/ : /[-x]/);
+let fpath = [], fkinds = [];  // fanorona: the steps tapped so far this turn
 const GO_LETTERS = "ABCDEFGHJ";
 const VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9 };
 const START = { p: 8, n: 2, b: 2, r: 2, q: 1 };
@@ -224,6 +257,7 @@ async function api(action, extra) {
 
 function showMessage(html) {
   document.getElementById("game").classList.add("hidden");
+  document.getElementById("party").classList.add("hidden");
   const m = document.getElementById("message");
   m.innerHTML = html; m.classList.remove("hidden");
 }
@@ -243,17 +277,18 @@ function parseFen(fen) {
   return grid;
 }
 
-function checkersNumber(r, c) { return (r + c) % 2 === 1 ? r * 4 + Math.floor(c / 2) + 1 : null; }
+function checkersNumber(r, c) { return (r + c) % 2 === 1 ? String(r * 4 + Math.floor(c / 2) + 1) : null; }
 function squareName(kind, r, c) {
   if (kind === "othello") return "abcdefgh"[c] + (r + 1);
   if (kind === "checkers") return checkersNumber(r, c);
+  if (kind === "draughts") return "abcdefgh"[c] + (8 - r);
   if (kind === "go") return GO_LETTERS[c] + (9 - r);
 }
 function moveSquares(kind, move) {
   // squares to highlight for a move
   if (!move || move === "pass") return [];
   if (kind === "chess") return [move.slice(0, 2), move.slice(2, 4)];
-  if (kind === "checkers" || state.layout) return move.split(/[-x]/).map(Number);
+  if (kind === "checkers" || kind === "draughts" || state.layout) return pathOf(move);
   return [move];
 }
 
@@ -261,6 +296,7 @@ function moveSquares(kind, move) {
 
 function render() {
   const s = state;
+  if (s.party) return renderParty();
   const emoji = EMOJI[s.kind] || "♟";
   if (s.status === "waiting") {
     const who = s.invited ? `${esc(s.host)} challenged <b>${esc(s.invited)}</b>.` : `${esc(s.host)} is waiting for an opponent.`;
@@ -334,6 +370,9 @@ function render() {
   if (s.status !== "playing") actions.innerHTML = "";
   else if (s.draw_offer === "them") actions.innerHTML =
     `<button class="primary" onclick="act('accept_draw')">Accept draw</button><button onclick="act('decline_draw')">Decline</button>`;
+  else if (s.kind === "fanorona" && fpath.length > 1) actions.innerHTML =
+    (fanoronaChoices().some(c => c.pts.length === fpath.length) ? `<button class="primary" onclick="endFanoronaTurn()">End turn</button>` : "") +
+    `<button onclick="cancelFanorona()">Cancel</button>`;
   else actions.innerHTML =
     (s.kind === "go" ? `<button onclick="send('pass')" ${myTurn && !reviewing ? "" : "disabled"}>Pass</button>` : "") +
     (s.bot ? "" : `<button onclick="act('offer_draw')" ${s.draw_offer ? "disabled" : ""}>Offer draw</button>`) +
@@ -368,20 +407,20 @@ function drawChess(board, snapshot, last, legal, reviewing) {
 
 function drawGrid(board, kind, snapshot, last, legal) {
   // othello and checkers: 8x8, one character per square
-  const s = state, flip = kind === "checkers" && s.you === "black";  // your own pieces at the bottom
+  const s = state, flip = kind !== "othello" && s.you === "black";  // your own pieces at the bottom
   const lit = moveSquares(kind, last);
   let targets = [];
   if (kind === "othello") targets = legal.filter(m => m !== "pass");
-  else if (selected) targets = legal.filter(m => +m.split(/[-x]/)[0] === selected).map(m => +m.split(/[-x]/).pop());
+  else if (selected) targets = legal.filter(m => pathOf(m)[0] === selected).map(m => pathOf(m).pop());
   board.style.gridTemplateColumns = "repeat(8, 1fr)";
   for (let rr = 0; rr < 8; rr++) {
     for (let cc = 0; cc < 8; cc++) {
       const r = flip ? 7 - rr : rr, c = flip ? 7 - cc : cc, name = squareName(kind, r, c);
       const p = snapshot[r * 8 + c];
       const el = document.createElement("div");
-      el.className = "sq" + (kind === "checkers" ? ((r + c) % 2 ? " d" : " l") : "");
+      el.className = "sq" + (kind !== "othello" ? ((r + c) % 2 ? " d" : " l") : "");
       if (name !== null && lit.includes(name)) el.classList.add("last");
-      if (kind === "checkers" && name !== null && name === selected) el.classList.add("sel");
+      if (kind !== "othello" && name !== null && name === selected) el.classList.add("sel");
       if (name !== null && targets.includes(name)) el.classList.add("target");
       if (p !== ".") el.innerHTML = `<span class="disc ${p.toLowerCase()}">${p === "B" || p === "W" ? CROWN : ""}</span>`;
       el.onclick = () => kind === "othello" ? tapPlace(name, legal) : tapCheckers(name, p, legal);
@@ -418,8 +457,14 @@ function drawLines(board, snapshot, last, legal) {
   board.className = `board lines ${s.kind}`;
   board.style.aspectRatio = `${w} / ${h}`;
   board.style.maxWidth = `calc(56vh * ${w / h})`;  // tall boards still fit on the screen
+  const fanorona = s.kind === "fanorona";
+  if (fanorona && fpath.length > 1) snapshot = simulateFanorona(snapshot, fpath, fkinds);
   const lit = moveSquares(s.kind, last).map(n => n - 1);
-  const targets = selected ? legal.filter(m => +m.split(/[-x]/)[0] === selected).map(m => +m.split(/[-x]/).pop() - 1) : [];
+  const pick = fanorona ? (fpath.length ? fpath[fpath.length - 1] : null) : selected;
+  const visited = fanorona ? fpath.slice(0, -1).map(n => n - 1) : [];
+  const targets = fanorona
+    ? fanoronaChoices().filter(c => c.pts.length > fpath.length).map(c => c.pts[fpath.length] - 1)
+    : selected ? legal.filter(m => pathOf(m)[0] === selected).map(m => pathOf(m).pop() - 1) : [];
   let svg = `<svg viewBox="${minX - pad} ${minY - pad} ${w} ${h}" xmlns="http://www.w3.org/2000/svg">
     <defs><radialGradient id="gb" cx=".35" cy=".3"><stop offset="0" stop-color="#555"/><stop offset=".7" stop-color="#111"/></radialGradient>
     <radialGradient id="gw" cx=".35" cy=".3"><stop offset="0" stop-color="#fff"/><stop offset=".75" stop-color="#d9d0c0"/></radialGradient></defs>`;
@@ -430,7 +475,8 @@ function drawLines(board, snapshot, last, legal) {
   snapshot.split("").forEach((p, i) => {
     const [x, y] = at(i);
     if (lit.includes(i)) svg += `<circle cx="${x}" cy="${y}" r=".44" fill="rgba(120,170,0,.55)"/>`;
-    if (i + 1 === selected) svg += `<circle cx="${x}" cy="${y}" r=".46" fill="rgba(255,214,0,.75)"/>`;
+    if (String(i + 1) === pick) svg += `<circle cx="${x}" cy="${y}" r=".46" fill="rgba(255,214,0,.75)"/>`;
+    if (visited.includes(i)) svg += `<circle cx="${x}" cy="${y}" r=".2" fill="rgba(255,214,0,.8)"/>`;
     if (p !== ".") {
       svg += `<circle cx="${x}" cy="${y}" r=".34" fill="url(#g${p.toLowerCase()})" stroke="${p.toLowerCase() === "b" ? "#000" : "#a89a82"}" stroke-width=".03"/>`;
       if (p === "B" || p === "W") svg += `<path transform="translate(${x - .19} ${y - .19}) scale(${.38 / 24})" fill="#e8b923" stroke="#7a5a00" stroke-width="1.2" stroke-linejoin="round" d="M3 18 2 7l5.5 4.5L12 4l4.5 7.5L22 7l-1 11z"/>`;
@@ -439,7 +485,77 @@ function drawLines(board, snapshot, last, legal) {
     svg += `<circle cx="${x}" cy="${y}" r=".5" fill="transparent" data-point="${i + 1}" data-piece="${p}"/>`;
   });
   board.innerHTML = svg + "</svg>";
-  board.querySelectorAll("[data-point]").forEach(el => el.onclick = () => tapCheckers(+el.dataset.point, el.dataset.piece, legal));
+  board.querySelectorAll("[data-point]").forEach(el => el.onclick = () =>
+    fanorona ? tapFanorona(el.dataset.point) : tapCheckers(el.dataset.point, el.dataset.piece, legal));
+}
+
+// ---------- fanorona: a turn can be several capturing steps, tapped one at a time
+
+function fanoronaChoices() {
+  // legal moves that start with the steps tapped so far
+  if (!state.legal || viewPly !== null) return [];
+  return state.legal.map(m => ({ move: m, pts: m.split(/[aw-]/), kinds: m.match(/[aw-]/g) }))
+    .filter(c => fpath.every((p, i) => c.pts[i] === p) && fkinds.every((k, i) => c.kinds[i] === k));
+}
+
+function simulateFanorona(snapshot, pts, kinds) {
+  // the board after the steps tapped so far, so the next step can be chosen from where the piece is now
+  const L = state.layout, board = snapshot.split(""), at = {};
+  L.points.forEach(([x, y], i) => at[x + "," + y] = i);
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1] - 1, b = pts[i] - 1, [ax, ay] = L.points[a], [bx, by] = L.points[b];
+    const dx = bx - ax, dy = by - ay, me = board[a], enemy = me === "b" ? "w" : "b";
+    let x = kinds[i - 1] === "a" ? bx + dx : ax - dx, y = kinds[i - 1] === "a" ? by + dy : ay - dy;
+    const sx = kinds[i - 1] === "a" ? dx : -dx, sy = kinds[i - 1] === "a" ? dy : -dy;
+    if (kinds[i - 1] !== "-") {
+      while (at[x + "," + y] !== undefined && board[at[x + "," + y]] === enemy) { board[at[x + "," + y]] = "."; x += sx; y += sy; }
+    }
+    board[b] = me; board[a] = ".";
+  }
+  return board.join("");
+}
+
+function tapFanorona(point) {
+  if (viewPly !== null) return goLive();
+  if (busy || !(state.legal || []).length) return;
+  const starts = new Set(state.legal.map(m => m.split(/[aw-]/)[0]));
+  if (fpath.length <= 1 && starts.has(point)) {  // pick (or switch) the piece
+    fpath = fpath[0] === point ? [] : [point]; fkinds = [];
+    haptic("light"); return render();
+  }
+  if (!fpath.length) return;
+  const next = fanoronaChoices().filter(c => c.pts.length > fpath.length && c.pts[fpath.length] === point);
+  if (!next.length) return;
+  const kinds = [...new Set(next.map(c => c.kinds[fpath.length - 1]))];
+  if (kinds.length > 1) return chooseCapture(kind => fanoronaStep(point, kind));
+  fanoronaStep(point, kinds[0]);
+}
+
+function fanoronaStep(point, kind) {
+  fpath.push(point); fkinds.push(kind);
+  const choices = fanoronaChoices();
+  const done = choices.find(c => c.pts.length === fpath.length);
+  if (done && !choices.some(c => c.pts.length > fpath.length)) return send(done.move);  // nothing more to capture
+  haptic("light"); render();
+}
+
+function endFanoronaTurn() {
+  const done = fanoronaChoices().find(c => c.pts.length === fpath.length);
+  if (done) send(done.move);
+}
+
+function cancelFanorona() { fpath = []; fkinds = []; render(); }
+
+function chooseCapture(then) {
+  const box = document.getElementById("promoChoices");
+  box.innerHTML = "";
+  for (const [kind, text] of [["a", "Take the line in front"], ["w", "Take the line behind"]]) {
+    const b = document.createElement("button");
+    b.textContent = text; b.style.cssText = "width:auto;height:auto;padding:12px 14px";
+    b.onclick = () => { document.getElementById("promo").classList.remove("open"); then(kind); };
+    box.appendChild(b);
+  }
+  document.getElementById("promo").classList.add("open");
 }
 
 function sideInfo(kind, snapshot, reviewing) {
@@ -451,8 +567,8 @@ function sideInfo(kind, snapshot, reviewing) {
     const n = { black: count("b"), white: count("w") };
     return { black: `<span class="taken">${n.black} discs</span>`, white: `<span class="taken">${n.white} discs</span>` };
   }
-  if (kind === "checkers" || s.layout) {  // pieces each side has taken = the opponent's missing pieces
-    const start = s.layout ? s.layout.pieces : 12;
+  if (kind === "checkers" || kind === "draughts" || s.layout) {  // pieces each side has taken = the opponent's missing pieces
+    const start = s.layout ? s.layout.pieces : kind === "draughts" ? 16 : 12;
     const row = (victim, n) => `<span class="taken">${`<span class="chip ${victim}"></span>`.repeat(Math.min(n, 12))}${n ? `<span class="count">${n}</span>` : ""}</span>`;
     return { black: row("w", start - count("w")), white: row("b", start - count("b")) };
   }
@@ -509,10 +625,10 @@ function tapCheckers(name, piece, legal) {
   if (busy || !legal.length || name === null) return;
   if (selected) {
     // the longest jump that starts here and ends on the tapped square
-    const options = legal.filter(m => { const sq = m.split(/[-x]/).map(Number); return sq[0] === selected && sq[sq.length - 1] === name; });
+    const options = legal.filter(m => { const sq = pathOf(m); return sq[0] === selected && sq[sq.length - 1] === name; });
     if (options.length) return send(options.sort((a, b) => b.length - a.length)[0]);
   }
-  selected = legal.some(m => +m.split(/[-x]/)[0] === name) ? (selected === name ? null : name) : null;
+  selected = legal.some(m => pathOf(m)[0] === name) ? (selected === name ? null : name) : null;
   if (selected) haptic("light");
   render();
 }
@@ -539,7 +655,7 @@ function choosePromotion(options, color) {
 
 async function send(move) {
   if (busy) return;
-  busy = true; selected = null;
+  busy = true; selected = null; fpath = []; fkinds = [];
   if (state.bot) {
     const st = document.getElementById("status");
     st.textContent = "Laden is thinking…"; st.className = "status";
@@ -597,6 +713,183 @@ function fillMoves() {
 function openMoves() { fillMoves(); document.getElementById("sheet").classList.add("open"); }
 function closeMoves() { document.getElementById("sheet").classList.remove("open"); }
 
+// ---------- dice games: snakes and ladders, ludo
+
+const PARTY_COLOURS = ["#e53935", "#43a047", "#fbc02d", "#1e88e5", "#8e24aa", "#fb8c00"];
+const LUDO_COLOURS = { red: "#e53935", green: "#43a047", yellow: "#fbc02d", blue: "#1e88e5" };
+const DICE = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
+let lastDice = null;
+
+function playerColour(i) {
+  const p = state.players[i];
+  return p.colour ? LUDO_COLOURS[p.colour] : PARTY_COLOURS[i % PARTY_COLOURS.length];
+}
+
+function renderParty() {
+  const s = state;
+  document.getElementById("game").classList.add("hidden");
+  const party = document.getElementById("party");
+  const emoji = s.kind === "ludo" ? "🎲" : "🐍";
+  if (s.status === "waiting") {
+    party.classList.add("hidden");
+    const names = s.players.map(p => `<b>${esc(p.name)}</b>`).join(", ");
+    const waiting = s.invited.filter(n => !s.players.some(p => p.name === n));
+    let html = `<div class="big">${emoji}</div><h2>${esc(s.title)}</h2><p>${s.min}–${s.max} players<br>Joined: ${names}` +
+      (waiting.length ? `<br>Waiting for: ${waiting.map(esc).join(", ")}` : s.invited.length ? "" : "<br>Anyone in the group can join.") + "</p>";
+    if (s.can_join) html += `<button class="primary" onclick="act('join')">Join the game</button>`;
+    else if (s.you !== null && !s.can_start) html += `<p>Waiting for ${esc(s.host)} to start…</p>`;
+    if (s.can_start) html += `<div class="actions"><button class="primary" onclick="act('start')">Start with ${s.players.length} players</button></div>`;
+    if (s.can_cancel) html += `<div class="actions"><button class="danger" onclick="act('cancel')">Cancel game</button></div>`;
+    return showMessage(html);
+  }
+  if (s.status === "private") {
+    party.classList.add("hidden");
+    return showMessage(`<div class="big">🔒</div><h2>${esc(s.title)}</h2><p>This game is private while it's being played. Laden will post the result in the group.</p>`);
+  }
+  if (!s.state) {
+    party.classList.add("hidden");
+    return showMessage(`<div class="big">${emoji}</div><h2>Game cancelled</h2><p>Start a new one in the group.</p>`);
+  }
+  document.getElementById("message").classList.add("hidden");
+  party.classList.remove("hidden");
+  const st = s.state, myTurn = s.status === "playing" && s.you === st.turn;
+
+  document.getElementById("plist").innerHTML = s.players.map((p, i) => {
+    const info = s.kind === "ludo" ? `${st.tokens[i].filter(t => t === 56).length}/4 home` : (st.pos[i] ? `on ${st.pos[i]}` : "at start");
+    return `<span class="pchip${i === st.turn && s.status === "playing" ? " turn" : ""}"><span class="pdot" style="background:${playerColour(i)}"></span>` +
+      `${esc(p.name)}${i === s.you ? " (you)" : ""} <span class="pinfo">${info}</span></span>`;
+  }).join("");
+
+  document.getElementById("pboard").innerHTML = s.kind === "ludo" ? ludoBoard() : snakesBoard();
+  document.querySelectorAll("#pboard [data-token]").forEach(el => el.onclick = () => moveToken(+el.dataset.token));
+
+  const die = document.getElementById("die");
+  die.textContent = st.dice ? DICE[st.dice] : "🎲";
+  if (st.dice && lastDice !== null && JSON.stringify(s.log) !== lastDice) { die.classList.remove("rolling"); void die.offsetWidth; die.classList.add("rolling"); }
+  lastDice = JSON.stringify(s.log);
+  const btn = document.getElementById("rollBtn");
+  btn.disabled = !myTurn || st.phase !== "roll" || busy;
+  btn.classList.toggle("hidden", s.status !== "playing");
+  partyStatus();
+  document.getElementById("plog").innerHTML = s.log.slice(-8).reverse().map(e => `<div>${esc(e)}</div>`).join("");
+}
+
+function partyStatus() {
+  const s = state, st = s.state, el = document.getElementById("pstatus");
+  if (!st || !el) return;
+  el.className = "status";
+  if (s.status === "over") { el.textContent = `🏆 ${s.players[st.winner].name} won!`; el.classList.add("strong"); return; }
+  const left = Math.max(0, Math.round(s.seconds_left - (performance.now() - s.receivedAt) / 1000));
+  if (s.you === st.turn) {
+    el.textContent = (st.phase === "roll" ? "Your turn: roll!" : `You rolled ${st.dice}: tap a token to move.`) + ` ⏱ ${left}s`;
+    el.classList.add("strong");
+  } else {
+    el.textContent = `${s.players[st.turn].name}'s turn ⏱ ${left}s`;
+  }
+}
+setInterval(() => { if (state && state.party && state.status === "playing") partyStatus(); }, 1000);
+
+function snakesCell(n) {
+  const i = n - 1, row = Math.floor(i / 10), col = row % 2 === 0 ? i % 10 : 9 - (i % 10);
+  return [col + .5, 9 - row + .5];
+}
+
+function snakesBoard() {
+  const s = state, L = s.layout;
+  let svg = `<svg viewBox="0 0 10 10" xmlns="http://www.w3.org/2000/svg">`;
+  for (let n = 1; n <= 100; n++) {
+    const [x, y] = snakesCell(n), shade = (Math.floor((n - 1) / 10) + n) % 2 ? "#fff3d6" : "#ffe0a3";
+    svg += `<rect x="${x - .5}" y="${y - .5}" width="1" height="1" fill="${n === 100 ? "#ffd54f" : shade}"/>` +
+      `<text x="${x - .44}" y="${y - .3}" font-size=".22" fill="#9a7b4f" font-family="sans-serif">${n}</text>`;
+  }
+  for (const [from, to] of Object.entries(L.ladders)) {  // two rails and rungs
+    const [x1, y1] = snakesCell(+from), [x2, y2] = snakesCell(+to);
+    const len = Math.hypot(x2 - x1, y2 - y1), nx = -(y2 - y1) / len * .16, ny = (x2 - x1) / len * .16;
+    svg += `<g stroke="#8d6e63" stroke-width=".07" stroke-linecap="round">` +
+      `<line x1="${x1 + nx}" y1="${y1 + ny}" x2="${x2 + nx}" y2="${y2 + ny}"/><line x1="${x1 - nx}" y1="${y1 - ny}" x2="${x2 - nx}" y2="${y2 - ny}"/>`;
+    for (let t = .12; t < 1; t += .3 / len) {
+      const x = x1 + (x2 - x1) * t, y = y1 + (y2 - y1) * t;
+      svg += `<line x1="${x + nx}" y1="${y + ny}" x2="${x - nx}" y2="${y - ny}" stroke-width=".05"/>`;
+    }
+    svg += `</g>`;
+  }
+  for (const [from, to] of Object.entries(L.snakes)) {  // a wiggly body from head to tail
+    const [x1, y1] = snakesCell(+from), [x2, y2] = snakesCell(+to);
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy), nx = -dy / len, ny = dx / len, w = Math.min(.9, len / 4);
+    const path = `M${x1} ${y1} C${x1 + dx * .33 + nx * w} ${y1 + dy * .33 + ny * w} ${x1 + dx * .66 - nx * w} ${y1 + dy * .66 - ny * w} ${x2} ${y2}`;
+    svg += `<path d="${path}" fill="none" stroke="#2e7d32" stroke-width=".24" stroke-linecap="round" opacity=".9"/>` +
+      `<path d="${path}" fill="none" stroke="#9ccc65" stroke-width=".08" stroke-dasharray=".12 .14" stroke-linecap="round"/>` +
+      `<circle cx="${x1}" cy="${y1}" r=".2" fill="#2e7d32"/><circle cx="${x1 - .07}" cy="${y1 - .05}" r=".04" fill="#fff"/><circle cx="${x1 + .07}" cy="${y1 - .05}" r=".04" fill="#fff"/>`;
+  }
+  const spots = {};
+  s.state.pos.forEach((p, i) => { if (p) (spots[p] = spots[p] || []).push(i); });
+  for (const [square, who] of Object.entries(spots)) {
+    const [x, y] = snakesCell(+square);
+    who.forEach((i, k) => {
+      const ox = who.length > 1 ? (k % 2 - .5) * .36 : 0, oy = who.length > 1 ? (Math.floor(k / 2) - .3) * .3 : 0;
+      svg += `<circle cx="${x + ox}" cy="${y + oy}" r=".24" fill="${playerColour(i)}" stroke="#222" stroke-width=".05"/>`;
+    });
+  }
+  return svg + "</svg>";
+}
+
+function ludoBoard() {
+  const s = state, st = s.state, L = s.layout;
+  const quadrant = { red: [0, 0], green: [0, 9], yellow: [9, 9], blue: [9, 0] };
+  let svg = `<svg viewBox="0 0 15 15" xmlns="http://www.w3.org/2000/svg"><rect width="15" height="15" fill="#fff"/>`;
+  for (const [colour, [r, c]] of Object.entries(quadrant)) {
+    svg += `<rect x="${c}" y="${r}" width="6" height="6" fill="${LUDO_COLOURS[colour]}"/>` +
+      `<rect x="${c + 1}" y="${r + 1}" width="4" height="4" rx=".4" fill="#fff"/>`;
+    for (const [dr, dc] of [[2, 2], [2, 4], [4, 2], [4, 4]])
+      svg += `<circle cx="${c + dc}" cy="${r + dr}" r=".45" fill="none" stroke="${LUDO_COLOURS[colour]}" stroke-width=".08"/>`;
+  }
+  L.track.forEach(([r, c], i) => {
+    const start = Object.entries(L.offset).find(([, o]) => o === i);
+    svg += `<rect x="${c}" y="${r}" width="1" height="1" fill="${start ? LUDO_COLOURS[start[0]] : "#fff"}" stroke="#bbb" stroke-width=".03"/>`;
+    if (L.safe.includes(i) && !start) svg += `<text x="${c + .5}" y="${r + .72}" font-size=".62" text-anchor="middle" fill="#999">★</text>`;
+  });
+  for (const [colour, cells] of Object.entries(L.home_columns))
+    for (const [r, c] of cells) svg += `<rect x="${c}" y="${r}" width="1" height="1" fill="${LUDO_COLOURS[colour]}" stroke="#bbb" stroke-width=".03"/>`;
+  svg += `<polygon points="6,6 7.5,7.5 6,9" fill="${LUDO_COLOURS.red}"/><polygon points="6,6 9,6 7.5,7.5" fill="${LUDO_COLOURS.green}"/>` +
+    `<polygon points="9,6 9,9 7.5,7.5" fill="${LUDO_COLOURS.yellow}"/><polygon points="6,9 9,9 7.5,7.5" fill="${LUDO_COLOURS.blue}"/>`;
+  const homeSpot = { red: [6.6, 7.5], green: [7.5, 6.6], yellow: [8.4, 7.5], blue: [7.5, 8.4] };
+  const places = {};  // where each token is drawn, grouped so tokens on one square fan out
+  st.tokens.forEach((tokens, i) => tokens.forEach((p, t) => {
+    const colour = st.colours[i];
+    let x, y;
+    if (p === -1) { const [r, c] = quadrant[colour], [dr, dc] = [[2, 2], [2, 4], [4, 2], [4, 4]][t]; x = c + dc; y = r + dr; }
+    else if (p <= 50) { const [r, c] = L.track[(L.offset[colour] + p) % 52]; x = c + .5; y = r + .5; }
+    else if (p < 56) { const [r, c] = L.home_columns[colour][p - 51]; x = c + .5; y = r + .5; }
+    else [x, y] = homeSpot[colour];
+    (places[x + "," + y] = places[x + "," + y] || []).push({ x, y, i, t, colour });
+  }));
+  const movable = s.movable || [];
+  for (const group of Object.values(places)) {
+    group.forEach((tok, k) => {
+      const spread = group.length > 1 ? .22 : 0, ox = spread * (k % 2 ? 1 : -1), oy = spread * (k > 1 ? 1 : -1) * (group.length > 2 ? 1 : 0);
+      const mine = tok.i === s.you && movable.includes(tok.t);
+      svg += `<circle class="token${mine ? " can" : ""}" cx="${tok.x + ox}" cy="${tok.y + oy}" r="${group.length > 1 ? .3 : .36}" fill="${LUDO_COLOURS[tok.colour]}" stroke="#222" stroke-width=".07"` +
+        (mine ? ` data-token="${tok.t}" style="cursor:pointer"` : "") + `/>`;
+      if (mine) svg += `<circle cx="${tok.x + ox}" cy="${tok.y + oy}" r=".55" fill="transparent" data-token="${tok.t}"/>`;
+    });
+  }
+  return svg + "</svg>";
+}
+
+async function roll() {
+  if (busy) return;
+  busy = true; document.getElementById("rollBtn").disabled = true;
+  try { state = await api("roll"); haptic("heavy"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false; render();
+}
+
+async function moveToken(token) {
+  if (busy) return;
+  busy = true;
+  try { state = await api("move", { token }); haptic("medium"); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
+  busy = false; render();
+}
+
 // ---------- clocks and staying in sync
 
 function clockText(t) {
@@ -630,9 +923,10 @@ async function poll() {
       const fresh = await api("state");
       if (fresh.version !== state.version || fresh.status !== state.status) {
         if (state.status === "playing" && fresh.turn === fresh.you && state.turn !== fresh.turn) haptic("medium");
-        state = fresh; selected = null; render();
+        state = fresh; selected = null; fpath = []; fkinds = []; render();
       } else {
-        state.clock = fresh.clock; state.receivedAt = fresh.receivedAt;  // stay in sync with the server's clock
+        state.clock = fresh.clock; state.seconds_left = fresh.seconds_left;  // stay in sync with the server's clock
+        state.receivedAt = fresh.receivedAt;
       }
     } catch (e) {}
   }
@@ -640,7 +934,7 @@ async function poll() {
 }
 
 (async () => {
-  if (!gameId) return showMessage(`<div class="big">♟</div><h2>No game</h2><p>Start one in the group with /chessmatch, /othello, /checkers, /go, /16beads or /alquerque.</p>`);
+  if (!gameId) return showMessage(`<div class="big">♟</div><h2>No game</h2><p>Start one in the group with a game command like /chessmatch or /ludo.</p>`);
   try { state = await api("state"); render(); }
   catch (e) { return showMessage(`<div class="big">♟</div><h2>Can't open the game</h2><p>${esc(e.message)}</p>`); }
   poll();
