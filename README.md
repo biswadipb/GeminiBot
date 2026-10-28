@@ -11,6 +11,8 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Splits long answers to fit Telegram's 4096-character limit
 - Works in groups: answers when called by name ("Laden, ..."), @mentioned, or replied to
 - Reply to anyone's message and mention the bot, and it reads that message too
+- Looks things up on its own: Gemini gets a web-search tool (Tavily, or DuckDuckGo) and uses it when a question needs current information, then lists up to 3 source sites under the answer. (Gemini's built-in Google Search has no free allowance.) It's also told today's date
+- Watches videos (up to 20 MB, Telegram's limit for bots): send one with a caption calling Laden, or reply to a video, round video or GIF. Gemini sees the frames (so it reads subtitles) and hears the sound
 - Reads pictures: send a photo with a caption (in groups, call Laden in the caption), or reply to a photo, picture file or sticker with "Laden what's this?"
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face

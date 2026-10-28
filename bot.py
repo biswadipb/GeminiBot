@@ -23,7 +23,7 @@ import time
 import zlib
 from decimal import Decimal, getcontext
 from fractions import Fraction
-from urllib.parse import parse_qsl, quote
+from urllib.parse import parse_qsl, quote, urlparse
 
 import chess
 import chess.engine
@@ -487,6 +487,7 @@ def markdown_to_html(text):
 
 async def send_formatted(message, text, **kwargs):
     """Reply with Gemini's Markdown rendered as Telegram formatting; fall back to plain text."""
+    kwargs.setdefault("link_preview_options", NO_PREVIEW)  # source links would otherwise show a big card
     for chunk in split_message(text, limit=TELEGRAM_LIMIT - 400):  # leave room for HTML tags
         try:
             await message.reply_text(markdown_to_html(chunk), parse_mode=ParseMode.HTML, **kwargs)
@@ -520,23 +521,77 @@ def quota_retry_seconds(error):
     return wait, daily
 
 
-async def ask_gemini(history, chat_id=None):
+# Gemini's own Google Search tool has no free allowance, so Gemini gets our web search (Tavily/DuckDuckGo)
+# as a function it can call when a question needs fresh information
+SEARCH_TOOL = types.Tool(function_declarations=[types.FunctionDeclaration(
+    name="web_search",
+    description="Search the web for current information: news, recent events, who currently holds a position, "
+                "prices, scores, releases, latest versions, or any fact that may have changed recently.",
+    parameters={"type": "object", "properties": {"query": {"type": "string", "description": "The search query"}},
+                "required": ["query"]},
+)])
+MAX_SEARCH_ROUNDS = 2  # searches Gemini may run for one answer
+MAX_SOURCES = 3
+
+
+async def generate_with_search(model, contents, config):
+    """Ask Gemini, running any web searches it asks for. Returns the answer with its sources listed underneath."""
+    contents, sources = list(contents), {}
+    for _ in range(MAX_SEARCH_ROUNDS + 1):
+        response = await client.aio.models.generate_content(model=model, contents=contents, config=config)
+        calls = response.function_calls or []
+        if not calls:
+            break
+        contents.append(response.candidates[0].content)  # keeps Gemini's request (and its thought signature)
+        replies = []
+        for call in calls:
+            query = str((call.args or {}).get("query", ""))[:300]
+            try:
+                results = await web_search(query)
+            except Exception as e:
+                log.warning("Web search for Gemini failed: %s", e)
+                results = []
+            log.info("Gemini searched the web for %r (%d results)", query, len(results))
+            for r in results[:MAX_SOURCES + 2]:
+                sources.setdefault(r["url"], r["title"])
+            replies.append(types.Part.from_function_response(name=call.name, response={
+                "results": [{"title": r["title"], "url": r["url"], "content": r["content"][:1500]} for r in results]
+                or "No results found."}))
+        contents.append(types.Content(role="user", parts=replies))
+    else:  # still asking for searches after the last round: answer with what it has
+        response = await client.aio.models.generate_content(
+            model=model, contents=contents, config=config.model_copy(update={"tools": None}))
+    text = response.text or ""
+    sites = {}  # one link per website
+    for url in sources:
+        sites.setdefault(urlparse(url).netloc.removeprefix("www."), url)
+    if text and sites:
+        text += "\n\n🔎 " + " · ".join(f"[{site}]({url})" for site, url in list(sites.items())[:MAX_SOURCES])
+    return text
+
+
+async def ask_gemini(history, chat_id=None, search=False):
     """Send the conversation to Gemini. Models whose free allowance is used up are skipped instantly until
-    it resets; temporarily overloaded models get one quick retry; then the next model in the chain is tried."""
-    contents = [types.Content(role=m["role"], parts=[*(types.Part.from_bytes(data=data, mime_type=mime)
-                                                         for data, mime in m.get("images", [])),
-                                                       types.Part(text=m["text"])]) for m in history]
-    config = types.GenerateContentConfig(system_instruction=await system_prompt(chat_id))
+    it resets; temporarily overloaded models get one quick retry; then the next model in the chain is tried.
+    search=True lets Gemini look things up on the web when the question needs fresh information."""
+    contents = [types.Content(role=m["role"], parts=[*m.get("media", []), types.Part(text=m["text"])]) for m in history]
+    instructions = await system_prompt(chat_id)
+    plain = types.GenerateContentConfig(system_instruction=instructions)
+    searching = types.GenerateContentConfig(system_instruction=instructions, tools=[SEARCH_TOOL],
+                                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
     chain = [GEMINI_MODEL, *FALLBACK_MODELS]
     available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
     last_error = None
     for model in available:
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                response = await client.aio.models.generate_content(model=model, contents=contents, config=config)
+                if search:
+                    answer = await generate_with_search(model, contents, searching)
+                else:
+                    answer = (await client.aio.models.generate_content(model=model, contents=contents, config=plain)).text
                 if model != chain[0]:
                     log.info("Answered with %s", model)
-                return response.text, model
+                return answer, model
             except errors.APIError as e:
                 last_error = e
                 if e.code in SKIP_MODEL:  # model doesn't exist for this key
@@ -636,9 +691,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text or update.message.caption or ""
     question = NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text
     maths = calculate(question.replace(f"@{context.bot.username}", "").strip(" ,:"))
-    if maths and not update.message.photo:  # exact answer from code: no Gemini call, no quota used
+    if maths and not media_file(update.message):  # exact answer from code: no Gemini call, no quota used
         await update.message.reply_text(f"🧮 {maths[0]} = {maths[1]}", do_quote=group)
         return
+    quoted = update.message.reply_to_message
+    for msg in (update.message, quoted):
+        size = (media_file(msg) or (None, None, None, 0))[3] if msg else 0
+        if size > MAX_DOWNLOAD_BYTES:
+            await update.message.reply_text("That video is over 20 MB, the most Telegram lets bots download. "
+                                            "Try a shorter or smaller one.", do_quote=group)
+            return
 
     quota, refusal = await use_quota(update.effective_user.id, "chat")
     if refusal:
@@ -647,51 +709,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     text = message_text.replace(f"@{context.bot.username}", "").strip()
-    quoted = update.message.reply_to_message
-    images = await message_images(context, update.message)
-    if images:
-        text = f"[Sent a picture]\n{text}"
-    quoted_images = await message_images(context, quoted) if quoted else []
-    images += quoted_images  # includes the bot's own /imagine and /fetch pictures, which history can't hold
-    if quoted and quoted.from_user.id != context.bot.id:
-        # Bot's own messages are already in history; anyone else's we pass along as context
-        quoted_text = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
-        if quoted_text or quoted_images:
-            what = f'message: "{quoted_text}"' if quoted_text else "message"
-            if quoted_images:
-                what = "picture (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
-            text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
-    if images and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
-            f"@{context.bot.username}", "").strip(" ,:?!."):
-        text += "\nWhat's in this picture?"  # just the picture (or "Laden" in reply to one)
-    text = speaker(update, text)
-    async with keep_typing(context, chat_id):
-        await answer_or_retry(update, context, quota, text, images=images, do_quote=group)
+    async with keep_typing(context, chat_id):  # downloading a video can take a few seconds
+        media, kind = await message_media(context, update.message)
+        if media:
+            text = f"[Sent a {kind}]\n{text}"
+        quoted_media, quoted_kind = await message_media(context, quoted) if quoted else ([], None)
+        media += quoted_media  # includes the bot's own /imagine and /fetch pictures, which history can't hold
+        kind = kind or quoted_kind
+        if quoted and quoted.from_user.id != context.bot.id:
+            # Bot's own messages are already in history; anyone else's we pass along as context
+            quoted_text = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
+            if quoted_text or quoted_media:
+                what = f'message: "{quoted_text}"' if quoted_text else "message"
+                if quoted_media:
+                    what = f"{quoted_kind} (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
+                text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
+        if media and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
+                f"@{context.bot.username}", "").strip(" ,:?!."):
+            text += f"\nWhat's in this {kind}?"  # just the picture or video (or "Laden" in reply to one)
+        text = speaker(update, text)
+        await answer_or_retry(update, context, quota, text, media=media, do_quote=group)
 
 
-MAX_IMAGE_BYTES = 15 * 1024 * 1024  # Gemini accepts up to ~20 MB of inline data per request
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram won't let bots download bigger files
+MAX_INLINE_BYTES = 14 * 1024 * 1024  # bigger files go through Gemini's Files API (requests are capped at ~20 MB)
 
 
-async def message_images(context, msg):
-    """Download a message's photo (or image sent as a file, or static sticker) as [(bytes, mime type)]."""
+def media_file(msg):
+    """(file_id, mime type, "picture"/"video", size) for a message's photo, image, static sticker or video; else None."""
     if msg.photo:
         # Telegram offers several sizes; the largest up to ~1600px is plenty for Gemini and quicker to send
         sizes = sorted(msg.photo, key=lambda p: p.width * p.height)
-        file_id, mime = next((p for p in reversed(sizes) if max(p.width, p.height) <= 1600), sizes[0]).file_id, "image/jpeg"
-    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
-        if (msg.document.file_size or 0) > MAX_IMAGE_BYTES:
-            return []
-        file_id, mime = msg.document.file_id, msg.document.mime_type
-    elif msg.sticker and not (msg.sticker.is_animated or msg.sticker.is_video):
-        file_id, mime = msg.sticker.file_id, "image/webp"
-    else:
-        return []
+        best = next((p for p in reversed(sizes) if max(p.width, p.height) <= 1600), sizes[0])
+        return best.file_id, "image/jpeg", "picture", best.file_size or 0
+    document = msg.document
+    if document and (document.mime_type or "").startswith(("image/", "video/")):
+        kind = "picture" if document.mime_type.startswith("image/") else "video"
+        return document.file_id, document.mime_type, kind, document.file_size or 0
+    if msg.sticker and not (msg.sticker.is_animated or msg.sticker.is_video):
+        return msg.sticker.file_id, "image/webp", "picture", msg.sticker.file_size or 0
+    video = msg.video or msg.video_note or msg.animation  # GIFs arrive as silent MP4s
+    if video:
+        return video.file_id, getattr(video, "mime_type", None) or "video/mp4", "video", video.file_size or 0
+    return None
+
+
+async def message_media(context, msg):
+    """Download a message's picture or video for Gemini. Returns ([types.Part], "picture"/"video") or ([], None).
+    Gemini watches videos frame by frame (so it can read subtitles) and listens to their sound."""
+    found = media_file(msg)
+    if not found or found[3] > MAX_DOWNLOAD_BYTES:
+        return [], None
+    file_id, mime, kind, _ = found
     try:
         file = await context.bot.get_file(file_id)
-        return [(bytes(await file.download_as_bytearray()), mime)]
+        data = bytes(await file.download_as_bytearray())
+        if len(data) <= MAX_INLINE_BYTES:
+            return [types.Part.from_bytes(data=data, mime_type=mime)], kind
+        return [await upload_to_gemini(data, mime)], kind
     except Exception:
-        log.exception("Could not download a picture")
-        return []
+        log.exception("Could not download a %s", kind)
+        return [], None
+
+
+async def upload_to_gemini(data, mime):
+    """Large files go through Gemini's Files API (kept by Google for 48 hours); videos need a moment to process."""
+    uploaded = await client.aio.files.upload(file=io.BytesIO(data), config=types.UploadFileConfig(mime_type=mime))
+    for _ in range(60):
+        if uploaded.state and uploaded.state.name == "FAILED":
+            raise RuntimeError(f"Gemini couldn't process the file: {uploaded.error}")
+        if not uploaded.state or uploaded.state.name == "ACTIVE":
+            break
+        await asyncio.sleep(2)
+        uploaded = await client.aio.files.get(name=uploaded.name)
+    return types.Part.from_uri(file_uri=uploaded.uri, mime_type=uploaded.mime_type)
 
 
 class keep_typing:
@@ -722,10 +813,10 @@ MAX_PENDING_RETRIES = 5  # per chat, so a long outage doesn't end in a flood of 
 pending_retries = {}  # chat_id -> questions waiting for a retry
 
 
-async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix="", images=(), **send_kwargs):
+async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix="", media=(), **send_kwargs):
     """Answer with Gemini; if every model is busy, say so and keep retrying this same message in the background."""
     chat_id = update.effective_chat.id
-    answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, images)
+    answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, media)
     if ok or answer != BUSY_REPLY:
         if not ok:
             await refund(quota)
@@ -737,10 +828,10 @@ async def answer_or_retry(update, context, quota, text, gemini_text=None, suffix
         return
     await update.message.reply_text(BUSY_REPLY, do_quote=True)
     pending_retries[chat_id] = pending_retries.get(chat_id, 0) + 1
-    asyncio.create_task(retry_later(update, context, quota, text, gemini_text, suffix, images, send_kwargs))
+    asyncio.create_task(retry_later(update, context, quota, text, gemini_text, suffix, media, send_kwargs))
 
 
-async def retry_later(update, context, quota, text, gemini_text, suffix, images, send_kwargs):
+async def retry_later(update, context, quota, text, gemini_text, suffix, media, send_kwargs):
     chat_id = update.effective_chat.id
     try:
         for delay in RETRY_DELAYS:
@@ -748,7 +839,7 @@ async def retry_later(update, context, quota, text, gemini_text, suffix, images,
             if await ignored_while_off(update) or await muted(update, context):
                 await refund(quota)
                 return  # switched off or muted meanwhile: drop it quietly
-            answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, images)
+            answer, ok = await chat_turn(chat_id, text, gemini_text, suffix, media)
             if ok:
                 send_kwargs["do_quote"] = True  # reply to the original question, so it's clear what this answers
                 await send_formatted(update.message, answer, **send_kwargs)
@@ -765,16 +856,16 @@ async def retry_later(update, context, quota, text, gemini_text, suffix, images,
         pending_retries[chat_id] = max(0, pending_retries.get(chat_id, 1) - 1)
 
 
-async def chat_turn(chat_id, text, gemini_text=None, answer_suffix="", images=()):
+async def chat_turn(chat_id, text, gemini_text=None, answer_suffix="", media=()):
     """Ask Gemini with the chat's history and remember the exchange. Returns (reply, succeeded).
 
     gemini_text: what Gemini actually sees for this turn (e.g. the question plus search results),
-    while only `text` is stored in history to keep it small. Pictures are sent for this turn only.
+    while only `text` is stored in history to keep it small. Pictures and videos are sent for this turn only.
     """
     history = await load_history(chat_id)
     try:
-        turn = {"role": "user", "text": gemini_text or text, "images": list(images)}
-        answer, model = await ask_gemini(history + [turn], chat_id)
+        turn = {"role": "user", "text": gemini_text or text, "media": list(media)}
+        answer, model = await ask_gemini(history + [turn], chat_id, search=True)
         answer = answer or "(Gemini returned an empty response.)"
         speaker_name = re.match(r"(\w+): ", text)
         if speaker_name:  # Gemini sometimes echoes the "Name:" prefix group messages carry
@@ -2540,7 +2631,11 @@ async def load_lore():
 
 
 async def system_prompt(chat_id=None):
-    prompt = SYSTEM_PROMPT
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%A %-d %B %Y")
+    prompt = SYSTEM_PROMPT + (
+        f"\n\nToday is {today}. Your training data is older than that, so for anything that may have changed "
+        "(news, current events, who holds a position, prices, scores, releases, the latest version of something, "
+        "or whenever you're unsure) use the web_search tool instead of relying on memory.")
     entries = await load_lore()
     if entries:
         facts = "\n".join(f"- {name}: {text}" for name, text in sorted(entries.items()))
@@ -2629,7 +2724,8 @@ def main():
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
-    pictures = filters.PHOTO | filters.Document.IMAGE  # stickers are only read when someone replies to one
+    # stickers and GIFs are only looked at when someone replies to one
+    pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     app.add_error_handler(on_error)
