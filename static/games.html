@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Laden Chess</title>
+<title>Laden Games</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root {
@@ -15,6 +15,10 @@
     --card: var(--tg-theme-secondary-bg-color, #f2f2f5);
     --light: #eedab6;
     --dark: #b48764;
+    --felt: #2e8b57;
+    --felt-line: #1f6b41;
+    --wood: #dcb35c;
+    --wood-line: #6b4a1b;
     --select: rgba(255, 214, 0, .55);
     --last: rgba(155, 199, 0, .45);
     --danger: #d64545;
@@ -27,26 +31,30 @@
   }
   .wrap { max-width: 480px; margin: 0 auto; }
   .player { display: flex; align-items: center; gap: 8px; padding: 8px 2px; font-weight: 600; }
-  .player .dot { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--hint); }
+  .player .dot { flex: none; width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--hint); }
   .player .dot.white { background: #fff; }
   .player .dot.black { background: #222; }
   .player .info { flex: 1; min-width: 0; }
   .player .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .taken { display: flex; align-items: center; height: 20px; margin-top: 1px; }
+  .player .turn { font-size: 13px; font-weight: 500; color: var(--button); }
+  .taken { display: flex; align-items: center; min-height: 20px; margin-top: 1px; font-size: 12px; font-weight: 600; color: var(--hint); }
   .taken .cap { position: relative; width: 20px; height: 20px; margin-right: -6px; filter: drop-shadow(0 0 1px var(--hint)); }
   .taken .cap.gap { margin-left: 7px; }
   .taken .cap svg { display: block; width: 100%; height: 100%; }
-  .taken .adv { margin-left: 9px; font-size: 12px; font-weight: 600; color: var(--hint); }
-  .player .turn { font-size: 13px; font-weight: 500; color: var(--button); }
+  .taken .adv { margin-left: 9px; }
+  .taken .chip { width: 13px; height: 13px; border-radius: 50%; margin-right: -4px; border: 1px solid #0006; }
+  .taken .chip.w { background: #f4f4f4; } .taken .chip.b { background: #222; }
+  .taken .count { margin-left: 8px; }
   .clock {
     min-width: 64px; padding: 3px 8px; border-radius: 7px; text-align: center; background: var(--card);
     font-variant-numeric: tabular-nums; font-size: 17px;
   }
   .clock.running { background: var(--button); color: var(--button-text); }
   .clock.low.running { background: var(--danger); color: #fff; }
+
   .board {
-    display: grid; grid-template-columns: repeat(8, 1fr); width: 100%; aspect-ratio: 1;
-    border-radius: 6px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+    display: grid; width: 100%; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,.15);
   }
   .sq { position: relative; display: flex; align-items: center; justify-content: center; }
   .sq.l { background: var(--light); }
@@ -57,7 +65,7 @@
   .sq.check { background: radial-gradient(circle, #ff3b30 0%, rgba(255,59,48,.5) 45%, transparent 75%), var(--dark); }
   .sq.l.check { background: radial-gradient(circle, #ff3b30 0%, rgba(255,59,48,.5) 45%, transparent 75%), var(--light); }
   .sq.target::after {
-    content: ""; position: absolute; width: 30%; height: 30%; border-radius: 50%; background: rgba(0,0,0,.22);
+    content: ""; position: absolute; z-index: 3; width: 30%; height: 30%; border-radius: 50%; background: rgba(0,0,0,.22);
   }
   .sq.target.capture::after { width: 88%; height: 88%; background: none; border: 4px solid rgba(0,0,0,.22); }
   .coord { position: absolute; z-index: 2; font-size: 10px; font-weight: 700; opacity: .7; pointer-events: none; }
@@ -67,6 +75,40 @@
   .sq.d .coord { color: var(--light); }
   .piece { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
   .piece svg { display: block; width: 100%; height: 100%; }
+
+  /* othello: green felt and discs */
+  .board.othello { background: var(--felt-line); gap: 1px; padding: 1px; }
+  .board.othello .sq { background: var(--felt); }
+  .board.othello .sq.last::before { background: rgba(255,255,255,.18); }
+  .board.othello .sq.target::after { width: 26%; height: 26%; background: rgba(0,0,0,.28); }
+  /* round pieces: othello discs, checkers men and go stones */
+  .disc {
+    position: relative; z-index: 1; width: 82%; height: 82%; border-radius: 50%; pointer-events: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .disc.b { background: radial-gradient(circle at 35% 30%, #555, #111 70%); box-shadow: 0 2px 3px rgba(0,0,0,.45); }
+  .disc.w { background: radial-gradient(circle at 35% 30%, #fff, #d6d6d6 75%); box-shadow: 0 2px 3px rgba(0,0,0,.4); }
+  .disc svg { width: 58%; height: 58%; }
+  /* checkers */
+  .board.checkers .disc { width: 78%; height: 78%; }
+  .board.checkers .disc.b { background: radial-gradient(circle at 35% 30%, #4a4a4a, #111 70%); border: 3px solid #333; }
+  .board.checkers .disc.w { background: radial-gradient(circle at 35% 30%, #fff8ee, #e6d6bf 75%); border: 3px solid #cbb89a; }
+  /* go: wood board, lines through the middle of each cell, stones on the intersections */
+  .board.go { background: var(--wood); padding: 2%; border-radius: 4px; }
+  .board.go .sq { background: none; }
+  .board.go .sq .line-h, .board.go .sq .line-v { position: absolute; background: var(--wood-line); pointer-events: none; }
+  .board.go .sq .line-h { height: 1px; top: 50%; left: 0; right: 0; }
+  .board.go .sq .line-v { width: 1px; left: 50%; top: 0; bottom: 0; }
+  .board.go .sq.left .line-h { left: 50%; } .board.go .sq.right .line-h { right: 50%; }
+  .board.go .sq.top .line-v { top: 50%; } .board.go .sq.bottom .line-v { bottom: 50%; }
+  .board.go .star { position: absolute; width: 16%; height: 16%; border-radius: 50%; background: var(--wood-line); }
+  .board.go .disc { width: 92%; height: 92%; }
+  .board.go .sq.last .disc::after {
+    content: ""; width: 34%; height: 34%; border-radius: 50%; border: 2px solid #e33;
+  }
+  .board.go .sq.last::before { background: none; }
+  .board.go .sq.target::after { width: 22%; height: 22%; background: rgba(0,0,0,.18); }
+
   .status { min-height: 22px; margin: 10px 2px 4px; text-align: center; color: var(--hint); font-size: 14px; }
   .status.strong { color: var(--text); font-weight: 600; }
   .actions { display: flex; gap: 8px; margin-top: 10px; }
@@ -77,16 +119,20 @@
   button.primary { background: var(--button); color: var(--button-text); }
   button.danger { color: var(--danger); }
   button:disabled { opacity: .45; }
-  .card { background: var(--card); border-radius: 12px; padding: 18px 16px; text-align: center; margin-top: 24px; }
-  .card h2 { margin: 0 0 6px; font-size: 20px; }
-  .card p { margin: 6px 0 14px; color: var(--hint); }
-  .big { font-size: 48px; line-height: 1; margin-bottom: 8px; }
   .nav { display: flex; gap: 8px; margin-top: 10px; }
   .nav button { padding: 8px 10px; font-size: 18px; line-height: 1; }
   .nav .step { flex: 0 0 56px; }
   .nav .list { font-size: 15px; }
   .review { color: var(--button); font-weight: 600; }
   .review a { color: var(--button); text-decoration: underline; cursor: pointer; }
+  .card { background: var(--card); border-radius: 12px; padding: 18px 16px; text-align: center; margin-top: 24px; }
+  .card h2 { margin: 0 0 6px; font-size: 20px; }
+  .card p { margin: 6px 0 14px; color: var(--hint); }
+  .big { font-size: 48px; line-height: 1; margin-bottom: 8px; }
+  .promo { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; z-index: 5; }
+  .promo.open { display: flex; }
+  .promo div { background: var(--bg); border-radius: 14px; padding: 14px; display: flex; gap: 8px; }
+  .promo button { position: relative; width: 60px; height: 60px; flex: none; padding: 4px; }
   .sheet { position: fixed; inset: 0; z-index: 6; display: none; background: rgba(0,0,0,.45); }
   .sheet.open { display: flex; align-items: flex-end; }
   .sheet .panel {
@@ -99,10 +145,6 @@
   .movelist .mv { padding: 7px 8px; border-radius: 7px; cursor: pointer; font-weight: 500; }
   .movelist .mv.on { background: var(--button); color: var(--button-text); }
   .movelist .empty { grid-column: 1 / -1; text-align: center; color: var(--hint); padding: 16px 0; }
-  .promo { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center; z-index: 5; }
-  .promo.open { display: flex; }
-  .promo div { background: var(--bg); border-radius: 14px; padding: 14px; display: flex; gap: 8px; }
-  .promo button { position: relative; width: 60px; height: 60px; flex: none; padding: 4px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -122,6 +164,7 @@
     <div class="actions" id="actions"></div>
   </div>
 </div>
+<div class="promo" id="promo"><div id="promoChoices"></div></div>
 <div class="sheet" id="sheet" onclick="if (event.target === this) closeMoves()">
   <div class="panel">
     <h3>Moves</h3>
@@ -129,7 +172,6 @@
     <button onclick="closeMoves()">Close</button>
   </div>
 </div>
-<div class="promo" id="promo"><div id="promoChoices"></div></div>
 
 <script>
 const tg = window.Telegram && Telegram.WebApp;
@@ -151,13 +193,17 @@ const PIECES = {
   wQ: "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"45\" height=\"45\" viewBox=\"0 0 45 45\"><g fill=\"#fff\" fill-rule=\"evenodd\" stroke=\"#000\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"1.5\"><path d=\"M8 12a2 2 0 1 1-4 0 2 2 0 1 1 4 0m16.5-4.5a2 2 0 1 1-4 0 2 2 0 1 1 4 0M41 12a2 2 0 1 1-4 0 2 2 0 1 1 4 0M16 8.5a2 2 0 1 1-4 0 2 2 0 1 1 4 0M33 9a2 2 0 1 1-4 0 2 2 0 1 1 4 0\"/><path stroke-linecap=\"butt\" d=\"M9 26c8.5-1.5 21-1.5 27 0l2-12-7 11V11l-5.5 13.5-3-15-3 15-5.5-14V25L7 14z\"/><path stroke-linecap=\"butt\" d=\"M9 26c0 2 1.5 2 2.5 4 1 1.5 1 1 .5 3.5-1.5 1-1.5 2.5-1.5 2.5-1.5 1.5.5 2.5.5 2.5 6.5 1 16.5 1 23 0 0 0 1.5-1 0-2.5 0 0 .5-1.5-1-2.5-.5-2.5-.5-2 .5-3.5 1-2 2.5-2 2.5-4-8.5-1.5-18.5-1.5-27 0z\"/><path fill=\"none\" d=\"M11.5 30c3.5-1 18.5-1 22 0M12 33.5c6-1 15-1 21 0\"/></g></svg>",
   wR: "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"45\" height=\"45\" viewBox=\"0 0 45 45\"><g fill=\"#fff\" fill-rule=\"evenodd\" stroke=\"#000\" stroke-linecap=\"round\" stroke-linejoin=\"round\" stroke-width=\"1.5\"><path stroke-linecap=\"butt\" d=\"M9 39h27v-3H9zm3-3v-4h21v4zm-1-22V9h4v2h5V9h5v2h5V9h4v5\"/><path d=\"m34 14-3 3H14l-3-3\"/><path stroke-linecap=\"butt\" stroke-linejoin=\"miter\" d=\"M31 17v12.5H14V17\"/><path d=\"m31 29.5 1.5 2.5h-20l1.5-2.5\"/><path fill=\"none\" stroke-linejoin=\"miter\" d=\"M11 14h23\"/></g></svg>",
 };
-let state = null, selected = null, busy = false;
-let viewPly = null;  // null = the live position; otherwise how many moves in we're looking back at
+const CROWN = `<svg viewBox="0 0 24 24"><path fill="#e8b923" stroke="#7a5a00" stroke-width="1.2" stroke-linejoin="round" d="M3 18 2 7l5.5 4.5L12 4l4.5 7.5L22 7l-1 11z"/></svg>`;
+const EMOJI = { chess: "♟", othello: "⚫", checkers: "⛀", go: "⚪" };
+const GO_LETTERS = "ABCDEFGHJ";
 const VALUES = { p: 1, n: 3, b: 3, r: 5, q: 9 };
 const START = { p: 8, n: 2, b: 2, r: 2, q: 1 };
+let state = null, selected = null, busy = false;
+let viewPly = null;  // null = the live position; otherwise how many moves in we're looking back at
 
 function haptic(kind) { try { tg.HapticFeedback.impactOccurred(kind || "light"); } catch (e) {} }
 function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function other(c) { return c === "white" ? "black" : "white"; }
 
 async function api(action, extra) {
   const r = await fetch("/chess/api", {
@@ -177,6 +223,8 @@ function showMessage(html) {
   m.innerHTML = html; m.classList.remove("hidden");
 }
 
+// ---------- reading boards (one character per square, top row first; chess uses FEN)
+
 function parseFen(fen) {
   const grid = {};
   fen.split(" ")[0].split("/").forEach((row, r) => {
@@ -190,11 +238,28 @@ function parseFen(fen) {
   return grid;
 }
 
+function checkersNumber(r, c) { return (r + c) % 2 === 1 ? r * 4 + Math.floor(c / 2) + 1 : null; }
+function squareName(kind, r, c) {
+  if (kind === "othello") return "abcdefgh"[c] + (r + 1);
+  if (kind === "checkers") return checkersNumber(r, c);
+  if (kind === "go") return GO_LETTERS[c] + (9 - r);
+}
+function moveSquares(kind, move) {
+  // squares to highlight for a move
+  if (!move || move === "pass") return [];
+  if (kind === "chess") return [move.slice(0, 2), move.slice(2, 4)];
+  if (kind === "checkers") return move.split(/[-x]/).map(Number);
+  return [move];
+}
+
+// ---------- drawing
+
 function render() {
   const s = state;
+  const emoji = EMOJI[s.kind] || "♟";
   if (s.status === "waiting") {
     const who = s.invited ? `${esc(s.host)} challenged <b>${esc(s.invited)}</b>.` : `${esc(s.host)} is waiting for an opponent.`;
-    let html = `<div class="big">♞</div><h2>Chess match</h2><p>${who}</p>`;
+    let html = `<div class="big">${emoji}</div><h2>${esc(s.title)} match</h2><p>${who}</p>`;
     if (s.can_join) html += `<button class="primary" onclick="act('join')">Join the game</button>`;
     else html += `<p>Waiting for ${s.invited ? esc(s.invited) : "someone"} to join…</p>`;
     if (s.can_cancel) html += `<div class="actions"><button class="danger" onclick="act('cancel')">Cancel game</button></div>`;
@@ -204,44 +269,31 @@ function render() {
     return showMessage(`<div class="big">🔒</div><h2>${esc(s.white)} vs ${esc(s.black)}</h2>
       <p>This game is private while it's being played. Laden will post the result and the moves in the group when it ends.</p>`);
   }
-  if (s.status === "over" && !s.fen) {
-    return showMessage(`<div class="big">♟</div><h2>Game cancelled</h2><p>Start a new one with /chessmatch.</p>`);
+  if (!s.board) {
+    return showMessage(`<div class="big">${emoji}</div><h2>Game cancelled</h2><p>Start a new one in the group.</p>`);
   }
   document.getElementById("message").classList.add("hidden");
   document.getElementById("game").classList.remove("hidden");
 
-  const flip = s.you === "black";
-  if (viewPly !== null && viewPly >= s.fens.length - 1) viewPly = null;  // caught up with the live position
+  if (viewPly !== null && viewPly >= s.positions.length - 1) viewPly = null;  // caught up with the live position
   const reviewing = viewPly !== null;
-  const grid = parseFen(reviewing ? s.fens[viewPly] : s.fen);
-  const last = reviewing ? (viewPly > 0 ? s.moves[viewPly - 1] : null) : s.last;
+  const snapshot = reviewing ? s.positions[viewPly] : s.board;
+  const last = reviewing ? (viewPly > 0 ? s.moves[viewPly - 1] : null) : s.moves[s.moves.length - 1];
   if (reviewing) selected = null;
   const myTurn = s.status === "playing" && s.you === s.turn;
-  const targets = selected ? s.legal.filter(m => m.startsWith(selected)).map(m => m.slice(2, 4)) : [];
-  const board = document.getElementById("board");
-  board.innerHTML = "";
-  for (let r = 0; r < 8; r++) {
-    for (let f = 0; f < 8; f++) {
-      const file = "abcdefgh"[flip ? 7 - f : f], rank = flip ? r + 1 : 8 - r, sq = file + rank;
-      const el = document.createElement("div");
-      el.className = "sq " + ((f + r) % 2 ? "d" : "l");
-      if (last && (last.slice(0, 2) === sq || last.slice(2, 4) === sq)) el.classList.add("last");
-      if (sq === selected) el.classList.add("sel");
-      if (sq === s.check && !reviewing) el.classList.add("check");
-      if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
-      const p = grid[sq];
-      if (p) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
-      if (r === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${file}</span>`);
-      if (f === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${rank}</span>`);
-      el.onclick = () => tap(sq, grid);
-      board.appendChild(el);
-    }
-  }
+  const legal = reviewing || !myTurn ? [] : (s.legal || []);
 
-  const me = s.you, them = me === "white" ? "black" : "white";
-  const bottom = me || "white", top = me ? them : "black";
-  const taken = takenPieces(grid);
-  const line = c => `<span class="dot ${c}"></span><span class="info"><span class="name">${esc(s[c])}</span>${taken[c]}</span>` +
+  const board = document.getElementById("board");
+  board.className = `board ${s.kind}`;
+  board.innerHTML = "";
+  if (s.kind === "chess") drawChess(board, snapshot, last, legal, reviewing);
+  else if (s.kind === "go") drawGo(board, snapshot, last, legal);
+  else drawGrid(board, s.kind, snapshot, last, legal);
+
+  const me = s.you, them = other(me || "white");
+  const bottom = me || s.first, top = other(bottom);
+  const extras = sideInfo(s.kind, snapshot, reviewing);
+  const line = c => `<span class="dot ${c}"></span><span class="info"><span class="name">${esc(s[c])}</span>${extras[c]}</span>` +
     (s.status === "playing" && s.turn === c && !s.running ? `<span class="turn">to move</span>` : "") +
     (s.clock ? `<span class="clock" data-color="${c}"></span>` : "");
   document.getElementById("topPlayer").innerHTML = line(top);
@@ -249,23 +301,25 @@ function render() {
 
   const status = document.getElementById("status");
   status.className = "status";
-  document.getElementById("prev").disabled = (reviewing ? viewPly : s.sans.length) === 0;
+  document.getElementById("prev").disabled = (reviewing ? viewPly : s.labels.length) === 0;
   document.getElementById("next").disabled = !reviewing;
+  const theyPassed = s.moves.length && s.moves[s.moves.length - 1] === "pass";
   if (reviewing) {
     status.innerHTML = `<span class="review">${viewPly ? `After ${esc(moveLabel(viewPly))}` : "Starting position"}` +
       ` · <a onclick="goLive()">back to the game</a></span>`;
   } else if (s.status === "over") {
-    const winner = s.result === "1-0" ? s.white : s.result === "0-1" ? s.black : null;
+    const winner = s.result === "white" || s.result === "black" ? s[s.result] : null;
     status.textContent = winner ? `${winner} won by ${s.reason}.` : `Draw by ${s.reason}.`;
     status.classList.add("strong");
   } else if (s.draw_offer === "them") {
     status.textContent = `${s[them]} offers a draw.`; status.classList.add("strong");
   } else if (myTurn) {
-    status.textContent = s.check ? "Check! Your move." : "Your move."; status.classList.add("strong");
+    let text = s.check ? "Check! Your move." : "Your move.";
+    if (theyPassed) text = s.kind === "go" ? `${s[them]} passed. Pass too to end the game, or play on.` : `${s[them]} had no moves and passed. Your move.`;
+    status.textContent = text; status.classList.add("strong");
   } else {
     status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" : `Waiting for ${s[them]}…`;
   }
-
   if (!reviewing && s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
   tickClocks();
 
@@ -273,10 +327,99 @@ function render() {
   if (s.status !== "playing") actions.innerHTML = "";
   else if (s.draw_offer === "them") actions.innerHTML =
     `<button class="primary" onclick="act('accept_draw')">Accept draw</button><button onclick="act('decline_draw')">Decline</button>`;
-  else actions.innerHTML = (s.bot ? "" :
-    `<button onclick="act('offer_draw')" ${s.draw_offer ? "disabled" : ""}>Offer draw</button>`) +
+  else actions.innerHTML =
+    (s.kind === "go" ? `<button onclick="send('pass')" ${myTurn && !reviewing ? "" : "disabled"}>Pass</button>` : "") +
+    (s.bot ? "" : `<button onclick="act('offer_draw')" ${s.draw_offer ? "disabled" : ""}>Offer draw</button>`) +
     `<button class="danger" onclick="resign()">Resign</button>`;
+
   if (document.getElementById("sheet").classList.contains("open")) fillMoves();
+}
+
+function drawChess(board, snapshot, last, legal, reviewing) {
+  const s = state, flip = s.you === "black", grid = parseFen(snapshot);
+  const lit = moveSquares("chess", last);
+  const targets = selected ? legal.filter(m => m.startsWith(selected)).map(m => m.slice(2, 4)) : [];
+  board.style.gridTemplateColumns = "repeat(8, 1fr)";
+  for (let r = 0; r < 8; r++) {
+    for (let f = 0; f < 8; f++) {
+      const file = "abcdefgh"[flip ? 7 - f : f], rank = flip ? r + 1 : 8 - r, sq = file + rank;
+      const el = document.createElement("div");
+      el.className = "sq " + ((f + r) % 2 ? "d" : "l");
+      if (lit.includes(sq)) el.classList.add("last");
+      if (sq === selected) el.classList.add("sel");
+      if (sq === s.check && !reviewing) el.classList.add("check");
+      if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
+      const p = grid[sq];
+      if (p) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
+      if (r === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${file}</span>`);
+      if (f === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${rank}</span>`);
+      el.onclick = () => tapChess(sq, grid, legal);
+      board.appendChild(el);
+    }
+  }
+}
+
+function drawGrid(board, kind, snapshot, last, legal) {
+  // othello and checkers: 8x8, one character per square
+  const s = state, flip = kind === "checkers" && s.you === "black";  // your own pieces at the bottom
+  const lit = moveSquares(kind, last);
+  let targets = [];
+  if (kind === "othello") targets = legal.filter(m => m !== "pass");
+  else if (selected) targets = legal.filter(m => +m.split(/[-x]/)[0] === selected).map(m => +m.split(/[-x]/).pop());
+  board.style.gridTemplateColumns = "repeat(8, 1fr)";
+  for (let rr = 0; rr < 8; rr++) {
+    for (let cc = 0; cc < 8; cc++) {
+      const r = flip ? 7 - rr : rr, c = flip ? 7 - cc : cc, name = squareName(kind, r, c);
+      const p = snapshot[r * 8 + c];
+      const el = document.createElement("div");
+      el.className = "sq" + (kind === "checkers" ? ((r + c) % 2 ? " d" : " l") : "");
+      if (name !== null && lit.includes(name)) el.classList.add("last");
+      if (kind === "checkers" && name !== null && name === selected) el.classList.add("sel");
+      if (name !== null && targets.includes(name)) el.classList.add("target");
+      if (p !== ".") el.innerHTML = `<span class="disc ${p.toLowerCase()}">${p === "B" || p === "W" ? CROWN : ""}</span>`;
+      el.onclick = () => kind === "othello" ? tapPlace(name, legal) : tapCheckers(name, p, legal);
+      board.appendChild(el);
+    }
+  }
+}
+
+function drawGo(board, snapshot, last, legal) {
+  const stars = ["C7", "G7", "E5", "C3", "G3"];
+  board.style.gridTemplateColumns = "repeat(9, 1fr)";
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const name = squareName("go", r, c), p = snapshot[r * 9 + c];
+      const el = document.createElement("div");
+      el.className = "sq" + (c === 0 ? " left" : "") + (c === 8 ? " right" : "") + (r === 0 ? " top" : "") + (r === 8 ? " bottom" : "");
+      el.innerHTML = `<span class="line-h"></span><span class="line-v"></span>` + (stars.includes(name) ? `<span class="star"></span>` : "");
+      if (name === last) el.classList.add("last");
+      if (p === "." && legal.includes(name)) el.classList.add("target");
+      if (p !== ".") el.insertAdjacentHTML("beforeend", `<span class="disc ${p}"></span>`);
+      el.onclick = () => tapPlace(name, legal);
+      board.appendChild(el);
+    }
+  }
+}
+
+function sideInfo(kind, snapshot, reviewing) {
+  // the line under each name: captured pieces (chess, checkers), disc counts (othello), captured stones (go)
+  const s = state;
+  if (kind === "chess") return takenPieces(parseFen(snapshot));
+  const count = ch => [...snapshot].filter(x => x.toLowerCase() === ch).length;
+  if (kind === "othello") {
+    const n = { black: count("b"), white: count("w") };
+    return { black: `<span class="taken">${n.black} discs</span>`, white: `<span class="taken">${n.white} discs</span>` };
+  }
+  if (kind === "checkers") {  // pieces each side has taken = the opponent's missing pieces
+    const row = (victim, n) => `<span class="taken">${`<span class="chip ${victim}"></span>`.repeat(n)}${n ? `<span class="count">${n}</span>` : ""}</span>`;
+    return { black: row("w", 12 - count("w")), white: row("b", 12 - count("b")) };
+  }
+  if (kind === "go") {
+    const score = reviewing ? null : s.score;  // captures are only known for the live position
+    const line = c => `<span class="taken">${score ? `${score[c]} captured` : ""}</span>`;
+    return { black: line("black"), white: line("white") };
+  }
+  return { black: "", white: "" };
 }
 
 function takenPieces(grid) {
@@ -302,53 +445,40 @@ function takenPieces(grid) {
   return { white: row("b", diff), black: row("w", -diff) };
 }
 
-function moveLabel(ply) {
-  const no = Math.ceil(ply / 2);
-  return `${no}${ply % 2 ? "." : "…"} ${state.sans[ply - 1]}`;
-}
+// ---------- moving
 
-function step(delta) {
-  const total = state.sans.length;
-  const at = viewPly === null ? total : viewPly;
-  const next = Math.min(total, Math.max(0, at + delta));
-  viewPly = next >= total ? null : next;
-  haptic("light"); render();
-}
-
-function goLive() { viewPly = null; render(); }
-
-function showPly(ply) { viewPly = ply >= state.sans.length ? null : ply; closeMoves(); render(); }
-
-function fillMoves() {
-  const list = document.getElementById("movelist");
-  const at = viewPly === null ? state.sans.length : viewPly;
-  if (!state.sans.length) { list.innerHTML = `<div class="empty">No moves yet.</div>`; return; }
-  let html = "";
-  state.sans.forEach((san, i) => {
-    if (i % 2 === 0) html += `<span class="no">${i / 2 + 1}.</span>`;
-    html += `<span class="mv${i + 1 === at ? " on" : ""}" onclick="showPly(${i + 1})">${esc(san)}</span>`;
-  });
-  list.innerHTML = html;
-  const on = list.querySelector(".on");
-  if (on) on.scrollIntoView({ block: "center" });
-}
-
-function openMoves() { fillMoves(); document.getElementById("sheet").classList.add("open"); }
-function closeMoves() { document.getElementById("sheet").classList.remove("open"); }
-
-function tap(sq, grid) {
+function tapChess(sq, grid, legal) {
   const s = state;
   if (viewPly !== null) return goLive();  // tapping the board while looking back returns to the game
-  if (busy || s.status !== "playing" || s.you !== s.turn) return;
+  if (busy || !legal.length) return;
   const mine = p => p && (p === p.toUpperCase()) === (s.you === "white");
   if (selected) {
-    const options = s.legal.filter(m => m.startsWith(selected + sq));
+    const options = legal.filter(m => m.startsWith(selected + sq));
     if (options.length === 1) return send(options[0]);
     if (options.length > 1) return choosePromotion(options, s.you);
   }
-  selected = mine(grid[sq]) && s.legal.some(m => m.startsWith(sq)) ? (selected === sq ? null : sq) : null;
+  selected = mine(grid[sq]) && legal.some(m => m.startsWith(sq)) ? (selected === sq ? null : sq) : null;
   if (selected) haptic("light");
   render();
+}
+
+function tapCheckers(name, piece, legal) {
+  if (viewPly !== null) return goLive();
+  if (busy || !legal.length || name === null) return;
+  if (selected) {
+    // the longest jump that starts here and ends on the tapped square
+    const options = legal.filter(m => { const sq = m.split(/[-x]/).map(Number); return sq[0] === selected && sq[sq.length - 1] === name; });
+    if (options.length) return send(options.sort((a, b) => b.length - a.length)[0]);
+  }
+  selected = legal.some(m => +m.split(/[-x]/)[0] === name) ? (selected === name ? null : name) : null;
+  if (selected) haptic("light");
+  render();
+}
+
+function tapPlace(name, legal) {
+  if (viewPly !== null) return goLive();
+  if (busy || !legal.includes(name)) return;
+  send(name);
 }
 
 function choosePromotion(options, color) {
@@ -366,6 +496,7 @@ function choosePromotion(options, color) {
 }
 
 async function send(move) {
+  if (busy) return;
   busy = true; selected = null;
   if (state.bot) {
     const st = document.getElementById("status");
@@ -387,6 +518,44 @@ async function act(action) {
   try { state = await api(action); } catch (e) { tg ? tg.showAlert(e.message) : alert(e.message); }
   busy = false; render();
 }
+
+// ---------- looking back through the game
+
+function moveLabel(ply) {
+  const no = Math.ceil(ply / 2);
+  return `${no}${ply % 2 ? "." : "…"} ${state.labels[ply - 1]}`;
+}
+
+function step(delta) {
+  const total = state.labels.length;
+  const at = viewPly === null ? total : viewPly;
+  const next = Math.min(total, Math.max(0, at + delta));
+  viewPly = next >= total ? null : next;
+  haptic("light"); render();
+}
+
+function goLive() { viewPly = null; render(); }
+
+function showPly(ply) { viewPly = ply >= state.labels.length ? null : ply; closeMoves(); render(); }
+
+function fillMoves() {
+  const list = document.getElementById("movelist");
+  const at = viewPly === null ? state.labels.length : viewPly;
+  if (!state.labels.length) { list.innerHTML = `<div class="empty">No moves yet.</div>`; return; }
+  let html = "";
+  state.labels.forEach((label, i) => {
+    if (i % 2 === 0) html += `<span class="no">${i / 2 + 1}.</span>`;
+    html += `<span class="mv${i + 1 === at ? " on" : ""}" onclick="showPly(${i + 1})">${esc(label)}</span>`;
+  });
+  list.innerHTML = html;
+  const on = list.querySelector(".on");
+  if (on) on.scrollIntoView({ block: "center" });
+}
+
+function openMoves() { fillMoves(); document.getElementById("sheet").classList.add("open"); }
+function closeMoves() { document.getElementById("sheet").classList.remove("open"); }
+
+// ---------- clocks and staying in sync
 
 function clockText(t) {
   if (t < 10) return `0:0${t.toFixed(1)}`;
@@ -429,7 +598,7 @@ async function poll() {
 }
 
 (async () => {
-  if (!gameId) return showMessage(`<div class="big">♟</div><h2>No game</h2><p>Start one in the group with /chessmatch.</p>`);
+  if (!gameId) return showMessage(`<div class="big">♟</div><h2>No game</h2><p>Start one in the group with /chessmatch, /othello, /checkers or /go.</p>`);
   try { state = await api("state"); render(); }
   catch (e) { return showMessage(`<div class="big">♟</div><h2>Can't open the game</h2><p>${esc(e.message)}</p>`); }
   poll();

@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, quote, urlparse
 
 import chess
 import chess.engine
+from boardgames import GAMES, OTHER
 import httpx
 import tornado.web
 from ddgs import DDGS
@@ -629,7 +630,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
-        "/chessmatch [@someone] – play chess (or leave the slot open); /chessmatch bot 1-8 to play Laden\n"
+        "/chessmatch · /othello · /checkers · /go – board games: challenge someone, leave the slot open, or play Laden\n"
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
@@ -1919,79 +1920,85 @@ async def imitate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Could not imitate message")
 
 
-# ---------- /chessmatch: a private two-player chess game in a Telegram Mini App ----------
+# ---------- Board games (/chessmatch, /othello, /checkers, /go): private two-player games in a Telegram Mini App ----------
 
-CHESS_APP_NAME = os.getenv("CHESS_APP_NAME", "")  # BotFather /newapp short name; empty = the bot's Main Mini App
-CHESS_GAME_TTL = 7 * 86400  # seconds an unfinished game is kept
-CHESS_MAX_OPEN = 3  # unfinished games one person may have at once
-CHESS_CLOCK = int(os.getenv("CHESS_CLOCK_MINUTES", "10")) * 60  # seconds on each player's clock
-CHESS_REASONS = {
-    "CHECKMATE": "checkmate", "STALEMATE": "stalemate", "INSUFFICIENT_MATERIAL": "insufficient material",
-    "SEVENTYFIVE_MOVES": "the 75-move rule", "FIVEFOLD_REPETITION": "fivefold repetition",
-    "FIFTY_MOVES": "the 50-move rule", "THREEFOLD_REPETITION": "threefold repetition",
-}
-chess_games = {}  # game id -> game dict; cache of Redis chess:<id>
-chess_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
+GAME_APP_NAME = os.getenv("CHESS_APP_NAME", "")  # BotFather /newapp short name; empty = the bot's Main Mini App
+GAME_TTL = 7 * 86400  # seconds an unfinished game is kept
+GAME_MAX_OPEN = 3  # unfinished games one person may have at once (all games together)
+CHESS_CLOCK_MINUTES = os.getenv("CHESS_CLOCK_MINUTES")  # overrides chess's 10 minutes; other games use their own
+BOT_DEFAULT_LEVEL = 3
+BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
+GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go"}
+board_games = {}  # game id -> game dict; cache of Redis game:<id>
+game_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
 
 
-def chess_link(bot_username, game_id):
-    if CHESS_APP_NAME:
-        return f"https://t.me/{bot_username}/{CHESS_APP_NAME}?startapp={game_id}"
+def game_link(bot_username, game_id):
+    if GAME_APP_NAME:
+        return f"https://t.me/{bot_username}/{GAME_APP_NAME}?startapp={game_id}"
     return f"https://t.me/{bot_username}?startapp={game_id}"
 
 
+def game_rules(game):
+    return GAMES[game.get("kind", "chess")]
+
+
 async def load_game(game_id):
-    if game_id not in chess_games and use_redis:
+    if game_id not in board_games and use_redis:
         try:
-            raw = await redis("GET", f"chess:{game_id}")
+            raw = await redis("GET", f"game:{game_id}")
             if raw:
-                chess_games[game_id] = json.loads(raw)
+                board_games[game_id] = json.loads(raw)
         except Exception:
-            log.exception("Could not load chess game %s", game_id)
-    return chess_games.get(game_id)
+            log.exception("Could not load game %s", game_id)
+    return board_games.get(game_id)
 
 
 async def save_game(game):
     game["version"] = game.get("version", 0) + 1
-    chess_games[game["id"]] = game
+    board_games[game["id"]] = game
     if use_redis:
         try:
-            await redis("SET", f"chess:{game['id']}", json.dumps(game), "EX", CHESS_GAME_TTL)
+            await redis("SET", f"game:{game['id']}", json.dumps(game), "EX", GAME_TTL)
         except Exception:
-            log.exception("Could not save chess game %s", game["id"])
-
-
-def game_board(game):
-    board = chess.Board()
-    for move in game["moves"]:
-        board.push_uci(move)
-    return board
+            log.exception("Could not save game %s", game["id"])
 
 
 def player_color(game, user_id):
     return next((c for c in ("white", "black") if (game.get(c) or {}).get("id") == user_id), None)
 
 
-def chess_pgn(game, board):
-    """Move list in standard notation, e.g. 1. e4 e5 2. Nf3 Nc6 1-0."""
-    replay, parts = chess.Board(), []
-    for i, move in enumerate(board.move_stack):
+def game_history(rules, moves):
+    """(board after each move, starting with the empty position; each move in notation; final state)."""
+    state = rules.new()
+    snapshots, labels = [rules.snapshot(state)], []
+    for move in moves:
+        labels.append(rules.label(state, move))
+        state = rules.play(state, move)
+        snapshots.append(rules.snapshot(state))
+    return snapshots, labels, state
+
+
+def game_notation(game, labels):
+    """Numbered move list, e.g. 1. e4 e5 2. Nf3 Nc6 1-0."""
+    parts = []
+    for i, label in enumerate(labels):
         if i % 2 == 0:
             parts.append(f"{i // 2 + 1}.")
-        parts.append(replay.san(move))
-        replay.push(move)
-    return " ".join(parts + [game.get("result") or "*"])
+        parts.append(label)
+    if game.get("kind", "chess") == "chess":
+        parts.append({"white": "1-0", "black": "0-1", "draw": "½-½"}.get(game.get("result"), "*"))
+    return " ".join(parts)
 
 
-# Laden's chess engine: Stockfish (open source), downloaded on first use unless STOCKFISH_PATH points to one
+# Laden's chess engine: Stockfish (open source), downloaded on first use unless STOCKFISH_PATH points to one.
+# Othello, checkers and go use the light Python opponents in boardgames.py.
 STOCKFISH_PATH = os.getenv("STOCKFISH_PATH", "")
 STOCKFISH_DOWNLOAD = "https://github.com/official-stockfish/Stockfish/releases/latest/download/"
 ENGINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines")
 # level -> (Stockfish "Skill Level" 0-20, max search depth, max seconds per move); roughly like lichess's levels
 CHESS_BOT_LEVELS = {1: (0, 1, 0.05), 2: (3, 2, 0.1), 3: (6, 3, 0.15), 4: (9, 5, 0.2),
                     5: (11, 7, 0.3), 6: (14, 9, 0.4), 7: (17, 12, 0.6), 8: (20, 18, 1.0)}
-CHESS_BOT_DEFAULT_LEVEL = 3
-CHESS_BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
 stockfish_path = None
 engine = None
 engine_setup_lock = asyncio.Lock()  # one download/start at a time
@@ -2061,21 +2068,8 @@ async def get_engine():
     return engine
 
 
-def instinct_move(board):
-    """No engine available: mate if possible, else the juiciest capture or a check, else anything."""
-    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
-
-    def score(move):
-        board.push(move)
-        mate, check = board.is_checkmate(), board.is_check()
-        board.pop()
-        taken = board.piece_type_at(move.to_square) if board.is_capture(move) else None
-        return (mate, values.get(taken, 0), check, random.random())
-
-    return max(board.legal_moves, key=score)
-
-
 async def engine_move(board, level):
+    """Stockfish's move as UCI, or the simple fallback if Stockfish isn't available."""
     global engine
     skill, depth, seconds = CHESS_BOT_LEVELS[level]
     try:
@@ -2085,23 +2079,26 @@ async def engine_move(board, level):
                 await eng.configure({"Skill Level": skill})
                 result = await eng.play(board, chess.engine.Limit(depth=depth, time=seconds))
             if result.move:
-                return result.move
+                return result.move.uci()
     except Exception:
         log.exception("Stockfish failed; restarting it next time")
         engine = None
-    return instinct_move(board)
+    return GAMES["chess"].bot_move(board, level)
 
 
-def is_bot_turn(game, board):
-    bot_color = next((c for c in ("white", "black") if (game.get(c) or {}).get("bot")), None)
-    return bot_color is not None and (bot_color == "white") == board.turn
+async def laden_move(game, rules, state):
+    if rules.kind == "chess":
+        return await engine_move(state, game["bot_level"])
+    return await asyncio.to_thread(rules.bot_move, state, game["bot_level"])  # keeps the bot responsive meanwhile
 
 
 def clock_running(game):
-    """Whose clock is ticking: the side to move, once both sides have made their first move (like lichess)."""
+    """Whose clock is ticking: the side to move, once both sides have made their first move (like lichess).
+    Moves always alternate (forced passes are recorded too), so the side to move follows from the count."""
     if not game.get("clock") or game["status"] != "playing" or len(game["moves"]) < 2:
         return None
-    return "white" if len(game["moves"]) % 2 == 0 else "black"
+    first = game.get("first", "white")
+    return first if len(game["moves"]) % 2 == 0 else OTHER[first]
 
 
 def time_left(game, color):
@@ -2111,13 +2108,32 @@ def time_left(game, color):
     return max(0.0, left)
 
 
-def record_move(game, uci):
+def record_move(game, move):
     """Charge the mover's clock for this turn, then start the opponent's."""
     color = clock_running(game)
     if color:
         game["clock"][color] = time_left(game, color)
-    game["moves"].append(uci)
+    game["moves"].append(move)
     game["turn_started"] = time.time()
+
+
+async def advance(game, rules, state):
+    """After a move: end the game if it's over, play forced moves (like a pass in othello) and Laden's
+    moves, until it's a person's turn."""
+    while game["status"] == "playing":
+        result = rules.outcome(state)
+        if result:
+            await finish_game(game, *result)
+            break
+        move = rules.forced(state)
+        if not move:
+            player = game.get(rules.turn(state)) or {}
+            if not player.get("bot"):
+                break
+            move = await laden_move(game, rules, state)
+        state = rules.play(state, move)
+        record_move(game, move)
+    return state
 
 
 async def check_flag(game):
@@ -2125,53 +2141,45 @@ async def check_flag(game):
     color = clock_running(game)
     if not color or time_left(game, color) > 0:
         return False
-    board = game_board(game)
-    winner = chess.BLACK if color == "white" else chess.WHITE
-    if board.has_insufficient_material(winner):  # the opponent couldn't have mated anyway
-        await finish_game(game, board, "1/2-1/2", "timeout vs insufficient material")
+    rules = game_rules(game)
+    state = rules.replay(game["moves"])
+    if rules.draw_by_timeout(state, OTHER[color]):  # the opponent couldn't have won anyway
+        await finish_game(game, "draw", "timeout vs insufficient material")
     else:
-        await finish_game(game, board, "0-1" if color == "white" else "1-0", "timeout")
+        await finish_game(game, OTHER[color], "timeout")
     await save_game(game)
     return True
 
 
-async def watch_chess_clocks():
+async def watch_game_clocks():
     """Flag players who run out of time even when nobody has the board open."""
     while True:
         await asyncio.sleep(10)
-        for game in list(chess_games.values()):
+        for game in list(board_games.values()):
             if clock_running(game):
                 try:
-                    async with chess_locks.setdefault(game["id"], asyncio.Lock()):
+                    async with game_locks.setdefault(game["id"], asyncio.Lock()):
                         await check_flag(game)
                 except Exception:
-                    log.exception("Chess clock check failed")
+                    log.exception("Game clock check failed")
 
 
-async def play_bot_move(game, board):
-    """If it's Laden's turn in a game against it, make its move (and end the game if that finishes it)."""
-    if game["status"] != "playing" or not is_bot_turn(game, board):
-        return
-    move = await engine_move(board, game["bot_level"])
-    board.push(move)
-    record_move(game, move.uci())
-    outcome = board.outcome(claim_draw=True)
-    if outcome:
-        await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
-
-
-def bot_level_from(words):
+def bot_level_from(words, levels):
     """('bot', '5') -> 5; None if these words don't ask for a game against Laden."""
     words = [w.lower().lstrip("@") for w in words]
-    if not words or words[0] not in CHESS_BOT_WORDS:
+    if not words or words[0] not in BOT_WORDS:
         return None
-    level = next((int(w) for w in words[1:] if w.isdigit()), CHESS_BOT_DEFAULT_LEVEL)
-    return min(max(level, 1), 8)
+    level = next((int(w) for w in words[1:] if w.isdigit()), BOT_DEFAULT_LEVEL)
+    return min(max(level, 1), levels)
+
+
+def open_board_button(rules, game_id, bot_username):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"{rules.emoji} Open board", url=game_link(bot_username, game_id))]])
 
 
 async def post_game(update, context, game, text, menu=None):
     """Post the game with its "Open board" button, or turn the picker menu message into that post."""
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game["id"]))]])
+    button = open_board_button(game_rules(game), game["id"], context.bot.username)
     text += "\n\nMoves stay private until the game ends; then I'll post the result and the notation here."
     if menu:
         await menu.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=button)
@@ -2183,126 +2191,154 @@ async def post_game(update, context, game, text, menu=None):
 
 
 def too_many_games(user_id):
-    open_games = [g for g in chess_games.values() if g["status"] != "over" and user_id in
+    open_games = [g for g in board_games.values() if g["status"] != "over" and user_id in
                   ((g.get("white") or {}).get("id"), (g.get("black") or {}).get("id"))]
-    if len(open_games) >= CHESS_MAX_OPEN:
+    if len(open_games) >= GAME_MAX_OPEN:
         return f"You already have {len(open_games)} unfinished games. Finish or resign one first."
     return None
 
 
-async def start_bot_game(update, context, level, menu=None):
-    user, chat = update.effective_user, update.effective_chat
-    me = {"id": user.id, "name": user.full_name}
-    laden = {"id": context.bot.id, "name": f"Laden 🤖 (level {level})", "bot": True}
+def new_game(kind, update, invited, bot_level=None):
+    rules = GAMES[kind]
+    return {"id": base64.urlsafe_b64encode(os.urandom(9)).decode(), "kind": kind, "first": rules.first,
+            "chat_id": update.effective_chat.id, "message_id": None, "creator": update.effective_user.id,
+            "invited": invited, "bot_level": bot_level, "white": None, "black": None, "moves": [],
+            "status": "waiting", "result": None, "reason": None, "draw_offer": None,
+            "clock": dict.fromkeys(("white", "black"), clock_seconds(rules)), "created": int(time.time())}
+
+
+def clock_seconds(rules):
+    if rules.kind == "chess" and CHESS_CLOCK_MINUTES:
+        return int(CHESS_CLOCK_MINUTES) * 60
+    return rules.clock_minutes * 60
+
+
+def versus(game):
+    """'Ann (Black) vs Bob (White)', with whoever moves first named first."""
+    first = game.get("first", "white")
+    return " vs ".join(f"<b>{html.escape(game[c]['name'])}</b> ({c.capitalize()})" for c in (first, OTHER[first]))
+
+
+async def start_bot_game(update, context, kind, level, menu=None):
+    rules, user = GAMES[kind], update.effective_user
+    game = new_game(kind, update, None, level)
     my_color = random.choice(["white", "black"])
-    game = {"id": base64.urlsafe_b64encode(os.urandom(9)).decode(), "chat_id": chat.id, "message_id": None,
-            "creator": user.id, "invited": None, "bot_level": level,
-            "white": me if my_color == "white" else laden, "black": laden if my_color == "white" else me,
-            "moves": [], "status": "playing", "result": None, "reason": None, "draw_offer": None,
-            "clock": {"white": CHESS_CLOCK, "black": CHESS_CLOCK}, "created": int(time.time())}
-    text = (f"♟ <b>{html.escape(user.full_name)}</b> ({my_color.capitalize()}) takes on <b>Laden 🤖</b> "
-            f"at level {level}/8 (Stockfish).")
+    game[my_color] = {"id": user.id, "name": user.full_name}
+    game[OTHER[my_color]] = {"id": context.bot.id, "name": f"Laden 🤖 (level {level})", "bot": True}
+    game["status"] = "playing"
+    text = (f"{rules.emoji} <b>{html.escape(user.full_name)}</b> ({my_color.capitalize()}) takes on "
+            f"<b>Laden 🤖</b> at {rules.title.lower()}, level {level}/{rules.levels}. "
+            f"{clock_seconds(rules) // 60} minutes each.")
     await post_game(update, context, game, text, menu)
-    await play_bot_move(game, chess.Board())  # Laden opens when it has White
+    await advance(game, rules, rules.new())  # Laden opens when it moves first
     await save_game(game)
 
 
-async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/chessmatch [@someone | name], or as a reply: start a game and post a button that opens the board."""
-    if await ignored_while_off(update) or await muted(update, context):
-        return
-    if not is_allowed(update):
-        await update.message.reply_text("Sorry, this bot is private.")
-        return
-    msg, user, chat = update.message, update.effective_user, update.effective_chat
-    refusal = too_many_games(user.id)
-    if refusal:
-        await msg.reply_text(refusal, do_quote=True)
-        return
-
-    quoted = msg.reply_to_message
-    if not context.args and not quoted:  # nothing specified: let them pick with buttons
-        await msg.reply_text(f"♟ <b>{html.escape(user.full_name)}</b>, who do you want to play?\n\n"
-                             "<i>To challenge someone specific: /chessmatch @name, or reply to them with /chessmatch.</i>",
-                             parse_mode=ParseMode.HTML, reply_markup=opponent_menu(user.id), do_quote=is_group(update))
-        return
-    level = bot_level_from(context.args)
-    if quoted and quoted.from_user and quoted.from_user.id == context.bot.id and not context.args:
-        level = CHESS_BOT_DEFAULT_LEVEL  # /chessmatch as a reply to Laden
-    if level is None and context.args and context.args[0].lstrip("@").lower() == context.bot.username.lower():
-        level = bot_level_from(["bot", *context.args[1:]])
-    if level is not None:
-        await start_bot_game(update, context, level)
-        return
-
-    invited = None
-    if quoted and quoted.from_user and not quoted.from_user.is_bot:
-        invited = {"id": quoted.from_user.id, "name": quoted.from_user.full_name}
-    elif context.args:
-        group_members = await load_members(chat.id) if is_group(update) else {}
-        by_username = {m["username"].lower(): uid for uid, m in group_members.items() if m["username"]}
-        for entity, text in msg.parse_entities(["mention", "text_mention"]).items():
-            if entity.type == "text_mention" and entity.user:
-                invited = {"id": entity.user.id, "name": entity.user.full_name}
-            else:
-                username = text.lstrip("@")
-                uid = by_username.get(username.lower())
-                invited = {"id": uid, "username": username.lower(),
-                           "name": group_members[uid]["name"] if uid else f"@{username}"}
-            break
-        if not invited:
-            found = match_member_name(" ".join(context.args).lower(), group_members)
-            if not found:
-                await msg.reply_text("I don't know who that is. Reply to their message or @mention them.",
-                                     do_quote=True)
-                return
-            invited = {"id": found[0], "name": found[1]}
-    if invited and invited.get("id") == user.id:
-        await msg.reply_text("Playing yourself? Leave the slot open instead.", do_quote=True)
-        return
-    await start_open_game(update, context, invited)
-
-
-async def start_open_game(update, context, invited, menu=None):
+async def start_open_game(update, context, kind, invited, menu=None):
     """A game against a person: the invited one, or anyone in the group if invited is None."""
-    user, chat = update.effective_user, update.effective_chat
-    game_id = base64.urlsafe_b64encode(os.urandom(9)).decode()
-    me = {"id": user.id, "name": user.full_name}
-    my_color = random.choice(["white", "black"])
-    game = {"id": game_id, "chat_id": chat.id, "message_id": None, "creator": user.id, "invited": invited,
-            "white": me if my_color == "white" else None, "black": me if my_color == "black" else None,
-            "moves": [], "status": "waiting", "result": None, "reason": None, "draw_offer": None,
-            "clock": {"white": CHESS_CLOCK, "black": CHESS_CLOCK}, "created": int(time.time())}
+    rules, user = GAMES[kind], update.effective_user
+    game = new_game(kind, update, invited)
+    game[random.choice(["white", "black"])] = {"id": user.id, "name": user.full_name}
+    name = html.escape(user.full_name)
     if invited:
-        text = f"♟ <b>{html.escape(user.full_name)}</b> challenges <b>{html.escape(invited['name'])}</b> to chess!"
+        text = f"{rules.emoji} <b>{name}</b> challenges <b>{html.escape(invited['name'])}</b> to {rules.title.lower()}!"
     else:
-        text = f"♟ <b>{html.escape(user.full_name)}</b> wants to play chess. The slot is open: anyone can join!"
+        text = f"{rules.emoji} <b>{name}</b> wants to play {rules.title.lower()}. The slot is open: anyone can join!"
+    text += f" {clock_seconds(rules) // 60} minutes each."
     await post_game(update, context, game, text, menu)
     await save_game(game)
 
 
-CHESS_LEVEL_LABELS = {1: "1 🐣", 2: "2", 3: "3 🙂", 4: "4", 5: "5 😤", 6: "6", 7: "7 🔥", 8: "8 💀"}
+def game_command(kind):
+    """/chessmatch, /othello, /checkers, /go [@someone | name | bot 1-N], or as a reply."""
+    rules, command = GAMES[kind], GAME_COMMANDS[kind]
+
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if await ignored_while_off(update) or await muted(update, context):
+            return
+        if not is_allowed(update):
+            await update.message.reply_text("Sorry, this bot is private.")
+            return
+        msg, user, chat = update.message, update.effective_user, update.effective_chat
+        refusal = too_many_games(user.id)
+        if refusal:
+            await msg.reply_text(refusal, do_quote=True)
+            return
+
+        quoted = msg.reply_to_message
+        if not context.args and not quoted:  # nothing specified: let them pick with buttons
+            await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, who do you want to play "
+                                 f"{rules.title.lower()} with?\n\n<i>To challenge someone specific: /{command} @name, "
+                                 f"or reply to them with /{command}.</i>", parse_mode=ParseMode.HTML,
+                                 reply_markup=opponent_menu(kind, user.id), do_quote=is_group(update))
+            return
+        level = bot_level_from(context.args, rules.levels)
+        if quoted and quoted.from_user and quoted.from_user.id == context.bot.id and not context.args:
+            level = BOT_DEFAULT_LEVEL  # as a reply to Laden
+        if level is None and context.args and context.args[0].lstrip("@").lower() == context.bot.username.lower():
+            level = bot_level_from(["bot", *context.args[1:]], rules.levels)
+        if level is not None:
+            await start_bot_game(update, context, kind, level)
+            return
+
+        invited = None
+        if quoted and quoted.from_user and not quoted.from_user.is_bot:
+            invited = {"id": quoted.from_user.id, "name": quoted.from_user.full_name}
+        elif context.args:
+            group_members = await load_members(chat.id) if is_group(update) else {}
+            by_username = {m["username"].lower(): uid for uid, m in group_members.items() if m["username"]}
+            for entity, text in msg.parse_entities(["mention", "text_mention"]).items():
+                if entity.type == "text_mention" and entity.user:
+                    invited = {"id": entity.user.id, "name": entity.user.full_name}
+                else:
+                    username = text.lstrip("@")
+                    uid = by_username.get(username.lower())
+                    invited = {"id": uid, "username": username.lower(),
+                               "name": group_members[uid]["name"] if uid else f"@{username}"}
+                break
+            if not invited:
+                found = match_member_name(" ".join(context.args).lower(), group_members)
+                if not found:
+                    await msg.reply_text("I don't know who that is. Reply to their message or @mention them.",
+                                         do_quote=True)
+                    return
+                invited = {"id": found[0], "name": found[1]}
+        if invited and invited.get("id") == user.id:
+            await msg.reply_text("Playing yourself? Leave the slot open instead.", do_quote=True)
+            return
+        await start_open_game(update, context, kind, invited)
+
+    return handler
 
 
-def opponent_menu(user_id):
+LEVEL_LABELS = {1: "1 🐣", 3: "3 🙂", 5: "5 😤", 7: "7 🔥", 8: "8 💀"}
+
+
+def opponent_menu(kind, user_id):
+    rules = GAMES[kind]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Anyone (open slot)", callback_data=f"chess|open|{user_id}")],
-        [InlineKeyboardButton("🤖 Laden (Stockfish)", callback_data=f"chess|bot|{user_id}")],
+        [InlineKeyboardButton("👥 Anyone (open slot)", callback_data=f"game|{kind}|open|{user_id}")],
+        [InlineKeyboardButton(f"🤖 {rules.opponent_name}", callback_data=f"game|{kind}|bot|{user_id}")],
     ])
 
 
-def level_menu(user_id):
-    buttons = [InlineKeyboardButton(label, callback_data=f"chess|lvl{n}|{user_id}") for n, label in CHESS_LEVEL_LABELS.items()]
-    return InlineKeyboardMarkup([buttons[:4], buttons[4:],
-                                 [InlineKeyboardButton("⬅️ Back", callback_data=f"chess|back|{user_id}")]])
+def level_menu(kind, user_id):
+    levels = GAMES[kind].levels
+    labels = {n: LEVEL_LABELS.get(n, str(n)) for n in range(1, levels + 1)}
+    labels[levels] = f"{levels} 💀"
+    buttons = [InlineKeyboardButton(label, callback_data=f"game|{kind}|lvl{n}|{user_id}") for n, label in labels.items()]
+    rows = [buttons[:4], buttons[4:]] if levels > 5 else [buttons]
+    return InlineKeyboardMarkup(rows + [[InlineKeyboardButton("⬅️ Back", callback_data=f"game|{kind}|back|{user_id}")]])
 
 
-async def chess_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buttons under "/chessmatch": pick an open game or Laden, then Laden's level. Only the asker can press them."""
+async def game_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons under a game command: an open game or Laden, then Laden's level. Only the asker can press them."""
     query = update.callback_query
-    _, choice, owner = query.data.split("|")
+    _, kind, choice, owner = query.data.split("|")
+    rules = GAMES[kind]
     if update.effective_user.id != int(owner):
-        await query.answer("This menu isn't yours. Start your own with /chessmatch ♟", show_alert=True)
+        await query.answer(f"This menu isn't yours. Start your own with /{GAME_COMMANDS[kind]} {rules.emoji}",
+                           show_alert=True)
         return
     if await ignored_while_off(update) or await muted(update, context):
         await query.answer()
@@ -2310,14 +2346,13 @@ async def chess_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = html.escape(update.effective_user.full_name)
     if choice == "bot":
         await query.answer()
-        await query.edit_message_text(f"🤖 <b>{name}</b>, how strong should Laden be?\n\n"
-                                      "1 = beginner · 3 = casual · 5 = club player · 8 = grandmaster+",
-                                      parse_mode=ParseMode.HTML, reply_markup=level_menu(update.effective_user.id))
+        await query.edit_message_text(f"🤖 <b>{name}</b>, how strong should Laden be?\n\n{rules.level_note}",
+                                      parse_mode=ParseMode.HTML, reply_markup=level_menu(kind, update.effective_user.id))
         return
     if choice == "back":
         await query.answer()
-        await query.edit_message_text(f"♟ <b>{name}</b>, who do you want to play?", parse_mode=ParseMode.HTML,
-                                      reply_markup=opponent_menu(update.effective_user.id))
+        await query.edit_message_text(f"{rules.emoji} <b>{name}</b>, who do you want to play {rules.title.lower()} with?",
+                                      parse_mode=ParseMode.HTML, reply_markup=opponent_menu(kind, update.effective_user.id))
         return
     refusal = too_many_games(update.effective_user.id)
     if refusal:
@@ -2325,45 +2360,44 @@ async def chess_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     if choice == "open":
-        await start_open_game(update, context, None, menu=query.message)
+        await start_open_game(update, context, kind, None, menu=query.message)
     elif choice.startswith("lvl"):
-        await start_bot_game(update, context, int(choice[3:]), menu=query.message)
+        await start_bot_game(update, context, kind, min(int(choice[3:]), rules.levels), menu=query.message)
 
 
-async def edit_chess_message(game, text):
+async def edit_game_message(game, text):
     """Update the group post (keeping the button while the game is still on)."""
-    markup = None
-    if game["status"] != "over":
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton(
-            "♟ Open board", url=chess_link(chess_bot.username, game["id"]))]])
+    markup = None if game["status"] == "over" else open_board_button(game_rules(game), game["id"], game_bot.username)
     try:
-        await chess_bot.edit_message_text(text, chat_id=game["chat_id"], message_id=game["message_id"],
-                                          parse_mode=ParseMode.HTML, reply_markup=markup)
+        await game_bot.edit_message_text(text, chat_id=game["chat_id"], message_id=game["message_id"],
+                                         parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception as e:
-        log.info("Could not edit chess message: %s", e)
+        log.info("Could not edit game message: %s", e)
 
 
-async def finish_game(game, board, result, reason):
+async def finish_game(game, winner, reason):
+    """winner: "white", "black", or None/"draw"."""
     ticking = clock_running(game)
     if ticking:  # stop the clock where it is
         game["clock"][ticking] = time_left(game, ticking)
-    game.update(status="over", result=result, reason=reason, draw_offer=None, ended=int(time.time()))
-    white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
+    rules = game_rules(game)
+    winner = winner or "draw"
+    game.update(status="over", result=winner, reason=reason, draw_offer=None, ended=int(time.time()))
+    names = {c: html.escape(game[c]["name"]) for c in ("white", "black")}
     moves = (len(game["moves"]) + 1) // 2
-    if result == "1-0":
-        headline = f"🏆 <b>{white}</b> (White) beat <b>{black}</b> by {reason}"
-    elif result == "0-1":
-        headline = f"🏆 <b>{black}</b> (Black) beat <b>{white}</b> by {reason}"
+    if winner == "draw":
+        headline = f"🤝 <b>{names['white']}</b> and <b>{names['black']}</b> drew by {reason}"
     else:
-        headline = f"🤝 <b>{white}</b> and <b>{black}</b> drew by {reason}"
-    text = (f"♟ <b>Chess result</b>\n{headline} after {moves} move{'s' * (moves != 1)}.\n\n"
-            f"<b>Notation</b>\n<blockquote expandable>{html.escape(chess_pgn(game, board))}</blockquote>")
+        headline = f"🏆 <b>{names[winner]}</b> ({winner.capitalize()}) beat <b>{names[OTHER[winner]]}</b> by {reason}"
+    _, labels, _ = game_history(rules, game["moves"])
+    text = (f"{rules.emoji} <b>{rules.title} result</b>\n{headline} after {moves} move{'s' * (moves != 1)}.\n\n"
+            f"<b>Notation</b>\n<blockquote expandable>{html.escape(game_notation(game, labels))}</blockquote>")
     try:
-        await chess_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
-                                     reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
+        await game_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
+                                    reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
     except Exception:
-        log.exception("Could not post the chess result")
-    await edit_chess_message(game, f"♟ {white} vs {black}: game over ({result}). The result is below.")
+        log.exception("Could not post the game result")
+    await edit_game_message(game, f"{rules.emoji} {versus(game)}: game over. The result is below.")
 
 
 def check_init_data(init_data):
@@ -2383,11 +2417,13 @@ def check_init_data(init_data):
         return None
 
 
-def chess_view(game, user_id):
+def game_view(game, user_id):
     """What this person may see. Only the two players see the board while the game is on."""
+    rules = game_rules(game)
     color = player_color(game, user_id)
     names = {c: (game.get(c) or {}).get("name") for c in ("white", "black")}
-    view = {"status": game["status"], "version": game.get("version", 0), "you": color, "bot": bool(game.get("bot_level"))}
+    view = {"kind": rules.kind, "title": rules.title, "first": game.get("first", "white"), "status": game["status"],
+            "version": game.get("version", 0), "you": color, "bot": bool(game.get("bot_level"))}
     if game["status"] == "waiting":
         invited = game.get("invited")
         view.update(host=names["white"] or names["black"], invited=invited and invited["name"],
@@ -2397,22 +2433,16 @@ def chess_view(game, user_id):
         view["status"] = "private"
         view.update(white=names["white"], black=names["black"])
         return view
-    board = game_board(game)
-    view.update(white=names["white"], black=names["black"], fen=board.fen(), turn="white" if board.turn else "black",
-                last=game["moves"][-1] if game["moves"] else None, result=game["result"], reason=game["reason"],
-                check=chess.square_name(board.king(board.turn)) if board.is_check() else None,
-                pgn=chess_pgn(game, board))
-    replay, fens, sans = chess.Board(), [], []
-    for move in board.move_stack:  # every earlier position, for stepping back through the game
-        fens.append(replay.board_fen())
-        sans.append(replay.san(move))
-        replay.push(move)
-    view.update(fens=fens + [board.board_fen()], sans=sans, moves=game["moves"])
+    if game.get("result") == "cancelled":
+        return view
+    snapshots, labels, state = game_history(rules, game["moves"])
+    view.update(white=names["white"], black=names["black"], board=snapshots[-1], positions=snapshots, labels=labels,
+                moves=game["moves"], turn=rules.turn(state), result=game["result"], reason=game["reason"],
+                score=rules.score(state), check=rules.check_square(state) if rules.kind == "chess" else None)
     if game.get("clock"):
         view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))
     if color and game["status"] == "playing":
-        mine = (color == "white") == board.turn
-        view["legal"] = [m.uci() for m in board.legal_moves] if mine else []
+        view["legal"] = rules.legal(state) if rules.turn(state) == color else []
         offer = game.get("draw_offer")
         view["draw_offer"] = None if offer is None else ("you" if offer == user_id else "them")
     return view
@@ -2424,7 +2454,7 @@ def same_person(invited, user):
     return invited.get("username") and invited["username"] == (user.get("username") or "").lower()
 
 
-async def chess_action(body):
+async def game_action(body):
     """Handle one request from the Mini App. Returns (http status, response dict)."""
     user = check_init_data(body.get("initData"))
     if not user:
@@ -2434,20 +2464,21 @@ async def chess_action(body):
         return 404, {"error": "This game doesn't exist (games are kept for 7 days)."}
     action, uid = body.get("action", "state"), user["id"]
     name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
-    async with chess_locks.setdefault(game["id"], asyncio.Lock()):
+    rules = game_rules(game)
+    async with game_locks.setdefault(game["id"], asyncio.Lock()):
         color = player_color(game, uid)
         if color and game[color]["name"] != name and game["status"] != "over":
             game[color]["name"] = name  # names follow the Telegram profile, tied to the user id
         if game["status"] == "playing" and await check_flag(game):
-            return 200, chess_view(game, uid)  # out of time: nothing else to do
+            return 200, game_view(game, uid)  # out of time: nothing else to do
         if action == "join":
             if game["status"] != "waiting" or color:
-                return 200, chess_view(game, uid)
+                return 200, game_view(game, uid)
             invited = game.get("invited")
             if invited and not same_person(invited, user):
                 return 403, {"error": f"This game is reserved for {invited['name']}."}
             try:
-                member = await chess_bot.get_chat_member(game["chat_id"], uid)
+                member = await game_bot.get_chat_member(game["chat_id"], uid)
                 if member.status in ("left", "kicked"):
                     return 403, {"error": "Only members of the group can join."}
             except Exception:
@@ -2456,64 +2487,59 @@ async def chess_action(body):
             game[free] = {"id": uid, "name": name}
             game["status"], game["turn_started"] = "playing", time.time()
             await save_game(game)
-            white, black = html.escape(game["white"]["name"]), html.escape(game["black"]["name"])
-            await edit_chess_message(game, f"♟ <b>{white}</b> (White) vs <b>{black}</b> (Black)\n"
-                                           "Game in progress. Moves stay private until it ends.")
+            await edit_game_message(game, f"{rules.emoji} {versus(game)}\nGame in progress. Moves stay private until it ends.")
         elif action == "cancel":
             if game["status"] == "waiting" and uid == game["creator"]:
                 game["status"], game["result"], game["reason"] = "over", "cancelled", "cancelled"
                 await save_game(game)
-                await edit_chess_message(game, "♟ Chess game cancelled.")
+                await edit_game_message(game, f"{rules.emoji} {rules.title} game cancelled.")
         elif action in ("move", "resign", "offer_draw", "accept_draw", "decline_draw"):
             if game["status"] != "playing" or not color:
                 return 403, {"error": "You're not playing in this game."}
-            board = game_board(game)
+            state = rules.replay(game["moves"])
             if action == "move":
+                move = str(body.get("move", ""))
+                if rules.turn(state) != color:
+                    return 400, {"error": "It's not your turn.", **game_view(game, uid)}
                 try:
-                    move = chess.Move.from_uci(str(body.get("move", "")))
+                    state = rules.play(state, move)
                 except ValueError:
-                    move = None
-                if (color == "white") != board.turn or move not in board.legal_moves:
-                    return 400, {"error": "That move isn't allowed.", **chess_view(game, uid)}
-                board.push(move)
-                record_move(game, move.uci())
+                    return 400, {"error": "That move isn't allowed.", **game_view(game, uid)}
+                record_move(game, move)
                 game["draw_offer"] = None  # moving declines a pending offer
-                outcome = board.outcome(claim_draw=True)
-                if outcome:
-                    await finish_game(game, board, outcome.result(), CHESS_REASONS.get(outcome.termination.name, "the rules"))
-                await play_bot_move(game, board)
+                await advance(game, rules, state)
             elif action == "resign":
-                await finish_game(game, board, "0-1" if color == "white" else "1-0", "resignation")
+                await finish_game(game, OTHER[color], "resignation")
             elif action == "offer_draw" and game.get("bot_level"):
-                return 400, {"error": "Laden doesn't do draws. Play on or resign!", **chess_view(game, uid)}
+                return 400, {"error": "Laden doesn't do draws. Play on or resign!", **game_view(game, uid)}
             elif action == "offer_draw":
                 game["draw_offer"] = uid
             elif action == "accept_draw" and game.get("draw_offer") not in (None, uid):
-                await finish_game(game, board, "1/2-1/2", "agreement")
+                await finish_game(game, "draw", "agreement")
             elif action == "decline_draw" and game.get("draw_offer") not in (None, uid):
                 game["draw_offer"] = None
             await save_game(game)
-        return 200, chess_view(game, uid)
+        return 200, game_view(game, uid)
 
 
-CHESS_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "chess.html")
+GAME_PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "games.html")
 
 
-class ChessPageHandler(tornado.web.RequestHandler):
+class GamePageHandler(tornado.web.RequestHandler):
     def get(self):
         self.set_header("Content-Type", "text/html; charset=utf-8")
         self.set_header("Cache-Control", "no-cache")
-        with open(CHESS_PAGE, encoding="utf-8") as f:
+        with open(GAME_PAGE, encoding="utf-8") as f:
             self.write(f.read())
 
 
-class ChessApiHandler(tornado.web.RequestHandler):
+class GameApiHandler(tornado.web.RequestHandler):
     async def post(self):
         try:
             body = json.loads(self.request.body or b"{}")
-            status, data = await chess_action(body)
+            status, data = await game_action(body)
         except Exception:
-            log.exception("Chess request failed")
+            log.exception("Game request failed")
             status, data = 500, {"error": "Something went wrong. Try again."}
         self.set_status(status)
         self.set_header("Content-Type", "application/json")
@@ -2538,27 +2564,27 @@ class AliveHandler(tornado.web.RequestHandler):
         self.write("Laden is awake.")
 
 
-chess_bot = None  # the Bot, set at startup so web requests can post to the group
+game_bot = None  # the Bot, set at startup so web requests can post to the group
 
 
 async def run_web(app, public_url):
-    """Webhook mode with our own web server, so the same port also serves the chess Mini App."""
-    global chess_bot
+    """Webhook mode with our own web server, so the same port also serves the games Mini App."""
+    global game_bot
     secret = hashlib.sha256(TELEGRAM_TOKEN.encode()).hexdigest()
     web = tornado.web.Application([
         (r"/telegram", TelegramWebhookHandler, {"app": app, "secret": secret}),
-        (r"/chess", ChessPageHandler),
-        (r"/chess/api", ChessApiHandler),
+        (r"/chess", GamePageHandler),  # the Mini App's address in BotFather; it hosts every game
+        (r"/chess/api", GameApiHandler),
         (r"/", AliveHandler),
     ])
     async with app:
-        chess_bot = app.bot
+        game_bot = app.bot
         await on_startup(app)
         await app.start()
         web.listen(int(os.getenv("PORT", "8443")), "0.0.0.0")
         # Telegram sends the secret back on every request so strangers can't post fake updates
         await app.bot.set_webhook(f"{public_url.rstrip('/')}/telegram", secret_token=secret)
-        log.info("Chess Mini App: %s/chess", public_url.rstrip("/"))
+        log.info("Games Mini App: %s/chess", public_url.rstrip("/"))
         try:
             await asyncio.Event().wait()
         finally:
@@ -2567,7 +2593,7 @@ async def run_web(app, public_url):
 
 async def on_startup(app):
     await register_commands(app)
-    asyncio.create_task(watch_chess_clocks())
+    asyncio.create_task(watch_game_clocks())
     asyncio.create_task(find_stockfish())  # fetch the chess engine now, so the first game against Laden is quick
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if public_url:
@@ -2588,7 +2614,10 @@ async def register_commands(app):
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
-        ("chessmatch", "Play chess: @someone, open slot, or 'bot 1-8' vs Laden"),
+        ("chessmatch", "Play chess: @someone, open slot, or Laden"),
+        ("othello", "Play othello: @someone, open slot, or Laden"),
+        ("checkers", "Play checkers: @someone, open slot, or Laden"),
+        ("go", "Play go (9×9): @someone, open slot, or Laden"),
         ("mock", "Reply to a message to mOcK iT"),
         ("ppcheck", "Measure a random member's pp (or @someone / reply)"),
         ("imitate", "Repeat text, or copy everyone (reply: copy one person)"),
@@ -2714,8 +2743,9 @@ def main():
     app.add_handler(CommandHandler("mock", mock))
     app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
-    app.add_handler(CommandHandler("chessmatch", chessmatch))
-    app.add_handler(CallbackQueryHandler(chess_menu, pattern=r"^chess\|"))
+    for kind, command in GAME_COMMANDS.items():
+        app.add_handler(CommandHandler(command, game_command(kind)))
+    app.add_handler(CallbackQueryHandler(game_menu, pattern=r"^game\|"))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
@@ -2743,8 +2773,8 @@ def main():
         log.info("Webhook mode: %s", public_url)
         asyncio.run(run_web(app, public_url))
     else:
-        global chess_bot
-        chess_bot = app.bot
+        global game_bot
+        game_bot = app.bot
         app.run_polling()
 
 
