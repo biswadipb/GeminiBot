@@ -40,6 +40,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -2025,8 +2026,29 @@ def bot_level_from(words):
     return min(max(level, 1), 8)
 
 
-async def start_bot_game(update, context, level):
-    msg, user, chat = update.message, update.effective_user, update.effective_chat
+async def post_game(update, context, game, text, menu=None):
+    """Post the game with its "Open board" button, or turn the picker menu message into that post."""
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game["id"]))]])
+    text += "\n\nMoves stay private until the game ends; then I'll post the result and the notation here."
+    if menu:
+        await menu.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=button)
+        game["message_id"] = menu.message_id
+    else:
+        sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=button,
+                                               do_quote=is_group(update))
+        game["message_id"] = sent.message_id
+
+
+def too_many_games(user_id):
+    open_games = [g for g in chess_games.values() if g["status"] != "over" and user_id in
+                  ((g.get("white") or {}).get("id"), (g.get("black") or {}).get("id"))]
+    if len(open_games) >= CHESS_MAX_OPEN:
+        return f"You already have {len(open_games)} unfinished games. Finish or resign one first."
+    return None
+
+
+async def start_bot_game(update, context, level, menu=None):
+    user, chat = update.effective_user, update.effective_chat
     me = {"id": user.id, "name": user.full_name}
     laden = {"id": context.bot.id, "name": f"Laden 🤖 (level {level})", "bot": True}
     my_color = random.choice(["white", "black"])
@@ -2036,11 +2058,8 @@ async def start_bot_game(update, context, level):
             "moves": [], "status": "playing", "result": None, "reason": None, "draw_offer": None,
             "created": int(time.time())}
     text = (f"♟ <b>{html.escape(user.full_name)}</b> ({my_color.capitalize()}) takes on <b>Laden 🤖</b> "
-            f"at level {level}/8 (Stockfish).\n\nMoves stay private until the game ends; then I'll post "
-            "the result and the notation here.")
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game["id"]))]])
-    sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=button, do_quote=is_group(update))
-    game["message_id"] = sent.message_id
+            f"at level {level}/8 (Stockfish).")
+    await post_game(update, context, game, text, menu)
     await play_bot_move(game, chess.Board())  # Laden opens when it has White
     await save_game(game)
 
@@ -2053,14 +2072,17 @@ async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sorry, this bot is private.")
         return
     msg, user, chat = update.message, update.effective_user, update.effective_chat
-    open_games = [g for g in chess_games.values() if g["status"] != "over" and user.id in
-                  ((g.get("white") or {}).get("id"), (g.get("black") or {}).get("id"))]
-    if len(open_games) >= CHESS_MAX_OPEN:
-        await msg.reply_text(f"You already have {len(open_games)} unfinished games. Finish or resign one first.",
-                             do_quote=True)
+    refusal = too_many_games(user.id)
+    if refusal:
+        await msg.reply_text(refusal, do_quote=True)
         return
 
     quoted = msg.reply_to_message
+    if not context.args and not quoted:  # nothing specified: let them pick with buttons
+        await msg.reply_text(f"♟ <b>{html.escape(user.full_name)}</b>, who do you want to play?\n\n"
+                             "<i>To challenge someone specific: /chessmatch @name, or reply to them with /chessmatch.</i>",
+                             parse_mode=ParseMode.HTML, reply_markup=opponent_menu(user.id), do_quote=is_group(update))
+        return
     level = bot_level_from(context.args)
     if quoted and quoted.from_user and quoted.from_user.id == context.bot.id and not context.args:
         level = CHESS_BOT_DEFAULT_LEVEL  # /chessmatch as a reply to Laden
@@ -2095,7 +2117,12 @@ async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if invited and invited.get("id") == user.id:
         await msg.reply_text("Playing yourself? Leave the slot open instead.", do_quote=True)
         return
+    await start_open_game(update, context, invited)
 
+
+async def start_open_game(update, context, invited, menu=None):
+    """A game against a person: the invited one, or anyone in the group if invited is None."""
+    user, chat = update.effective_user, update.effective_chat
     game_id = base64.urlsafe_b64encode(os.urandom(9)).decode()
     me = {"id": user.id, "name": user.full_name}
     my_color = random.choice(["white", "black"])
@@ -2107,11 +2134,57 @@ async def chessmatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"♟ <b>{html.escape(user.full_name)}</b> challenges <b>{html.escape(invited['name'])}</b> to chess!"
     else:
         text = f"♟ <b>{html.escape(user.full_name)}</b> wants to play chess. The slot is open: anyone can join!"
-    text += "\n\nMoves stay private until the game ends; then I'll post the result and the notation here."
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("♟ Open board", url=chess_link(context.bot.username, game_id))]])
-    sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=button, do_quote=is_group(update))
-    game["message_id"] = sent.message_id
+    await post_game(update, context, game, text, menu)
     await save_game(game)
+
+
+CHESS_LEVEL_LABELS = {1: "1 🐣", 2: "2", 3: "3 🙂", 4: "4", 5: "5 😤", 6: "6", 7: "7 🔥", 8: "8 💀"}
+
+
+def opponent_menu(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Anyone (open slot)", callback_data=f"chess|open|{user_id}")],
+        [InlineKeyboardButton("🤖 Laden (Stockfish)", callback_data=f"chess|bot|{user_id}")],
+    ])
+
+
+def level_menu(user_id):
+    buttons = [InlineKeyboardButton(label, callback_data=f"chess|lvl{n}|{user_id}") for n, label in CHESS_LEVEL_LABELS.items()]
+    return InlineKeyboardMarkup([buttons[:4], buttons[4:],
+                                 [InlineKeyboardButton("⬅️ Back", callback_data=f"chess|back|{user_id}")]])
+
+
+async def chess_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buttons under "/chessmatch": pick an open game or Laden, then Laden's level. Only the asker can press them."""
+    query = update.callback_query
+    _, choice, owner = query.data.split("|")
+    if update.effective_user.id != int(owner):
+        await query.answer("This menu isn't yours. Start your own with /chessmatch ♟", show_alert=True)
+        return
+    if await ignored_while_off(update) or await muted(update, context):
+        await query.answer()
+        return
+    name = html.escape(update.effective_user.full_name)
+    if choice == "bot":
+        await query.answer()
+        await query.edit_message_text(f"🤖 <b>{name}</b>, how strong should Laden be?\n\n"
+                                      "1 = beginner · 3 = casual · 5 = club player · 8 = grandmaster+",
+                                      parse_mode=ParseMode.HTML, reply_markup=level_menu(update.effective_user.id))
+        return
+    if choice == "back":
+        await query.answer()
+        await query.edit_message_text(f"♟ <b>{name}</b>, who do you want to play?", parse_mode=ParseMode.HTML,
+                                      reply_markup=opponent_menu(update.effective_user.id))
+        return
+    refusal = too_many_games(update.effective_user.id)
+    if refusal:
+        await query.answer(refusal, show_alert=True)
+        return
+    await query.answer()
+    if choice == "open":
+        await start_open_game(update, context, None, menu=query.message)
+    elif choice.startswith("lvl"):
+        await start_bot_game(update, context, int(choice[3:]), menu=query.message)
 
 
 async def edit_chess_message(game, text):
@@ -2481,6 +2554,7 @@ def main():
     app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
     app.add_handler(CommandHandler("chessmatch", chessmatch))
+    app.add_handler(CallbackQueryHandler(chess_menu, pattern=r"^chess\|"))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
