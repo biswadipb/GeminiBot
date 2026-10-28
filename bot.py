@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl, quote, urlparse
 import chess
 import chess.engine
 from boardgames import GAMES, OTHER, PARTY_GAMES
+import gameimages
 import httpx
 import tornado.web
 from ddgs import DDGS
@@ -2164,6 +2165,13 @@ async def watch_game_clocks():
     while True:
         await asyncio.sleep(10)
         for game in list(board_games.values()):
+            if game["status"] == "waiting":
+                try:
+                    async with game_locks.setdefault(game["id"], asyncio.Lock()):
+                        await close_if_stale(game)
+                except Exception:
+                    log.exception("Waiting room check failed")
+                continue
             if clock_running(game) or (game.get("party") and game["status"] == "playing"):
                 try:
                     async with game_locks.setdefault(game["id"], asyncio.Lock()):
@@ -2405,6 +2413,28 @@ async def edit_game_message(game, text):
         log.info("Could not edit game message: %s", e)
 
 
+async def post_result(game, picture, summary, details):
+    """The final board as a picture, captioned with the result; details (like the notation) follow as text
+    if they don't fit in a caption."""
+    reply = ReplyParameters(game["message_id"], allow_sending_without_reply=True)
+    caption = f"{summary}\n\n{details}"
+    try:
+        if len(re.sub(r"<[^>]+>", "", caption)) <= 1000:  # Telegram captions stop at 1024 characters
+            await game_bot.send_photo(game["chat_id"], picture, caption=caption, parse_mode=ParseMode.HTML,
+                                      reply_parameters=reply)
+            return
+        sent = await game_bot.send_photo(game["chat_id"], picture, caption=summary, parse_mode=ParseMode.HTML,
+                                         reply_parameters=reply)
+        await game_bot.send_message(game["chat_id"], details, parse_mode=ParseMode.HTML,
+                                    reply_parameters=ReplyParameters(sent.message_id, allow_sending_without_reply=True))
+    except Exception:
+        log.exception("Could not post the result picture; sending text only")
+        try:
+            await game_bot.send_message(game["chat_id"], caption, parse_mode=ParseMode.HTML, reply_parameters=reply)
+        except Exception:
+            log.exception("Could not post the game result")
+
+
 async def finish_game(game, winner, reason):
     """winner: "white", "black", or None/"draw"."""
     ticking = clock_running(game)
@@ -2419,14 +2449,13 @@ async def finish_game(game, winner, reason):
         headline = f"🤝 <b>{names['white']}</b> and <b>{names['black']}</b> drew by {reason}"
     else:
         headline = f"🏆 <b>{names[winner]}</b> ({winner.capitalize()}) beat <b>{names[OTHER[winner]]}</b> by {reason}"
-    _, labels, _ = game_history(rules, game["moves"])
-    text = (f"{rules.emoji} <b>{rules.title} result</b>\n{headline} after {moves} move{'s' * (moves != 1)}.\n\n"
-            f"<b>Notation</b>\n<blockquote expandable>{html.escape(game_notation(game, labels))}</blockquote>")
-    try:
-        await game_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
-                                    reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
-    except Exception:
-        log.exception("Could not post the game result")
+    snapshots, labels, _ = game_history(rules, game["moves"])
+    summary = f"{rules.emoji} <b>{rules.title} result</b>\n{headline} after {moves} move{'s' * (moves != 1)}."
+    notation = f"<b>Notation</b>\n<blockquote expandable>{html.escape(game_notation(game, labels))}</blockquote>"
+    plain = re.sub(r"<[^>]+>", "", html.unescape(headline)).replace("🏆 ", "").replace("🤝 ", "")
+    picture = await asyncio.to_thread(gameimages.board_game_picture, game, snapshots[-1],
+                                      game["moves"][-1] if game["moves"] else None, plain)
+    await post_result(game, picture, summary, notation)
     await edit_game_message(game, f"{rules.emoji} {versus(game)}: game over. The result is below.")
 
 
@@ -2497,6 +2526,9 @@ async def game_action(body):
     action, uid = body.get("action", "state"), user["id"]
     name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Player"
     rules = game_rules(game)
+    if game["status"] == "waiting":
+        async with game_locks.setdefault(game["id"], asyncio.Lock()):
+            await close_if_stale(game)
     if game.get("party"):
         async with game_locks.setdefault(game["id"], asyncio.Lock()):
             return await party_action(game, user, action, body)
@@ -2561,6 +2593,8 @@ async def game_action(body):
 
 PARTY_COMMANDS = {"snakes": "snakesandladders", "ludo": "ludo"}
 TURN_SECONDS = 60  # after this, Laden rolls or moves for whoever's turn it is, so nobody can stall the game
+ABANDON_AFTER = 5  # a game ends as abandoned once every person has had this many turns in a row played for them
+WAITING_ROOM_SECONDS = 30 * 60  # a game nobody started is closed after this
 PARTY_LOG = 30  # recent events shown on the board
 LUDO_BOTS = ["Laden 🤖", "Laden's bro 🤖", "Laden's sis 🤖"]  # computer players for ludo, in the order they join
 
@@ -2752,13 +2786,9 @@ async def finish_party(game):
     else:
         standings = sorted(range(len(names)), key=lambda i: -state["pos"][i])
         detail = "\n".join(f"{n}. {html.escape(names[i])} – square {state['pos'][i]}" for n, i in enumerate(standings, 1))
-    text = (f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!\n\n"
-            f"<blockquote expandable>{detail}</blockquote>")
-    try:
-        await game_bot.send_message(game["chat_id"], text, parse_mode=ParseMode.HTML,
-                                    reply_parameters=ReplyParameters(game["message_id"], allow_sending_without_reply=True))
-    except Exception:
-        log.exception("Could not post the game result")
+    summary = f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!"
+    picture = await asyncio.to_thread(gameimages.party_picture, game, f"{names[state['winner']]} won!")
+    await post_result(game, picture, summary, f"<blockquote expandable>{detail}</blockquote>")
     joined = ", ".join(f"<b>{html.escape(n)}</b>" for n in names)
     await edit_game_message(game, f"{rules.emoji} {rules.title}: {joined}. Game over – the result is below.")
 
@@ -2768,6 +2798,13 @@ async def party_turn_timeout(game):
     if game["status"] != "playing" or time.time() - game.get("turn_started", 0) < TURN_SECONDS:
         return False
     rules, state = PARTY_GAMES[game["kind"]], game["state"]
+    idle = game.setdefault("idle", {})
+    seat = str(state["turn"])
+    idle[seat] = idle.get(seat, 0) + 1
+    people = [str(i) for i, p in enumerate(game["players"]) if not p.get("bot")]
+    if all(idle.get(i, 0) >= ABANDON_AFTER for i in people):
+        await abandon_party(game)
+        return True
     name = game["players"][state["turn"]]["name"]
     events = [f"⏱ {name} took too long, so Laden played for them"] + rules.auto(state)
     party_log(game, events)
@@ -2775,6 +2812,32 @@ async def party_turn_timeout(game):
     if state["winner"] is not None:
         await finish_party(game)
     await save_game(game)
+    return True
+
+
+async def abandon_party(game):
+    """Everyone has wandered off: end the game quietly instead of letting it play itself for hours."""
+    rules = PARTY_GAMES[game["kind"]]
+    game.update(status="over", result="abandoned", ended=int(time.time()))
+    await save_game(game)
+    names = ", ".join(html.escape(n) for n in party_names(game))
+    try:
+        await game_bot.send_message(game["chat_id"], f"{rules.emoji} {rules.title} abandoned: nobody has played for "
+                                    f"{ABANDON_AFTER} turns.", reply_parameters=ReplyParameters(
+                                        game["message_id"], allow_sending_without_reply=True))
+    except Exception:
+        log.exception("Could not post the abandoned note")
+    await edit_game_message(game, f"{rules.emoji} {rules.title} ({names}): abandoned.")
+
+
+async def close_if_stale(game):
+    """Close a waiting room nobody started within 30 minutes. Returns True if it did."""
+    if game["status"] != "waiting" or time.time() - game.get("created", time.time()) < WAITING_ROOM_SECONDS:
+        return False
+    rules = game_rules(game)
+    game.update(status="over", result="cancelled", reason="expired")
+    await save_game(game)
+    await edit_game_message(game, f"{rules.emoji} {rules.title}: closed, nobody started it within 30 minutes.")
     return True
 
 
@@ -2872,6 +2935,7 @@ async def party_action(game, user, action, body):
                 events = rules.move(state, int(body.get("token", -1)))
         except (ValueError, TypeError) as e:
             return 400, {"error": str(e).capitalize() + ".", **party_view(game, user)}
+        game.setdefault("idle", {})[str(me)] = 0  # they're here
         party_log(game, events)
         await run_bots(game)
         if state["winner"] is not None and game["status"] == "playing":

@@ -779,7 +779,10 @@ function partyStatus() {
   const s = state, st = s.state, el = document.getElementById("pstatus");
   if (!st || !el) return;
   el.className = "status";
-  if (s.status === "over") { el.textContent = `🏆 ${s.players[st.winner].name} won!`; el.classList.add("strong"); return; }
+  if (s.status === "over") {
+    el.textContent = st.winner === null ? "Game abandoned: nobody was playing." : `🏆 ${s.players[st.winner].name} won!`;
+    el.classList.add("strong"); return;
+  }
   const left = Math.max(0, Math.round(s.seconds_left - (performance.now() - s.receivedAt) / 1000));
   if (s.you === st.turn) {
     el.textContent = (st.phase === "roll" ? "Your turn: roll!" : `You rolled ${st.dice}: tap a token to move.`) + ` ⏱ ${left}s`;
