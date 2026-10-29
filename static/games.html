@@ -795,12 +795,17 @@ function frame(fresh, changes) {
 }
 
 async function animateSnakes(old, fresh) {
-  const L = fresh.layout, pos = [...old.state.pos], dice = fresh.state.dice;
+  const L = fresh.layout, pos = [...old.state.pos];
+  const rolled = fresh.state.last_roll || [];
   frame(fresh, { pos: [...pos] });
   for (let i = 0; i < pos.length; i++) {
     const a = old.state.pos[i], b = fresh.state.pos[i];
-    if (a === b) continue;
-    const landed = a + dice, jump = landed <= 100 && landed !== b && (L.ladders[landed] === b || L.snakes[landed] === b);
+    // each player's own last roll (several players can move between two updates)
+    const dice = rolled[i] || fresh.state.dice, landed = a + dice;
+    const jump = landed <= 100 && landed !== b && (L.ladders[landed] === b || L.snakes[landed] === b);
+    // a snake can drop you back where you started (e.g. 53 → 56 → 53): still show the move, but only if this
+    // player really rolled (their turn has passed since the old state)
+    if (a === b && !(jump && old.state.turn === i && fresh.state.rolls !== old.state.rolls)) continue;
     const end = jump ? landed : (b > a && b - a <= 6 ? b : null);
     if (end !== null) {
       for (let sq = a + 1; sq <= end; sq++) { pos[i] = sq; frame(fresh, { pos: [...pos] }); await sleep(180); }

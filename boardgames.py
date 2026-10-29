@@ -1325,6 +1325,7 @@ class SnakesAndLadders(PartyGame):
         dice = dice or roll_die()
         me = state["turn"]
         state["dice"], state["rolls"] = dice, state["rolls"] + 1
+        state.setdefault("last_roll", [None] * len(state["pos"]))[me] = dice  # so the board can replay each move
         here, target = state["pos"][me], state["pos"][me] + dice
         if target > 100:
             events = [f"{{{me}}} rolled {dice} but needs exactly {100 - here} to finish"]
