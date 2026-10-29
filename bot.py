@@ -2153,7 +2153,7 @@ def bot_to_move(game):
         return False
     if game.get("party"):
         state = game["state"]
-        return state["winner"] is None and bool(game["players"][state["turn"]].get("bot"))
+        return not state.get("over") and bool(game["players"][state["turn"]].get("bot"))
     rules = game_rules(game)
     state = rules.replay(game["moves"])
     return not rules.outcome(state) and bool((game.get(rules.turn(state)) or {}).get("bot"))
@@ -2190,8 +2190,7 @@ async def bot_step(game):
     if game.get("party"):
         rules, state = PARTY_GAMES[game["kind"]], game["state"]
         party_log(game, rules.auto(state))
-        if state["winner"] is not None:
-            await finish_party(game)
+        await check_party_end(game)
     else:
         rules = game_rules(game)
         state = rules.replay(game["moves"])
@@ -2677,9 +2676,35 @@ def bot_count(words):
 
 async def run_bots(game):
     """Hand over to the bots if it's their turn (they play in the background, one action at a time)."""
-    if game["status"] == "playing" and game["state"]["winner"] is not None:
-        await finish_party(game)
+    await check_party_end(game)
     schedule_bots(game)
+
+
+async def check_party_end(game):
+    """End the game once at most one player is still playing - or once only bots are, since then every person
+    has finished or left: bots are placed by how far they got. Nobody finished and everyone left = abandoned."""
+    if game["status"] != "playing":
+        return
+    rules, state = PARTY_GAMES[game["kind"]], game["state"]
+    if not state.get("over"):
+        people_playing = [i for i in rules.active(state) if not game["players"][i].get("bot")]
+        if people_playing:
+            return
+        if not any(not game["players"][i].get("bot") for i in state.get("finished") or []):
+            await save_game(game)
+            await abandon_party(game, "everyone left")
+            return
+        state["over"] = True
+    if state.get("winner") is None:  # nobody reached the end: the furthest player takes 1st
+        state["winner"] = rules.standings(state, party_progress(game))[0]
+    await finish_party(game)
+
+
+def party_progress(game):
+    state = game["state"]
+    if game["kind"] == "ludo":
+        return lambda i: sum(p == 56 for p in state["tokens"][i]) * 1000 + sum(max(p, 0) for p in state["tokens"][i])
+    return lambda i: state["pos"][i]
 
 
 def party_names(game):
@@ -2837,14 +2862,14 @@ async def finish_party(game):
     game.update(status="over", result=state["winner"], ended=int(time.time()))
     names = party_names(game)
     left = state.get("left") or [False] * len(names)
+    standings = rules.standings(state, party_progress(game))
+    state["standings"] = standings
     if game["kind"] == "ludo":
-        home = lambda i: sum(p == 56 for p in state["tokens"][i])
-        standings = rules.standings(state, lambda i: home(i) * 1000 + sum(max(p, 0) for p in state["tokens"][i]))
-        info = lambda i: f"{home(i)}/4 tokens home"
+        info = lambda i: f"{sum(p == 56 for p in state['tokens'][i])}/4 tokens home"
     else:
-        standings = rules.standings(state, lambda i: state["pos"][i])
         info = lambda i: f"square {state['pos'][i]}"
-    detail = "\n".join(f"{n}. {html.escape(names[i])} – {info(i)}{' (left)' if left[i] else ''}"
+    medals = {1: "🏆", 2: "🥈", 3: "🥉"}
+    detail = "\n".join(f"{medals.get(n, f'{n}.')} {html.escape(names[i])} – {info(i)}{' (left)' if left[i] else ''}"
                        for n, i in enumerate(standings, 1))
     summary = f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!"
     picture = await asyncio.to_thread(gameimages.party_picture, game, f"{names[state['winner']]} won!")
@@ -2861,17 +2886,19 @@ async def party_turn_timeout(game):
     idle = game.setdefault("idle", {})
     seat = str(state["turn"])
     idle[seat] = idle.get(seat, 0) + 1
-    gone = state.get("left") or []
-    people = [str(i) for i, p in enumerate(game["players"]) if not p.get("bot") and not (gone and gone[i])]
+    people = [str(i) for i in rules.active(state) if not game["players"][i].get("bot")]
     if all(idle.get(i, 0) >= ABANDON_AFTER for i in people):
-        await abandon_party(game)
+        if any(not game["players"][i].get("bot") for i in state.get("finished") or []):
+            state["over"] = True  # someone finished: end with places rather than abandoning
+            await check_party_end(game)
+        else:
+            await abandon_party(game)
+        await save_game(game)
         return True
     name = game["players"][state["turn"]]["name"]
     events = [f"⏱ {name} took too long, so Laden played for them"] + rules.auto(state)
     party_log(game, events)
     await run_bots(game)
-    if state["winner"] is not None:
-        await finish_party(game)
     await save_game(game)
     return True
 
@@ -2906,7 +2933,7 @@ async def close_if_stale(game):
 def party_view(game, user):
     rules, user_id = PARTY_GAMES[game["kind"]], user["id"]
     me = next((i for i, p in enumerate(game["players"]) if p["id"] == user_id), None)
-    view = {"kind": rules.kind, "party": True, "title": rules.title, "status": game["status"],
+    view = {"kind": rules.kind, "party": True, "title": rules.title, "status": game["status"], "result": game.get("result"),
             "version": game.get("version", 0), "you": me, "min": rules.min_players, "max": rules.max_players,
             "players": [{"name": p["name"], "colour": p.get("colour"), "bot": p.get("bot", False)} for p in game["players"]]}
     if game["status"] == "waiting":
@@ -2983,20 +3010,10 @@ async def party_action(game, user, action, body):
             await edit_game_message(game, f"{rules.emoji} {rules.title} game cancelled.")
     elif action == "leave":
         state = game["state"]
-        if game["status"] != "playing" or me is None or (state.get("left") or [False] * 9)[me]:
-            return 400, {"error": "You're not in this game.", **party_view(game, user)}
+        if game["status"] != "playing" or me is None or me not in rules.active(state):
+            return 400, {"error": "You're not playing in this game any more.", **party_view(game, user)}
         party_log(game, rules.leave(state, me))
-        still_here = [i for i, p in enumerate(game["players"]) if not p.get("bot") and not state["left"][i]]
-        if state["winner"] is not None:
-            await finish_party(game)
-        elif not still_here:
-            await save_game(game)
-            await abandon_party(game, "everyone left")
-            return 200, party_view(game, user)
-        else:
-            await run_bots(game)
-            if state["winner"] is not None and game["status"] == "playing":
-                await finish_party(game)
+        await run_bots(game)
         await save_game(game)
     elif action in ("roll", "move"):
         state = game["state"]
@@ -3018,8 +3035,6 @@ async def party_action(game, user, action, body):
         game.setdefault("idle", {})[str(me)] = 0  # they're here
         party_log(game, events)
         await run_bots(game)
-        if state["winner"] is not None and game["status"] == "playing":
-            await finish_party(game)
         await save_game(game)
     return 200, party_view(game, user)
 

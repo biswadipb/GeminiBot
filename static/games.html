@@ -773,6 +773,7 @@ function closeMoves() { document.getElementById("sheet").classList.remove("open"
 let slide = {};  // player -> [x, y] while their counter slides along a snake or ladder
 let animating = false, queuedState = null;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const pace = ms => sleep(queuedState ? ms * .3 : ms);  // newer moves are waiting: hurry to catch up
 
 async function showParty(fresh) {
   // Show a new dice-game state, moving counters and tokens step by step instead of jumping
@@ -808,12 +809,12 @@ async function animateSnakes(old, fresh) {
     if (a === b && !(jump && old.state.turn === i && fresh.state.rolls !== old.state.rolls)) continue;
     const end = jump ? landed : (b > a && b - a <= 6 ? b : null);
     if (end !== null) {
-      for (let sq = a + 1; sq <= end; sq++) { pos[i] = sq; frame(fresh, { pos: [...pos] }); await sleep(180); }
+      for (let sq = a + 1; sq <= end; sq++) { pos[i] = sq; frame(fresh, { pos: [...pos] }); await pace(140); }
     }
     if (jump) {  // slide along the ladder or snake
-      await sleep(150);
+      await pace(120);
       const [x1, y1] = snakesCell(landed), [x2, y2] = snakesCell(b);
-      for (let k = 1; k <= 12; k++) { slide = { [i]: [x1 + (x2 - x1) * k / 12, y1 + (y2 - y1) * k / 12] }; frame(fresh, { pos: [...pos] }); await sleep(45); }
+      for (let k = 1; k <= 12; k++) { slide = { [i]: [x1 + (x2 - x1) * k / 12, y1 + (y2 - y1) * k / 12] }; frame(fresh, { pos: [...pos] }); await pace(35); }
       slide = {};
     }
     pos[i] = b; frame(fresh, { pos: [...pos] });
@@ -828,11 +829,11 @@ async function animateLudo(old, fresh) {
     const a = old.state.tokens[i][t], b = fresh.state.tokens[i][t];
     if (a === b) continue;
     if (b === -1) { captured.push([i, t]); continue; }  // knocked back: shown after the move that did it
-    if (a === -1) { tokens[i][t] = 0; frame(fresh, { tokens: tokens.map(x => [...x]) }); await sleep(250); continue; }
-    for (let p = a + 1; p <= b; p++) { tokens[i][t] = p; frame(fresh, { tokens: tokens.map(x => [...x]) }); await sleep(150); }
+    if (a === -1) { tokens[i][t] = 0; frame(fresh, { tokens: tokens.map(x => [...x]) }); await pace(200); continue; }
+    for (let p = a + 1; p <= b; p++) { tokens[i][t] = p; frame(fresh, { tokens: tokens.map(x => [...x]) }); await pace(110); }
   }
   if (captured.length) {
-    await sleep(200);
+    await pace(160);
     for (const [i, t] of captured) tokens[i][t] = -1;
     frame(fresh, { tokens: tokens.map(x => [...x]) });
   }
@@ -880,9 +881,10 @@ function renderParty() {
 
   document.getElementById("plist").innerHTML = s.players.map((p, i) => {
     const info = s.kind === "ludo" ? `${st.tokens[i].filter(t => t === 56).length}/4 home` : (st.pos[i] ? `on ${st.pos[i]}` : "at start");
-    const gone = (s.left || [])[i];
+    const gone = (s.left || [])[i], place = (st.standings || st.finished || []).indexOf(i) + 1;
+    const badge = place && !gone ? `${["🏆", "🥈", "🥉"][place - 1] || "🏁"} ${ordinal(place)}` : gone ? "left" : info;
     return `<span class="pchip${i === st.turn && s.status === "playing" ? " turn" : ""}"${gone ? ' style="opacity:.5"' : ""}><span class="pdot" style="background:${playerColour(i)}"></span>` +
-      `${esc(p.name)}${i === s.you ? " (you)" : ""} <span class="pinfo">${gone ? "left" : info}</span></span>`;
+      `${esc(p.name)}${i === s.you ? " (you)" : ""} <span class="pinfo">${badge}</span></span>`;
   }).join("");
 
   document.getElementById("pboard").innerHTML = s.kind === "ludo" ? ludoBoard() : snakesBoard();
@@ -897,20 +899,25 @@ function renderParty() {
   btn.classList.toggle("hidden", s.status !== "playing");
   partyStatus();
   document.getElementById("plog").innerHTML = s.log.slice(-8).reverse().map(e => `<div>${esc(e)}</div>`).join("");
-  const iLeft = s.you !== null && (s.left || [])[s.you];
+  const iLeft = s.you !== null && ((s.left || [])[s.you] || (st.finished || []).includes(s.you));
   document.getElementById("leaveBtn").classList.toggle("hidden", s.status !== "playing" || s.you === null || iLeft);
 }
+
+function ordinal(n) { return n + ((n % 100 >= 11 && n % 100 <= 13) ? "th" : ({ 1: "st", 2: "nd", 3: "rd" }[n % 10] || "th")); }
 
 function partyStatus() {
   const s = state, st = s.state, el = document.getElementById("pstatus");
   if (!st || !el) return;
   el.className = "status";
   if (s.status === "over") {
-    el.textContent = st.winner === null ? "Game abandoned: nobody was playing." : `🏆 ${s.players[st.winner].name} won!`;
+    el.textContent = s.result === "abandoned" || st.winner === null ? "Game abandoned: nobody was playing." : `🏆 ${s.players[st.winner].name} won!`;
     el.classList.add("strong"); return;
   }
   const left = Math.max(0, Math.round(s.seconds_left - (performance.now() - s.receivedAt) / 1000));
-  if (s.you !== null && (s.left || [])[s.you]) {
+  const myPlace = s.you !== null ? (st.finished || []).indexOf(s.you) + 1 : 0;
+  if (myPlace) {
+    el.textContent = `You finished ${ordinal(myPlace)}! The others play on. ${s.players[st.turn].name}'s turn ⏱ ${left}s`;
+  } else if (s.you !== null && (s.left || [])[s.you]) {
     el.textContent = `You left the game. ${s.players[st.turn].name}'s turn ⏱ ${left}s`;
   } else if (s.you === st.turn) {
     el.textContent = (st.phase === "roll" ? "Your turn: roll!" : `You rolled ${st.dice}: tap a token to move.`) + ` ⏱ ${left}s`;
@@ -1147,7 +1154,8 @@ async function poll() {
       }
     } catch (e) {}
   }
-  setTimeout(poll, botToMove() || animating ? 500 : 2000);  // check often while a bot is playing
+  const quick = botToMove() || animating || (state && state.party && state.status === "playing");
+  setTimeout(poll, quick ? (botToMove() ? 500 : 600) : 2000);  // check often during dice games and while a bot plays
 }
 
 (async () => {

@@ -1274,39 +1274,67 @@ class PartyGame:
     kind = title = emoji = ""
     min_players, max_players = 2, 4
 
-    def next_turn(self, state):
-        """The next player who hasn't left the game."""
+    # The game goes on after the first player finishes, until everyone has a place: players who finish get
+    # 1st, 2nd, ... in order; the game ends when one player (or none) is still playing, and that player is placed
+    # after everyone who finished; players who left come last.
+
+    def active(self, state):
+        """Players still playing: not finished and not left."""
         count = len(state["players_done"])
         left = state.get("left") or [False] * count
+        done = state.get("finished") or []
+        return [i for i in range(count) if not left[i] and i not in done]
+
+    def next_turn(self, state):
+        """The next player who is still playing."""
+        count = len(state["players_done"])
+        playing = self.active(state)
         for step in range(1, count + 1):
             following = (state["turn"] + step) % count
-            if not left[following]:
+            if following in playing:
                 state["turn"] = following
                 break
         state["phase"] = "roll"
 
+    def finish(self, state, player):
+        """This player is done: give them the next place. Returns the event, and ends the game if at most
+        one player is still playing."""
+        finished = state.setdefault("finished", [])
+        finished.append(player)
+        if state.get("winner") is None:
+            state["winner"] = player
+        place = len(finished)
+        medal = {1: "🏆", 2: "🥈", 3: "🥉"}.get(place, "🏁")
+        events = [f"{medal} {{{player}}} finished {ordinal(place)}!"]
+        if len(self.active(state)) <= 1:
+            state["over"] = True
+        return events
+
     def leave(self, state, player):
         """The player leaves: their pieces stay frozen where they are, their turns are skipped, and they're
-        ranked last. If only one player is left, they win."""
+        ranked last. If at most one player is still playing, the game ends."""
         count = len(state["players_done"])
         state.setdefault("left", [False] * count)[player] = True
         state.setdefault("left_order", []).append(player)
         events = [f"🚪 {{{player}}} left the game"]
-        active = [i for i in range(count) if not state["left"][i]]
-        if len(active) == 1:
-            state["winner"] = active[0]
-            events.append(f"🏆 {{{active[0]}}} is the last one standing!")
+        if len(self.active(state)) <= 1:
+            state["over"] = True
+            if state.get("winner") is None and self.active(state):
+                state["winner"] = self.active(state)[0]  # last one standing
         elif state["turn"] == player:
             state["sixes"] = 0
             self.next_turn(state)
         return events
 
     def standings(self, state, progress):
-        """Players still in, best first (winner on top), then those who left - the earliest leaver last."""
-        count = len(state["players_done"])
-        left = state.get("left") or [False] * count
-        playing = sorted((i for i in range(count) if not left[i]), key=lambda i: (i != state["winner"], -progress(i)))
-        return playing + list(reversed(state.get("left_order", [])))
+        """Finishers in order, then anyone still playing (furthest first), then those who left - earliest last."""
+        done = list(state.get("finished") or [])
+        playing = sorted(self.active(state), key=lambda i: -progress(i))
+        return done + playing + list(reversed(state.get("left_order", [])))
+
+
+def ordinal(n):
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 SNAKES = {16: 6, 47: 26, 49: 11, 56: 53, 62: 19, 64: 60, 87: 24, 93: 73, 95: 75, 98: 78}
@@ -1339,9 +1367,9 @@ class SnakesAndLadders(PartyGame):
                 target = SNAKES[target]
             state["pos"][me] = target
             if target == 100:
-                state["winner"] = me
-                events.append(f"🏆 {{{me}}} reached 100!")
-                return events
+                events += self.finish(state, me)
+                if state.get("over"):
+                    return events
         self.next_turn(state)
         return events
 
@@ -1441,8 +1469,9 @@ class Ludo(PartyGame):
                         events.append(f"💥 {{{me}}} knocked {{{other}}}'s token back to base")
                         again = True
         if all(p == LUDO_HOME for p in tokens):
-            state["winner"] = me
-            events.append(f"🏆 {{{me}}} got all four tokens home!")
+            events += self.finish(state, me)
+            if not state.get("over"):
+                self.pass_turn(state)
             return events
         if again:
             state["phase"] = "roll"  # a 6, a capture or a token home: roll again

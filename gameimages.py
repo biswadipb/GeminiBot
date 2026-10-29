@@ -12,7 +12,7 @@ from bidi.algorithm import get_display
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont, features
 
-from boardgames import (GAMES, GO_SIZE, GO_STAR_POINTS, LADDERS, LUDO_HOME_COLUMNS, LUDO_OFFSET, LUDO_SAFE,
+from boardgames import (GAMES, GO_SIZE, ordinal, GO_STAR_POINTS, LADDERS, LUDO_HOME_COLUMNS, LUDO_OFFSET, LUDO_SAFE,
                         LUDO_TRACK, SNAKES, checkers_coords)
 
 SCALE = 2  # draw at twice the size and shrink at the end, for smooth edges
@@ -613,7 +613,9 @@ def party_picture(game, headline):
     state = game["state"]
     board_w = WIDTH - 2 * PAD
     players = []
-    for i, p in enumerate(game["players"]):
+    order = state.get("standings") or list(range(len(game["players"])))
+    for place, i in enumerate(order, 1):  # in finishing order: 1st, 2nd, ...
+        p = game["players"][i]
         if game["kind"] == "ludo":
             colour = LUDO[p["colour"]]
             info = f"{sum(t == 56 for t in state['tokens'][i])}/4 home"
@@ -622,7 +624,7 @@ def party_picture(game, headline):
             info = f"square {state['pos'][i]}"
         if (state.get("left") or [False] * len(game["players"]))[i]:
             info += " (left)"
-        players.append((colour, f"{clean(p['name'])} - {info}", state["winner"] == i))
+        players.append((colour, f"{ordinal(place)}  {clean(p['name'])} - {info}", state["winner"] == i))
     draw_board = (lambda img, d, x, y, w: ludo_board(img, d, x, y, w, state)) if game["kind"] == "ludo" else \
         (lambda img, d, x, y, w: snakes_board(img, d, x, y, w, state, game["players"]))
     title = "Ludo" if game["kind"] == "ludo" else "Snakes and Ladders"
