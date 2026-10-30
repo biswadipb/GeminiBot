@@ -185,10 +185,10 @@ OTHELLO_WEIGHTS = [
 
 
 class OthelloState:
-    __slots__ = ("board", "turn")
+    __slots__ = ("board", "turn", "moves")
 
     def __init__(self, board, turn):
-        self.board, self.turn = board, turn
+        self.board, self.turn, self.moves = board, turn, {}  # moves: placements per colour, worked out once
 
 
 def othello_square(index):
@@ -225,11 +225,16 @@ class Othello(Rules):
     def turn(self, state):
         return state.turn
 
+    def options(self, state, color):
+        if color not in state.moves:
+            state.moves[color] = self.placements(state.board, color)
+        return state.moves[color]
+
     def legal(self, state):
-        moves = [othello_square(i) for i in self.placements(state.board, state.turn)]
+        moves = [othello_square(i) for i in self.options(state, state.turn)]
         if moves:
             return moves
-        return ["pass"] if self.placements(state.board, OTHER[state.turn]) else []
+        return ["pass"] if self.options(state, OTHER[state.turn]) else []
 
     def forced(self, state):
         return "pass" if self.legal(state) == ["pass"] else None
@@ -286,7 +291,7 @@ class Othello(Rules):
             return 10000 * (1 if diff > 0 else -1 if diff < 0 else 0) + diff
         position = sum(w for w, d in zip(OTHELLO_WEIGHTS, state.board) if d == mine) - \
             sum(w for w, d in zip(OTHELLO_WEIGHTS, state.board) if d == theirs)
-        mobility = len(self.placements(state.board, state.turn)) - len(self.placements(state.board, OTHER[state.turn]))
+        mobility = len(self.options(state, state.turn)) - len(self.options(state, OTHER[state.turn]))
         return position + 8 * mobility
 
     def bot_move(self, state, level):
@@ -297,7 +302,7 @@ class Othello(Rules):
             return random.choice(moves)
         if level == 2:  # greedy: most discs flipped, with some randomness
             return max(moves, key=lambda m: len(self.flips(state.board, self.index(m), state.turn[0])) + random.random() * 3)
-        depth, seconds = {3: (2, 0.5), 4: (4, 1.0), 5: (6, 2.0)}[level]
+        depth, seconds = {3: (2, 0.4), 4: (4, 0.8), 5: (6, 1.4)}[level]
         return negamax_search(self, state, depth, seconds)
 
 

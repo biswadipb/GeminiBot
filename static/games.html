@@ -275,10 +275,16 @@ function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;"
 function other(c) { return c === "white" ? "black" : "white"; }
 
 async function api(action, extra) {
-  const r = await fetch("/chess/api", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, game: gameId, initData: tg ? tg.initData : "", ...extra }),
-  });
+  // give up on a request that hangs (a dropped connection), so the board never stays stuck waiting for it
+  const abort = new AbortController(), timer = setTimeout(() => abort.abort(), 12000);
+  let r;
+  try {
+    r = await fetch("/chess/api", {
+      method: "POST", headers: { "Content-Type": "application/json" }, signal: abort.signal,
+      body: JSON.stringify({ action, game: gameId, initData: tg ? tg.initData : "", ...extra }),
+    });
+  } catch (e) { throw new Error("Connection problem. Try again."); }
+  finally { clearTimeout(timer); }
   const data = await r.json().catch(() => ({ error: "Connection problem. Try again." }));
   if (data.error && !data.status) throw new Error(data.error);
   if (data.error && tg) tg.showAlert(data.error);
@@ -368,7 +374,8 @@ function render() {
   const bottom = me || s.first, top = other(bottom);
   const extras = sideInfo(s.kind, snapshot, reviewing);
   const line = c => `<span class="dot ${c}"></span><span class="info"><span class="name">${esc(s[c])}</span>${extras[c]}</span>` +
-    (s.status === "playing" && s.turn === c && !s.running ? `<span class="turn">to move</span>` : "") +
+    (s.status === "playing" && s.turn === c && s.away === c ? `<span class="turn">offline</span>` :
+     s.status === "playing" && s.turn === c && !s.running ? `<span class="turn">to move</span>` : "") +
     (s.clock ? `<span class="clock" data-color="${c}"></span>` : "");
   document.getElementById("topPlayer").innerHTML = line(top);
   document.getElementById("bottomPlayer").innerHTML = line(bottom);
@@ -395,7 +402,10 @@ function render() {
     status.textContent = s.draw_offer === "you" ? "Draw offered. Waiting for your opponent…" :
       s.bot ? `${s[them]} is thinking…` : `Waiting for ${s[them]}…`;
   }
-  if (!reviewing && s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
+  if (!reviewing && s.status === "playing" && s.away) {
+    const m = Math.floor(s.away_left / 60), sec = String(s.away_left % 60).padStart(2, "0");
+    status.textContent = `${s[s.away]}'s connection dropped. Their clock is paused; they lose if they're not back within ${m}:${sec}.`;
+  } else if (!reviewing && s.status === "playing" && s.clock && !s.running) status.textContent += " Clocks start after both sides' first moves.";
   tickClocks();
 
   const actions = document.getElementById("actions");
@@ -1149,8 +1159,11 @@ async function poll() {
         selected = null; fpath = []; fkinds = [];
         if (fresh.party) showParty(fresh); else { state = fresh; render(); }
       } else {
+        const awayChanged = fresh.away !== state.away || fresh.away_left !== state.away_left;
         state.clock = fresh.clock; state.seconds_left = fresh.seconds_left;  // stay in sync with the server's clock
+        state.running = fresh.running; state.away = fresh.away; state.away_left = fresh.away_left;
         state.receivedAt = fresh.receivedAt;
+        if (awayChanged && !fresh.party) render();
       }
     } catch (e) {}
   }

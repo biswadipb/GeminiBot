@@ -638,7 +638,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
-        "kitty · foodporn · carporn – instant pictures\n"
+        ".kitty · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -1166,7 +1166,7 @@ CARS = ["Porsche 911", "Lamborghini Huracan", "Ferrari SF90", "Nissan GT-R", "BM
         "Toyota Supra", "McLaren 720S", "Audi R8", "Mercedes-AMG GT", "Bugatti Chiron", "Aston Martin DB11",
         "Chevrolet Corvette", "Koenigsegg Jesko", "Mazda RX-7", "Rolls-Royce Phantom"]
 KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "cat close up portrait", "tabby kitten"]
-KEYWORD_PATTERN = r"(?i)^\s*(kitty|foodporn|carporn)\s*[!.]*\s*$"
+KEYWORD_PATTERN = r"(?i)^\s*(\.kitty|foodporn|carporn)\s*[!.]*\s*$"
 
 
 recent_memes = []  # recently posted meme URLs, so kitty doesn't repeat itself
@@ -1209,7 +1209,7 @@ async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return  # stay quiet for one-word triggers outside allowed chats
     keyword = context.matches[0].group(1).lower()
-    if keyword == "kitty":
+    if keyword == ".kitty":
         await send_web_photo(update, context, "", candidates=await cat_photos())  # caption = 🐱 or meme title
     elif keyword == "carporn":
         car = random.choice(CARS)
@@ -2110,10 +2110,39 @@ def clock_running(game):
     return first if len(game["moves"]) % 2 == 0 else OTHER[first]
 
 
+# A dropped connection shouldn't cost anyone the game. The board checks in every few seconds; once the player to
+# move has been silent for AWAY_AFTER seconds their clock stops, and the silent time is given back when they
+# return. Being away is capped at AWAY_LIMIT per game (about the five idle turns that end a dice game), after
+# which they lose, so nobody can stall a game forever by closing the board.
+AWAY_AFTER = 10
+AWAY_LIMIT = 5 * 60
+
+
+def away_for(game, color):
+    """How long the player to move has been silent this turn, if long enough to count as gone (else 0)."""
+    if clock_running(game) != color or (game.get(color) or {}).get("bot"):
+        return 0.0
+    silent = time.time() - max(game.get("seen", {}).get(color, 0), game["turn_started"])
+    return silent if silent > AWAY_AFTER else 0.0
+
+
+def away_used(game, color):
+    return game.get("away_used", {}).get(color, 0) + away_for(game, color)
+
+
+def check_in(game, color):
+    """The player's board was in touch: give back any time they were gone this turn."""
+    gone = away_for(game, color)
+    if gone:
+        game["turn_away"] = game.get("turn_away", 0) + gone
+        game.setdefault("away_used", {})[color] = game.get("away_used", {}).get(color, 0) + gone
+    game.setdefault("seen", {})[color] = time.time()
+
+
 def time_left(game, color):
     left = game["clock"][color]
     if clock_running(game) == color:
-        left -= time.time() - game["turn_started"]
+        left -= time.time() - game["turn_started"] - game.get("turn_away", 0) - away_for(game, color)
     return max(0.0, left)
 
 
@@ -2123,7 +2152,7 @@ def record_move(game, move):
     if color:
         game["clock"][color] = time_left(game, color)
     game["moves"].append(move)
-    game["turn_started"] = time.time()
+    game["turn_started"], game["turn_away"] = time.time(), 0
 
 
 async def advance(game, rules, state):
@@ -2172,20 +2201,31 @@ async def bot_turns(game_id):
         if not game:
             bot_tasks.pop(game_id, None)
             return
-        await asyncio.sleep(BOT_PAUSE["party" if game.get("party") else "board"])
         try:
+            started = time.time()
+            # Laden thinks without holding the game's lock, so boards keep refreshing meanwhile; its thinking
+            # counts towards the pause, so a slow move isn't followed by a wait on top
+            move = None if game.get("party") or not bot_to_move(game) else await bot_think(game)
+            await asyncio.sleep(max(0.0, BOT_PAUSE["party" if game.get("party") else "board"] - (time.time() - started)))
             async with game_locks.setdefault(game_id, asyncio.Lock()):
                 if not bot_to_move(game):
                     bot_tasks.pop(game_id, None)  # under the lock, so a new move can schedule again
                     return
-                await bot_step(game)
+                await bot_step(game, move)
         except Exception:
             log.exception("A bot turn failed")
             bot_tasks.pop(game_id, None)
             return
 
 
-async def bot_step(game):
+async def bot_think(game):
+    """Laden's move in a board game, with the number of moves it was worked out for."""
+    rules = game_rules(game)
+    seen = len(game["moves"])
+    return seen, await laden_move(game, rules, rules.replay(game["moves"]))
+
+
+async def bot_step(game, move=None):
     """One action by whichever bot is to play: a roll or token move in dice games, a move in board games."""
     if game.get("party"):
         rules, state = PARTY_GAMES[game["kind"]], game["state"]
@@ -2194,15 +2234,20 @@ async def bot_step(game):
     else:
         rules = game_rules(game)
         state = rules.replay(game["moves"])
-        move = await laden_move(game, rules, state)
-        record_move(game, move)
-        await advance(game, rules, rules.play(state, move))
+        if not move or move[0] != len(game["moves"]):  # the game moved on while Laden was thinking
+            move = await bot_think(game)
+        record_move(game, move[1])
+        await advance(game, rules, rules.play(state, move[1]))
     await save_game(game)
 
 
 async def check_flag(game):
     """End the game if the side to move has run out of time. Returns True if it did."""
     color = clock_running(game)
+    if color and away_used(game, color) >= AWAY_LIMIT:
+        await finish_game(game, OTHER[color], "disconnection")
+        await save_game(game)
+        return True
     if not color or time_left(game, color) > 0:
         return False
     rules = game_rules(game)
@@ -2559,6 +2604,10 @@ def game_view(game, user_id):
                 score=rules.score(state), check=rules.check_square(state) if rules.kind == "chess" else None)
     if game.get("clock"):
         view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))
+        away = view["running"] and away_for(game, view["running"])
+        if away:  # their clock is stopped; show how long they have to come back
+            view.update(running=None, away=view["running"],
+                        away_left=round(max(0, AWAY_LIMIT - away_used(game, view["running"]))))
     if color and game["status"] == "playing":
         view["legal"] = rules.legal(state) if rules.turn(state) == color else []
         offer = game.get("draw_offer")
@@ -2594,6 +2643,8 @@ async def game_action(body):
         color = player_color(game, uid)
         if color and game[color]["name"] != name and game["status"] != "over":
             game[color]["name"] = name  # names follow the Telegram profile, tied to the user id
+        if color and game["status"] == "playing":
+            check_in(game, color)
         if game["status"] == "playing" and await check_flag(game):
             return 200, game_view(game, uid)  # out of time: nothing else to do
         if action == "join":
@@ -3338,7 +3389,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_reply_randomly), group=3)  # rarer emoji replies
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
-    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
+    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # .kitty / foodporn / carporn
     # stickers and GIFs are only looked at when someone replies to one
     pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
