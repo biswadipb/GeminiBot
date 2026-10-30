@@ -87,7 +87,7 @@ If both allowlists are empty, anyone can use the bot.
 - `/chatid` – show the current chat's ID and your user ID
 - `ring` or `/ring` – Laden gifts the ring and marries off two people active this week who score well (falls back to anyone seen and the group admins); `/ring @a @b` marries specific people; `/noring` / `/yesring` to opt out / back in
 - `/nick [name]` – one fresh nickname in a random style (funny, silly, cool, embarrassing…), inspired by what they said today
-- `.kitty`, `foodporn`, `carporn` – send just that (with the dot for `.kitty`) for a random cat photo or funny cat meme (TheCatAPI / cataas.com / r/catmemes), food (with a tasty description) or car photo
+- `kitty`, `foodporn`, `carporn` – send just the word for a random cat photo or funny cat meme (TheCatAPI / cataas.com / r/catmemes), food (with a tasty description) or car photo
 - Group lore lives in `lore.json` (name → description); Laden plays along with it. Edit the file and redeploy to change it. Lore that shouldn't be public can go in the `LORE_PRIVATE` env var as a JSON object with the same shape.
 - `/tldrmode` – short, to-the-point answers for the chat (about 60 words at most, answer first, no padding). Alone it switches on/off; `/tldrmode on` or `/tldrmode off` sets it exactly. Remembered across restarts with Upstash
 - `/serious` – serious mode for the chat: critical, logical, less agreeable answers with reasoning. Stays on (even across restarts) until `/unserious`

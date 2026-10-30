@@ -638,7 +638,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mock – reply to a message to mOcK iT\n"
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
-        ".kitty · foodporn · carporn – instant pictures\n"
+        "kitty · foodporn · carporn – instant pictures\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
@@ -1166,7 +1166,7 @@ CARS = ["Porsche 911", "Lamborghini Huracan", "Ferrari SF90", "Nissan GT-R", "BM
         "Toyota Supra", "McLaren 720S", "Audi R8", "Mercedes-AMG GT", "Bugatti Chiron", "Aston Martin DB11",
         "Chevrolet Corvette", "Koenigsegg Jesko", "Mazda RX-7", "Rolls-Royce Phantom"]
 KITTY_QUERIES = ["cute kitten", "fluffy cat", "kitten playing", "sleepy cat", "cat close up portrait", "tabby kitten"]
-KEYWORD_PATTERN = r"(?i)^\s*(\.kitty|foodporn|carporn)\s*[!.]*\s*$"
+KEYWORD_PATTERN = r"(?i)^\s*(kitty|foodporn|carporn)\s*[!.]*\s*$"
 
 
 recent_memes = []  # recently posted meme URLs, so kitty doesn't repeat itself
@@ -1209,7 +1209,7 @@ async def keyword_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return  # stay quiet for one-word triggers outside allowed chats
     keyword = context.matches[0].group(1).lower()
-    if keyword == ".kitty":
+    if keyword == "kitty":
         await send_web_photo(update, context, "", candidates=await cat_photos())  # caption = 🐱 or meme title
     elif keyword == "carporn":
         car = random.choice(CARS)
@@ -3389,7 +3389,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_reply_randomly), group=3)  # rarer emoji replies
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
-    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # .kitty / foodporn / carporn
+    app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
     # stickers and GIFs are only looked at when someone replies to one
     pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
