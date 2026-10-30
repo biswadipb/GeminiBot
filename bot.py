@@ -2537,6 +2537,21 @@ async def post_result(game, picture, summary, details):
             log.exception("Could not post the game result")
 
 
+background_tasks = set()  # keeps a reference to each running background job until it's done
+
+
+def in_background(coro):
+    """Run a slow job (drawing and posting a result) without making the player's move wait for it."""
+    async def run():
+        try:
+            await coro
+        except Exception:
+            log.exception("A background job failed")
+    task = asyncio.create_task(run())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 async def finish_game(game, winner, reason):
     """winner: "white", "black", or None/"draw"."""
     ticking = clock_running(game)
@@ -2555,10 +2570,13 @@ async def finish_game(game, winner, reason):
     summary = f"{rules.emoji} <b>{rules.title} result</b>\n{headline} after {moves} move{'s' * (moves != 1)}."
     notation = f"<b>Notation</b>\n<blockquote expandable>{html.escape(game_notation(game, labels))}</blockquote>"
     plain = re.sub(r"<[^>]+>", "", html.unescape(headline)).replace("🏆 ", "").replace("🤝 ", "")
-    picture = await asyncio.to_thread(gameimages.board_game_picture, game, snapshots[-1],
-                                      game["moves"][-1] if game["moves"] else None, plain)
-    await post_result(game, picture, summary, notation)
-    await edit_game_message(game, f"{rules.emoji} {versus(game)}: game over. The result is below.")
+
+    async def announce():
+        picture = await asyncio.to_thread(gameimages.board_game_picture, game, snapshots[-1],
+                                          game["moves"][-1] if game["moves"] else None, plain)
+        await post_result(game, picture, summary, notation)
+        await edit_game_message(game, f"{rules.emoji} {versus(game)}: game over. The result is below.")
+    in_background(announce())
 
 
 def check_init_data(init_data):
@@ -2923,10 +2941,13 @@ async def finish_party(game):
     detail = "\n".join(f"{medals.get(n, f'{n}.')} {html.escape(names[i])} – {info(i)}{' (left)' if left[i] else ''}"
                        for n, i in enumerate(standings, 1))
     summary = f"{rules.emoji} <b>{rules.title} result</b>\n🏆 <b>{html.escape(names[state['winner']])}</b> won!"
-    picture = await asyncio.to_thread(gameimages.party_picture, game, f"{names[state['winner']]} won!")
-    await post_result(game, picture, summary, f"<blockquote expandable>{detail}</blockquote>")
     joined = ", ".join(f"<b>{html.escape(n)}</b>" for n in names)
-    await edit_game_message(game, f"{rules.emoji} {rules.title}: {joined}. Game over – the result is below.")
+
+    async def announce():
+        picture = await asyncio.to_thread(gameimages.party_picture, game, f"{names[state['winner']]} won!")
+        await post_result(game, picture, summary, f"<blockquote expandable>{detail}</blockquote>")
+        await edit_game_message(game, f"{rules.emoji} {rules.title}: {joined}. Game over – the result is below.")
+    in_background(announce())
 
 
 async def party_turn_timeout(game):
