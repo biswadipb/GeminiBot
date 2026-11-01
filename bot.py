@@ -2019,9 +2019,9 @@ BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
 GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go", "beads": "16beads",
                  "alquerque": "alquerque", "alquerque9": "alquerque",  # /alquerque asks for the board size first
                  "fanorona": "fanorona", "draughts": "draughts",
-                 "checkerchess": "chesswithcheckers", "checkerchess_kings": "chesswithcheckers",  # asks for the variant first
-                 "checkerchess_blind": "chesswithcheckers"}
-CHECKER_CHESS_WORDS = {"kings": "checkerchess_kings", "king": "checkerchess_kings", "crowns": "checkerchess_kings",
+                 "checkerchess": "chesswithcheckers", "checkerchess_kings": "chesswithcheckers",  # variants via a button
+                 "checkerchess_pawns": "chesswithcheckers", "checkerchess_blind": "chesswithcheckers"}
+CHECKER_CHESS_WORDS = {"pawns": "checkerchess_pawns", "pawn": "checkerchess_pawns", "kings": "checkerchess_kings", "king": "checkerchess_kings", "crowns": "checkerchess_kings",
                        "blind": "checkerchess_blind", "blindfold": "checkerchess_blind", "checkers": "checkerchess",
                        "classic": "checkerchess"}
 BIG_BOARD_WORDS = {"9x9", "9×9", "big", "bigger", "large"}
@@ -2546,6 +2546,7 @@ def size_menu(user_id):
 
 VARIANT_NOTE = ("Normal chess rules, but every piece looks like a checker, so you play from memory.\n"
                 "• <b>Checkers</b>: chess.com's version, every piece a checker\n"
+                "• <b>Pawns visible</b>: the pawns look like pawns, everything else is a checker\n"
                 "• <b>Kings marked</b>: easier, the kings wear a crown\n"
                 "• <b>Blindfold</b>: hardest, no pieces on the board at all\n"
                 "The real pieces are shown when the game ends.")
@@ -2553,7 +2554,8 @@ VARIANT_NOTE = ("Normal chess rules, but every piece looks like a checker, so yo
 
 def variant_menu(user_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚪ Checkers (chess.com)", callback_data=f"game|checkerchess|size|{user_id}")],
+        [InlineKeyboardButton("⚪ Checkers (chess.com)", callback_data=f"game|checkerchess|size|{user_id}"),
+         InlineKeyboardButton("♟ Pawns visible", callback_data=f"game|checkerchess_pawns|size|{user_id}")],
         [InlineKeyboardButton("👑 Kings marked (easier)", callback_data=f"game|checkerchess_kings|size|{user_id}"),
          InlineKeyboardButton("🙈 Blindfold (harder)", callback_data=f"game|checkerchess_blind|size|{user_id}")],
     ])
