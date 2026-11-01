@@ -12,7 +12,7 @@ from bidi.algorithm import get_display
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont, features
 
-from boardgames import (GAMES, GO_SIZE, ordinal, GO_STAR_POINTS, LADDERS, LUDO_HOME_COLUMNS, LUDO_OFFSET, LUDO_SAFE,
+from boardgames import (GAMES, Chess, GO_SIZE, ordinal, GO_STAR_POINTS, LADDERS, LUDO_HOME_COLUMNS, LUDO_OFFSET, LUDO_SAFE,
                         LUDO_TRACK, SNAKES, checkers_coords)
 
 SCALE = 2  # draw at twice the size and shrink at the end, for smooth edges
@@ -641,7 +641,7 @@ def board_game_picture(game, snapshot, last, headline):
         gap = min(board_w / (span_c + .5), 520 / (span_r + .5))
         height = gap * (span_r + .5)
         draw_board = lambda img, d, x, y, w: line_board(img, d, x, y, w, snapshot, rules)
-    elif rules.kind == "chess":
+    elif isinstance(rules, Chess):  # chess, and chess with checkers (revealed at the end)
         height, draw_board = board_w, lambda img, d, x, y, w: chess_board(img, d, x, y, w, snapshot, last)
     elif rules.kind == "go":
         height, draw_board = board_w, lambda img, d, x, y, w: go_board(img, d, x, y, w, snapshot, last)

@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import chess
 import chess.engine
 import chess.pgn
-from boardgames import ENDGAME, GAMES, OTHER, PARTY_GAMES, OthelloState
+from boardgames import ENDGAME, GAMES, OTHER, PARTY_GAMES, Chess, OthelloState
 import gameimages
 import httpx
 import tornado.web
@@ -660,7 +660,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "puzzle or othello puzzle – solve it on the board or move by move in the chat · /puzzle top · /dailypuzzle on · /trivia\n"
         "/birthday 14 March · /birthdays\n"
         "/paid 1200 dinner for me, Ann and Bob · /tab · /settle @name – split bills\n"
-        "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
+        "/chessmatch · /chesswithcheckers · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
         "leave the slot open, or play Laden\n"
         "/snakesandladders · /ludo [@people] [bot 1-3] – dice games for several players, with bots if you like\n"
         "/mock – reply to a message to mOcK iT\n"
@@ -2018,7 +2018,12 @@ BOT_DEFAULT_LEVEL = 3
 BOT_WORDS = {"bot", "laden", "stockfish", "ai", "engine", "computer"}
 GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "checkers", "go": "go", "beads": "16beads",
                  "alquerque": "alquerque", "alquerque9": "alquerque",  # /alquerque asks for the board size first
-                 "fanorona": "fanorona", "draughts": "draughts"}
+                 "fanorona": "fanorona", "draughts": "draughts",
+                 "checkerchess": "chesswithcheckers", "checkerchess_kings": "chesswithcheckers",  # asks for the variant first
+                 "checkerchess_blind": "chesswithcheckers"}
+CHECKER_CHESS_WORDS = {"kings": "checkerchess_kings", "king": "checkerchess_kings", "crowns": "checkerchess_kings",
+                       "blind": "checkerchess_blind", "blindfold": "checkerchess_blind", "checkers": "checkerchess",
+                       "classic": "checkerchess"}
 BIG_BOARD_WORDS = {"9x9", "9×9", "big", "bigger", "large"}
 board_games = {}  # game id -> game dict; cache of Redis game:<id>
 game_locks = {}  # game id -> asyncio.Lock, so two quick moves can't both apply
@@ -2079,7 +2084,7 @@ def game_notation(game, labels):
         if i % 2 == 0:
             parts.append(f"{i // 2 + 1}.")
         parts.append(label)
-    if game.get("kind", "chess") == "chess":
+    if isinstance(GAMES[game.get("kind", "chess")], Chess):
         parts.append({"white": "1-0", "black": "0-1", "draw": "½-½"}.get(game.get("result"), "*"))
     return " ".join(parts)
 
@@ -2180,7 +2185,7 @@ async def engine_move(board, level):
 
 
 async def laden_move(game, rules, state):
-    if rules.kind == "chess":
+    if isinstance(rules, Chess):  # chess and chess with checkers: Stockfish
         return await engine_move(state, game["bot_level"])
     return await asyncio.to_thread(rules.bot_move, state, game["bot_level"])  # keeps the bot responsive meanwhile
 
@@ -2411,7 +2416,7 @@ def new_game(kind, update, invited, bot_level=None):
 
 
 def clock_seconds(rules):
-    if rules.kind == "chess" and CHESS_CLOCK_MINUTES:
+    if isinstance(rules, Chess) and CHESS_CLOCK_MINUTES:
         return int(CHESS_CLOCK_MINUTES) * 60
     return rules.clock_minutes * 60
 
@@ -2473,6 +2478,21 @@ def game_command(kind):
             await msg.reply_text(f"{rules.emoji} <b>{html.escape(user.full_name)}</b>, which alquerque board?",
                                  parse_mode=ParseMode.HTML, reply_markup=size_menu(user.id), do_quote=is_group(update))
             return
+        if kind == "checkerchess":
+            picked = next((CHECKER_CHESS_WORDS[a.lower()] for a in context.args if a.lower() in CHECKER_CHESS_WORDS), None)
+            context.args = [a for a in context.args if a.lower() not in CHECKER_CHESS_WORDS]
+            if picked and picked != "checkerchess":
+                await game_command(picked)(update, context)
+                return
+            if not picked and not context.args and not quoted:  # the variant first
+                await msg.reply_text(f"⚪ <b>{html.escape(user.full_name)}</b>, which Chess with Checkers?\n\n"
+                                     "Normal chess rules, but the pieces look like checkers, so you play from memory.\n"
+                                     "• <b>Checkers</b>: every piece is a checker (as on chess.com)\n"
+                                     "• <b>Kings marked</b>: easier, the kings wear a crown\n"
+                                     "• <b>Blindfold</b>: hardest, no pieces on the board at all\n\n"
+                                     "The real pieces are shown when the game ends.",
+                                     parse_mode=ParseMode.HTML, reply_markup=variant_menu(user.id), do_quote=is_group(update))
+                return
         if kind == "alquerque" and any(a.lower() in BIG_BOARD_WORDS for a in context.args):
             context.args = [a for a in context.args if a.lower() not in BIG_BOARD_WORDS and a.lower() not in ("5x5", "5×5")]
             await game_command("alquerque9")(update, context)
@@ -2531,6 +2551,14 @@ def size_menu(user_id):
         InlineKeyboardButton("5×5 (standard)", callback_data=f"game|alquerque|size|{user_id}"),
         InlineKeyboardButton("9×9 (bigger)", callback_data=f"game|alquerque9|size|{user_id}"),
     ]])
+
+
+def variant_menu(user_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚪ Checkers", callback_data=f"game|checkerchess|size|{user_id}"),
+         InlineKeyboardButton("👑 Kings marked", callback_data=f"game|checkerchess_kings|size|{user_id}")],
+        [InlineKeyboardButton("🙈 Blindfold", callback_data=f"game|checkerchess_blind|size|{user_id}")],
+    ])
 
 
 def opponent_menu(kind, user_id):
@@ -2704,7 +2732,14 @@ def game_view(game, user_id):
     snapshots, labels, state = game_history(rules, game["moves"])
     view.update(white=names["white"], black=names["black"], board=snapshots[-1], positions=snapshots, labels=labels,
                 moves=game["moves"], turn=rules.turn(state), result=game["result"], reason=game["reason"],
-                score=rules.score(state), check=rules.check_square(state) if rules.kind == "chess" else None)
+                score=rules.score(state), check=rules.check_square(state) if isinstance(rules, Chess) else None)
+    if hasattr(rules, "hide_board"):  # chess with checkers: the board page sees checkers, the real pieces only at the end
+        view.update(kind="chess", variant=rules.variant)
+        if game["status"] != "over":
+            view.update(board=rules.hide_board(view["board"]), positions=[rules.hide_board(f) for f in view["positions"]],
+                        labels=[rules.hide_move(l) for l in view["labels"]], in_check=bool(view["check"]))
+            if rules.variant != "kings":
+                view["check"] = None  # the red square would give the king away
     if game.get("clock"):
         view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))
         away = view["running"] and away_for(game, view["running"])
@@ -5023,6 +5058,7 @@ async def register_commands(app):
         ("alquerque", "Play alquerque 5×5 or 9×9 (long-press to add @name)"),
         ("fanorona", "Play fanorona (long-press to add @name)"),
         ("draughts", "Play Turkish draughts (long-press to add @name)"),
+        ("chesswithcheckers", "Chess where every piece looks like a checker (long-press to add @name)"),
         ("snakesandladders", "Snakes and Ladders for 2-6 (long-press to add @names)"),
         ("ludo", "Ludo for 2-4 (long-press to add @names)"),
         ("mock", "Reply to a message to mOcK iT"),
@@ -5205,7 +5241,7 @@ def main():
     app.add_handler(CommandHandler("ppcheck", ppcheck))
     app.add_handler(CommandHandler("calc", calc))
     for kind, command in GAME_COMMANDS.items():
-        if kind != "alquerque9":  # reached through /alquerque
+        if kind != "alquerque9" and not kind.startswith("checkerchess_"):  # reached through /alquerque, /chesswithcheckers
             app.add_handler(CommandHandler(command, game_command(kind)))
     app.add_handler(CommandHandler("beads", game_command("beads")))
     for kind, command in PARTY_COMMANDS.items():

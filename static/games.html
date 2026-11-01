@@ -106,12 +106,14 @@
   .board.checkers .sq.d, .board.draughts .sq.d {
     background: repeating-linear-gradient(97deg, rgba(0,0,0,.06) 0 2px, transparent 2px 6px), linear-gradient(135deg, #8a5630, #6b3f20);
   }
-  .board.checkers .disc, .board.draughts .disc { width: 80%; height: 80%; }
-  .board.checkers .disc.b, .board.draughts .disc.b {
+  .board.checkers .disc, .board.draughts .disc, .board.chess .disc { width: 80%; height: 80%; }
+  .board.chess .disc { height: auto; aspect-ratio: 1; }  /* chess with checkers: a crown mustn't stretch the row */
+  .board.chess .disc svg { position: absolute; width: 50%; height: 50%; }
+  .board.checkers .disc.b, .board.draughts .disc.b, .board.chess .disc.b {
     background: radial-gradient(circle, #323232 0 28%, #121212 29% 34%, #2c2c2c 35% 50%, #0e0e0e 51% 56%, #3a3a3a 57% 100%);
     border: 2px solid #050505; box-shadow: 0 4px 5px rgba(0,0,0,.55), inset 0 2px 2px rgba(255,255,255,.22);
   }
-  .board.checkers .disc.w, .board.draughts .disc.w {
+  .board.checkers .disc.w, .board.draughts .disc.w, .board.chess .disc.w {
     background: radial-gradient(circle, #fbf3e3 0 28%, #d4bf98 29% 34%, #f6ecd8 35% 50%, #cdb68c 51% 56%, #fff8ea 57% 100%);
     border: 2px solid #a88d62; box-shadow: 0 4px 5px rgba(0,0,0,.45), inset 0 2px 2px rgba(255,255,255,.7);
   }
@@ -400,7 +402,7 @@ function render() {
   } else if (s.draw_offer === "them") {
     status.textContent = `${s[them]} offers a draw.`; status.classList.add("strong");
   } else if (myTurn) {
-    let text = s.check ? "Check! Your move." : "Your move.";
+    let text = s.check || s.in_check ? "Check! Your move." : "Your move.";
     if (theyPassed) text = s.kind === "go" ? `${s[them]} passed. Pass too to end the game, or play on.` : `${s[them]} had no moves and passed. Your move.`;
     status.textContent = text; status.classList.add("strong");
   } else {
@@ -445,8 +447,10 @@ function drawChess(board, snapshot, last, legal, reviewing) {
       if (sq === selected) el.classList.add("sel");
       if (sq === s.check && !reviewing) el.classList.add("check");
       if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
-      const p = grid[sq];
-      if (p) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
+      const p = grid[sq], hidden = s.variant && s.status !== "over";  // chess with checkers: pieces hidden until the end
+      if (p && hidden && s.variant !== "blind")
+        el.innerHTML = `<span class="disc ${p === p.toUpperCase() ? "w" : "b"}">${p.toLowerCase() === "k" ? CROWN : ""}</span>`;
+      else if (p && !hidden) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
       if (r === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${file}</span>`);
       if (f === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${rank}</span>`);
       el.onclick = () => tapChess(sq, grid, legal);
@@ -640,6 +644,12 @@ function chooseCapture(then) {
 function sideInfo(kind, snapshot, reviewing) {
   // the line under each name: captured pieces (chess, checkers), disc counts (othello), captured stones (go)
   const s = state;
+  if (kind === "chess" && s.variant && s.status !== "over") {  // only how many, not which pieces
+    const left = { w: 0, b: 0 };
+    for (const p of Object.values(parseFen(snapshot))) left[p === p.toUpperCase() ? "w" : "b"]++;
+    const taken = n => n ? `<span class="taken"><span class="count">${n} taken</span></span>` : "";
+    return { white: taken(16 - left.b), black: taken(16 - left.w) };
+  }
   if (kind === "chess") return takenPieces(parseFen(snapshot));
   const count = ch => [...snapshot].filter(x => x.toLowerCase() === ch).length;
   if (kind === "othello") {
