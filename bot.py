@@ -103,7 +103,9 @@ LIMIT_NOUNS = {"chat": "messages", "search": "searches", "imagine": "pictures", 
 
 # Names the bot answers to in groups (whole word, any case), besides @mentions and replies
 BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.strip()]
-NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, BOT_NAMES)) + r")\b", re.IGNORECASE) if BOT_NAMES else None
+NICKNAMES = ["Meowsama bin Laden", "Meowsama", "Mewsama", "Meosama"]  # always answered to as well
+CALLED_BY = sorted(set(BOT_NAMES + NICKNAMES), key=len, reverse=True)  # longest first, so the full name is matched whole
+NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, CALLED_BY)) + r")\b", re.IGNORECASE)
 LORE_INSTRUCTIONS = (
     "Group lore (running in-jokes about people in this chat). When someone asks about one of these people, "
     "or asks you to check on them, play along with the lore in character, playfully and sarcastically. "
@@ -114,6 +116,7 @@ LORE_INSTRUCTIONS = (
 )
 SYSTEM_PROMPT = (
     f"You are {BOT_NAMES[0] if BOT_NAMES else 'an assistant'}, a friendly, helpful AI assistant in a Telegram chat. "
+    f"People also call you {', '.join(NICKNAMES[1:])} or {NICKNAMES[0]}; those all mean you. "
     "In group chats, messages are prefixed with the sender's name; never start your own reply with a name label. "
     "Don't guess anyone's gender from their name. Keep answers concise unless asked for detail. "
     "Don't use religious exclamations (such as Mashallah, Inshallah, Subhanallah, Astaghfirullah or Alhamdulillah). "
@@ -717,7 +720,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with keep_typing(context, chat_id):  # downloading a video can take a few seconds
         media, kind = await message_media(context, update.message)
         if media:
-            text = f"[Sent a {kind}]\n{text}"
+            text = f"[Sent {kind}]\n{text}"
         quoted_media, quoted_kind = await message_media(context, quoted) if quoted else ([], None)
         media += quoted_media  # includes the bot's own /imagine and /fetch pictures, which history can't hold
         kind = kind or quoted_kind
@@ -727,11 +730,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if quoted_text or quoted_media:
                 what = f'message: "{quoted_text}"' if quoted_text else "message"
                 if quoted_media:
-                    what = f"{quoted_kind} (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
+                    what = f"{quoted_kind.split(' ', 1)[-1]} (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
                 text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
         if media and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
                 f"@{context.bot.username}", "").strip(" ,:?!."):
-            text += f"\nWhat's in this {kind}?"  # just the picture or video (or "Laden" in reply to one)
+            text += f"\nWhat's in {'these' if kind[0].isdigit() else 'this'} {kind.split(' ', 1)[-1]}?"  # just the picture(s) or video (or "Laden" in reply)
         text = speaker(update, text)
         await answer_or_retry(update, context, quota, text, media=media, do_quote=group)
 
@@ -759,22 +762,67 @@ def media_file(msg):
     return None
 
 
-async def message_media(context, msg):
-    """Download a message's picture or video for Gemini. Returns ([types.Part], "picture"/"video") or ([], None).
-    Gemini watches videos frame by frame (so it can read subtitles) and listens to their sound."""
+# Several pictures sent together (an album) arrive as separate messages sharing a media_group_id, with the caption
+# on just one of them, and bots can't look messages up later. So the bot notes every album item as it arrives, and
+# reads the whole album when someone asks about it or replies to any picture in it.
+albums = {}  # media_group_id -> {message_id: media_file(...)}, oldest albums first
+ALBUM_SETTLE = 1.5  # seconds to wait for the rest of an album that's still arriving
+MAX_ALBUMS = 300
+
+
+async def remember_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    found = msg and msg.media_group_id and media_file(msg)
+    if found:
+        albums.setdefault(msg.media_group_id, {})[msg.message_id] = found
+        while len(albums) > MAX_ALBUMS:
+            albums.pop(next(iter(albums)))
+
+
+async def album_files(msg):
+    """Every picture or video in the message's album, in order (just its own if it isn't in one)."""
     found = media_file(msg)
-    if not found or found[3] > MAX_DOWNLOAD_BYTES:
-        return [], None
+    if not found or not msg.media_group_id:
+        return [found] if found else []
+    items = albums.setdefault(msg.media_group_id, {})
+    items[msg.message_id] = found
+    if time.time() - msg.date.timestamp() < 30:  # just sent: let the rest of the album arrive
+        count = -1
+        while count != len(items):
+            count = len(items)
+            await asyncio.sleep(ALBUM_SETTLE)
+    return [items[i] for i in sorted(items)]
+
+
+async def download_media(context, found, inline_limit=MAX_INLINE_BYTES):
     file_id, mime, kind, _ = found
-    try:
-        file = await context.bot.get_file(file_id)
-        data = bytes(await file.download_as_bytearray())
-        if len(data) <= MAX_INLINE_BYTES:
-            return [types.Part.from_bytes(data=data, mime_type=mime)], kind
-        return [await upload_to_gemini(data, mime)], kind
-    except Exception:
-        log.exception("Could not download a %s", kind)
+    file = await context.bot.get_file(file_id)
+    data = bytes(await file.download_as_bytearray())
+    if len(data) <= inline_limit:
+        return types.Part.from_bytes(data=data, mime_type=mime)
+    return await upload_to_gemini(data, mime)
+
+
+async def message_media(context, msg):
+    """Download a message's pictures or video (all of an album's) for Gemini. Returns ([types.Part], a description
+    like "a picture" or "3 pictures") or ([], None). Gemini watches videos frame by frame (so it can read
+    subtitles) and listens to their sound."""
+    files = [f for f in await album_files(msg) if f[3] <= MAX_DOWNLOAD_BYTES]
+    if not files:
         return [], None
+    share = MAX_INLINE_BYTES // len(files)  # the request has a size cap, so big album items go via the Files API
+    results = await asyncio.gather(*(download_media(context, f, share) for f in files), return_exceptions=True)
+    parts = []
+    for found, part in zip(files, results):
+        if isinstance(part, Exception):
+            log.error("Could not download a %s: %s", found[2], part)
+        else:
+            parts.append(part)
+    if not parts:
+        return [], None
+    kinds = {f[2] for f in files}
+    noun = kinds.pop() if len(kinds) == 1 else "file"
+    return parts, f"a {noun}" if len(parts) == 1 else f"{len(parts)} {noun}s"
 
 
 async def upload_to_gemini(data, mime):
@@ -3414,6 +3462,7 @@ def main():
     # stickers and GIFs are only looked at when someone replies to one
     pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.ALL, remember_album), group=-2)  # note album pictures as they arrive
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else
     app.add_error_handler(on_error)
     log.info("Bot running with model %s (fallbacks: %s)", GEMINI_MODEL, ", ".join(FALLBACK_MODELS) or "none")

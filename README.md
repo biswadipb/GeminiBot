@@ -13,7 +13,7 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Reply to anyone's message and mention the bot, and it reads that message too
 - Looks things up on its own: Gemini gets a web-search tool (Tavily, or DuckDuckGo) and uses it when a question needs current information, then lists up to 3 source sites under the answer. (Gemini's built-in Google Search has no free allowance.) It's also told today's date
 - Watches videos (up to 20 MB, Telegram's limit for bots): send one with a caption calling Laden, or reply to a video, round video or GIF. Gemini sees the frames (so it reads subtitles) and hears the sound
-- Reads pictures: send a photo with a caption (in groups, call Laden in the caption), or reply to a photo, picture file or sticker with "Laden what's this?"
+- Reads pictures: send a photo with a caption (in groups, call Laden in the caption), or reply to a photo, picture file or sticker with "Laden what's this?". With several pictures sent together (an album), Laden reads all of them, whether the caption calls it or someone replies to any one picture (albums sent since the bot last restarted)
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
 - `/fetch` finds real pictures and GIFs on the web (Google Images via Serper if `SERPER_API_KEY` is set, else DuckDuckGo; Tavily fallback)
@@ -57,7 +57,7 @@ All settings live in `.env`:
 | `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
-| `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word) |
+| `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word); it always answers to Meowsama, Mewsama, Meosama and Meowsama bin Laden too |
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
 | `CHESS_APP_NAME` | no | – | Short name of a BotFather `/newapp` Mini App for `/chessmatch`; empty uses the bot's Main Mini App |
 | `STOCKFISH_PATH` | no | – | Path to a Stockfish binary for `/chessmatch bot`; empty = download the official release on first start |
