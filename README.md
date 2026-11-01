@@ -57,6 +57,7 @@ All settings live in `.env`:
 | `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
+| `GEMINI_TIMEOUT` | no | `25` | Seconds to wait for a model before moving on to the next one (doubled with a picture or video); a model that times out is skipped for 5 minutes |
 | `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word); it always answers to Meowsama, Mewsama, Meosama and Meowsama bin Laden too |
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |
 | `CHESS_APP_NAME` | no | – | Short name of a BotFather `/newapp` Mini App for `/chessmatch`; empty uses the bot's Main Mini App |

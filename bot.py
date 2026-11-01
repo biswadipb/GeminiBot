@@ -515,7 +515,11 @@ def split_message(text, limit=TELEGRAM_LIMIT):
     return chunks
 
 
-model_blocked_until = {}  # model -> time it can be tried again (its free allowance ran out, or it doesn't exist)
+model_blocked_until = {}  # model -> time it can be tried again (its free allowance ran out, it doesn't exist, or it hung)
+# Gemini sometimes accepts a request and then just doesn't answer. Rather than wait on it, give up after this long,
+# move on to the next model and leave the stuck one alone for a few minutes.
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "25"))  # seconds per model (doubled when a picture or video is sent)
+SLOW_MODEL_PAUSE = 5 * 60
 
 
 def quota_retry_seconds(error):
@@ -587,16 +591,24 @@ async def ask_gemini(history, chat_id=None, search=False):
     chain = [GEMINI_MODEL, *FALLBACK_MODELS]
     available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
     last_error = None
+    limit = GEMINI_TIMEOUT * (2 if any(m.get("media") for m in history) else 1)
     for model in available:
         for attempt in range(RETRIES_PER_MODEL):
             try:
                 if search:
-                    answer = await generate_with_search(model, contents, searching)
+                    request = generate_with_search(model, contents, searching)
                 else:
-                    answer = (await client.aio.models.generate_content(model=model, contents=contents, config=plain)).text
+                    request = client.aio.models.generate_content(model=model, contents=contents, config=plain)
+                answer = await asyncio.wait_for(request, limit)
+                answer = answer if isinstance(answer, str) else answer.text
                 if model != chain[0]:
                     log.info("Answered with %s", model)
                 return answer, model
+            except asyncio.TimeoutError:
+                model_blocked_until[model] = time.time() + SLOW_MODEL_PAUSE
+                log.warning("%s didn't answer within %ds; skipping it for %dm", model, limit, SLOW_MODEL_PAUSE // 60)
+                last_error = errors.APIError(504, {"error": {"code": 504, "message": f"{model} timed out", "status": "DEADLINE_EXCEEDED"}})
+                break
             except errors.APIError as e:
                 last_error = e
                 if e.code in SKIP_MODEL:  # model doesn't exist for this key
