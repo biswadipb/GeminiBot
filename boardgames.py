@@ -1262,8 +1262,8 @@ class Draughts(Rules):
 
 class ChessWithCheckers(Chess):
     """chess.com's Chess with Checkers: ordinary chess, except every piece looks like a checker, so you play from
-    memory. Variants: every piece a checker; pawns left as pawns; kings marked with a crown (easier); blindfold, no
-    pieces at all (hardest).
+    memory. Variants: every piece a checker; pawns left as pawns; kings left as kings; kings and pawns both left as
+    they are (easiest); blindfold, no pieces at all (hardest).
     Only what players see changes: the server hides the pieces (and the piece letters in the moves) until the end."""
     emoji = "⚪"
 
@@ -1271,17 +1271,19 @@ class ChessWithCheckers(Chess):
         self.kind, self.variant, self.title = kind, variant, title
 
     def hide_board(self, fen):
-        """Every piece becomes a plain checker (X/x) of its colour, except kings or pawns in those variants."""
-        keep = {"kings": "Kk", "pawns": "Pp"}.get(self.variant, "")
+        """Every piece becomes a plain checker (X/x) of its colour, except the kings and/or pawns in those variants."""
+        keep = {"kings": "Kk", "pawns": "Pp", "kings_pawns": "KkPp"}.get(self.variant, "")
         return "".join(ch if ch in keep or not ch.isalpha() else ("X" if ch.isupper() else "x") for ch in fen)
 
     def hide_move(self, san):
         """"Nf3" -> "?f3", "exd5" -> "?xd5", "e8=Q+" -> "?e8+"; castling stays as it is (it's plain to see anyway).
-        With pawns visible, pawn moves stay as they are (apart from what a pawn promotes to)."""
+        Pieces left visible keep their moves as they are (apart from what a pawn promotes to)."""
         if san.startswith("O-O"):
             return san
-        if self.variant == "pawns" and san[0] in "abcdefgh":
+        if "pawns" in self.variant and san[0] in "abcdefgh":
             return re.sub(r"=[QRBN]", "=?", san)
+        if "kings" in self.variant and san[0] == "K":
+            return san
         m = re.search(r"(x?)([a-h][1-8])(?:=[QRBN])?([+#]?)$", san)
         return f"?{m[1]}{m[2]}{m[3]}" if m else "?"
 
@@ -1289,7 +1291,8 @@ class ChessWithCheckers(Chess):
 CHESS_WITH_CHECKERS = [
     ChessWithCheckers("checkerchess", "checkers", "Chess with Checkers"),
     ChessWithCheckers("checkerchess_pawns", "pawns", "Chess with Checkers (pawns visible)"),
-    ChessWithCheckers("checkerchess_kings", "kings", "Chess with Checkers (kings marked)"),
+    ChessWithCheckers("checkerchess_kings", "kings", "Chess with Checkers (kings visible)"),
+    ChessWithCheckers("checkerchess_kingspawns", "kings_pawns", "Chess with Checkers (kings and pawns visible)"),
     ChessWithCheckers("checkerchess_blind", "blind", "Chess with Checkers (blindfold)"),
 ]
 

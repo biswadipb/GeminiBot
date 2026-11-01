@@ -2020,8 +2020,10 @@ GAME_COMMANDS = {"chess": "chessmatch", "othello": "othello", "checkers": "check
                  "alquerque": "alquerque", "alquerque9": "alquerque",  # /alquerque asks for the board size first
                  "fanorona": "fanorona", "draughts": "draughts",
                  "checkerchess": "chesswithcheckers", "checkerchess_kings": "chesswithcheckers",  # variants via a button
-                 "checkerchess_pawns": "chesswithcheckers", "checkerchess_blind": "chesswithcheckers"}
-CHECKER_CHESS_WORDS = {"pawns": "checkerchess_pawns", "pawn": "checkerchess_pawns", "kings": "checkerchess_kings", "king": "checkerchess_kings", "crowns": "checkerchess_kings",
+                 "checkerchess_pawns": "chesswithcheckers", "checkerchess_kingspawns": "chesswithcheckers",
+                 "checkerchess_blind": "chesswithcheckers"}
+CHECKER_CHESS_WORDS = {"pawns": "checkerchess_pawns", "pawn": "checkerchess_pawns", "kings": "checkerchess_kings",
+                       "king": "checkerchess_kings", "kingspawns": "checkerchess_kingspawns",
                        "blind": "checkerchess_blind", "blindfold": "checkerchess_blind", "checkers": "checkerchess",
                        "classic": "checkerchess"}
 BIG_BOARD_WORDS = {"9x9", "9×9", "big", "bigger", "large"}
@@ -2479,7 +2481,10 @@ def game_command(kind):
                                  parse_mode=ParseMode.HTML, reply_markup=size_menu(user.id), do_quote=is_group(update))
             return
         if kind == "checkerchess":
-            picked = next((CHECKER_CHESS_WORDS[a.lower()] for a in context.args if a.lower() in CHECKER_CHESS_WORDS), None)
+            chosen = {CHECKER_CHESS_WORDS[a.lower()] for a in context.args if a.lower() in CHECKER_CHESS_WORDS}
+            if {"checkerchess_kings", "checkerchess_pawns"} <= chosen:  # "kings pawns": both stay visible
+                chosen = {"checkerchess_kingspawns"}
+            picked = next(iter(chosen), None)
             context.args = [a for a in context.args if a.lower() not in CHECKER_CHESS_WORDS]
             if picked and picked != "checkerchess":
                 await game_command(picked)(update, context)
@@ -2547,7 +2552,8 @@ def size_menu(user_id):
 VARIANT_NOTE = ("Normal chess rules, but every piece looks like a checker, so you play from memory.\n"
                 "• <b>Checkers</b>: chess.com's version, every piece a checker\n"
                 "• <b>Pawns visible</b>: the pawns look like pawns, everything else is a checker\n"
-                "• <b>Kings marked</b>: easier, the kings wear a crown\n"
+                "• <b>Kings visible</b>: the kings look like kings, everything else is a checker\n"
+                "• <b>Kings and pawns visible</b>: easiest, only the other pieces are checkers\n"
                 "• <b>Blindfold</b>: hardest, no pieces on the board at all\n"
                 "The real pieces are shown when the game ends.")
 
@@ -2556,8 +2562,9 @@ def variant_menu(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚪ Checkers (chess.com)", callback_data=f"game|checkerchess|size|{user_id}"),
          InlineKeyboardButton("♟ Pawns visible", callback_data=f"game|checkerchess_pawns|size|{user_id}")],
-        [InlineKeyboardButton("👑 Kings marked (easier)", callback_data=f"game|checkerchess_kings|size|{user_id}"),
-         InlineKeyboardButton("🙈 Blindfold (harder)", callback_data=f"game|checkerchess_blind|size|{user_id}")],
+        [InlineKeyboardButton("♚ Kings visible", callback_data=f"game|checkerchess_kings|size|{user_id}"),
+         InlineKeyboardButton("♚♟ Kings and pawns visible", callback_data=f"game|checkerchess_kingspawns|size|{user_id}")],
+        [InlineKeyboardButton("🙈 Blindfold (hardest)", callback_data=f"game|checkerchess_blind|size|{user_id}")],
     ])
 
 
@@ -2744,7 +2751,7 @@ def game_view(game, user_id):
         if game["status"] != "over":
             view.update(board=rules.hide_board(view["board"]), positions=[rules.hide_board(f) for f in view["positions"]],
                         labels=[rules.hide_move(l) for l in view["labels"]], in_check=bool(view["check"]))
-            if rules.variant != "kings":
+            if "kings" not in rules.variant:
                 view["check"] = None  # the red square would give the king away
     if game.get("clock"):
         view.update(clock={c: round(time_left(game, c), 1) for c in ("white", "black")}, running=clock_running(game))

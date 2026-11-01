@@ -449,10 +449,9 @@ function drawChess(board, snapshot, last, legal, reviewing) {
       if (sq === s.check && !reviewing) el.classList.add("check");
       if (targets.includes(sq)) el.classList.add("target", ...(grid[sq] ? ["capture"] : []));
       const p = grid[sq], hidden = s.variant && s.status !== "over";  // chess with checkers: pieces hidden until the end
-      const asDisc = hidden && (p || "").toLowerCase() === "x" || (hidden && s.variant === "kings" && (p || "").toLowerCase() === "k");
       if (p && hidden && s.variant === "blind") {}  // nothing to see
-      else if (p && asDisc)  // a checker (x); in the kings-marked variant the kings are crowned checkers
-        el.innerHTML = `<span class="disc ${p === p.toUpperCase() ? "w" : "b"}">${p.toLowerCase() === "k" ? CROWN : ""}</span>`;
+      else if (p && hidden && p.toLowerCase() === "x")  // a hidden piece: a plain checker (kings and pawns may stay visible)
+        el.innerHTML = `<span class="disc ${p === p.toUpperCase() ? "w" : "b"}"></span>`;
       else if (p) el.innerHTML = `<span class="piece">${PIECES[(p === p.toUpperCase() ? "w" : "b") + p.toUpperCase()]}</span>`;
       if (r === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${file}</span>`);
       if (f === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${rank}</span>`);
