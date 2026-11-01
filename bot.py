@@ -2484,15 +2484,6 @@ def game_command(kind):
             if picked and picked != "checkerchess":
                 await game_command(picked)(update, context)
                 return
-            if not picked and not context.args and not quoted:  # the variant first
-                await msg.reply_text(f"⚪ <b>{html.escape(user.full_name)}</b>, which Chess with Checkers?\n\n"
-                                     "Normal chess rules, but the pieces look like checkers, so you play from memory.\n"
-                                     "• <b>Checkers</b>: every piece is a checker (as on chess.com)\n"
-                                     "• <b>Kings marked</b>: easier, the kings wear a crown\n"
-                                     "• <b>Blindfold</b>: hardest, no pieces on the board at all\n\n"
-                                     "The real pieces are shown when the game ends.",
-                                     parse_mode=ParseMode.HTML, reply_markup=variant_menu(user.id), do_quote=is_group(update))
-                return
         if kind == "alquerque" and any(a.lower() in BIG_BOARD_WORDS for a in context.args):
             context.args = [a for a in context.args if a.lower() not in BIG_BOARD_WORDS and a.lower() not in ("5x5", "5×5")]
             await game_command("alquerque9")(update, context)
@@ -2553,20 +2544,28 @@ def size_menu(user_id):
     ]])
 
 
+VARIANT_NOTE = ("Normal chess rules, but every piece looks like a checker, so you play from memory.\n"
+                "• <b>Checkers</b>: chess.com's version, every piece a checker\n"
+                "• <b>Kings marked</b>: easier, the kings wear a crown\n"
+                "• <b>Blindfold</b>: hardest, no pieces on the board at all\n"
+                "The real pieces are shown when the game ends.")
+
+
 def variant_menu(user_id):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚪ Checkers", callback_data=f"game|checkerchess|size|{user_id}"),
-         InlineKeyboardButton("👑 Kings marked", callback_data=f"game|checkerchess_kings|size|{user_id}")],
-        [InlineKeyboardButton("🙈 Blindfold", callback_data=f"game|checkerchess_blind|size|{user_id}")],
+        [InlineKeyboardButton("⚪ Checkers (chess.com)", callback_data=f"game|checkerchess|size|{user_id}")],
+        [InlineKeyboardButton("👑 Kings marked (easier)", callback_data=f"game|checkerchess_kings|size|{user_id}"),
+         InlineKeyboardButton("🙈 Blindfold (harder)", callback_data=f"game|checkerchess_blind|size|{user_id}")],
     ])
 
 
 def opponent_menu(kind, user_id):
     rules = GAMES[kind]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Anyone (open slot)", callback_data=f"game|{kind}|open|{user_id}")],
-        [InlineKeyboardButton(f"🤖 {rules.opponent_name}", callback_data=f"game|{kind}|bot|{user_id}")],
-    ])
+    rows = [[InlineKeyboardButton("👥 Anyone (open slot)", callback_data=f"game|{kind}|open|{user_id}")],
+            [InlineKeyboardButton(f"🤖 {rules.opponent_name}", callback_data=f"game|{kind}|bot|{user_id}")]]
+    if kind.startswith("checkerchess"):  # chess.com's version unless they pick another
+        rows.append([InlineKeyboardButton("🎚 Easier or harder variant", callback_data=f"game|{kind}|variant|{user_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def level_menu(kind, user_id):
@@ -2595,6 +2594,11 @@ async def game_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.edit_message_text(f"{rules.emoji} <b>{name}</b>, who do you want to play {rules.title.lower()} with?",
                                       parse_mode=ParseMode.HTML, reply_markup=opponent_menu(kind, update.effective_user.id))
+        return
+    if choice == "variant":  # chess with checkers: kings marked or blindfold instead of chess.com's version
+        await query.answer()
+        await query.edit_message_text(f"⚪ <b>{name}</b>, which Chess with Checkers?\n\n{VARIANT_NOTE}",
+                                      parse_mode=ParseMode.HTML, reply_markup=variant_menu(update.effective_user.id))
         return
     if choice == "bot":
         await query.answer()
