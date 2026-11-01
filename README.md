@@ -13,6 +13,17 @@ A Telegram bot that sends your messages to Google's Gemini API (free tier) and r
 - Reply to anyone's message and mention the bot, and it reads that message too
 - Looks things up on its own: Gemini gets a web-search tool (Tavily, or DuckDuckGo) and uses it when a question needs current information, then lists up to 3 source sites under the answer. (Gemini's built-in Google Search has no free allowance.) It's also told today's date
 - Watches videos (up to 20 MB, Telegram's limit for bots): send one with a caption calling Laden, or reply to a video, round video or GIF. Gemini sees the frames (so it reads subtitles) and hears the sound
+- Hears voice messages and audio files: reply "Laden" to one (or reply to Laden with one) and it transcribes it, translating it if it isn't English, and answers it if it was said to Laden
+- Reads links: ask about an article, or reply "Laden tldr" to a message with a link, and it reads the page; YouTube links are watched by Gemini itself
+- `/recap` (or `/recap 3h`) sums up the last 24 hours of the group; "Laden what did I miss?" recaps everything since your last message
+- Reminders: `/remind me in 2 hours to call mum`, `/remind everyone friday 8pm match`, `/remind @ann tomorrow at 9am rent`, or "Laden remind me…". `/reminders` lists them (`/reminders cancel 2`). Times follow the group's time zone (`TIMEZONE`, default Asia/Kolkata; change per group with `/timezone Asia/Dhaka`)
+- `/poll Pizza or burgers?` or `/poll Where to? Goa, Manali, Ooty` makes a Telegram poll; `/pick a, b, c` or "Laden pick one: a, b or c" picks at random
+- "Laden translate" as a reply (or "translate to French", or "translate hello to French"); `/autotranslate Bengali` replies to every message written in Bengali with an English translation (`/autotranslate Hindi into Bengali`, `/autotranslate off`; at most 300 a day per group, using the light model)
+- `/leaderboard`: board-game ratings (Elo between people), wins against Laden, Ludo/Snakes and Ladders wins, daily puzzle points, trivia, and all puzzles solved; `/stats` (or `/stats @name`, or as a reply) for one person's record, including each game and level against Laden
+- Chess puzzles from Lichess: send `puzzle` (or "Laden post a puzzle") for one just for fun; `/dailypuzzle on` posts the Lichess daily puzzle every morning at 9, with the first solver getting a daily point. Reply to a puzzle with your first move (Nf3, e2e4…); the first to solve it gets a solved copy of the board posted with credit, like a game result. Every solve counts towards "Puzzles solved" on the leaderboard. Unsolved puzzles get their answer posted after a day (or when the next daily one arrives)
+- `/trivia`: a question (Open Trivia DB) with four buttons; the first right tap scores, one guess each, 90 seconds. `/trivia top` for this week; the weekly champion is announced on Monday morning
+- `/birthday 14 March` saves yours (`/birthday forget` removes it), `/birthdays` lists them; Laden wishes people in the group at 9 on the day
+- Bills: `/paid 1200 dinner for me, Ann and Bob` (or "Laden I paid 1200 for dinner for me, Ann and Bob"), `/paid 600 taxi for @ann` (Ann owes it all), `/paid 900 snacks with Ann` (split with you). `/tab` shows who owes whom in the fewest payments, `/settle @ann` (or `/settle @ann 200`) records paying back, `/tab undo` removes your last entry, `/tab clear` (group admins) starts over
 - Reads pictures: send a photo with a caption (in groups, call Laden in the caption), or reply to a photo, picture file or sticker with "Laden what's this?". With several pictures sent together (an album), Laden reads all of them, whether the caption calls it or someone replies to any one picture (albums sent since the bot last restarted)
 - `/search` answers from the web with numbered sources (Tavily or DuckDuckGo)
 - `/imagine` generates pictures for free: Cloudflare Workers AI if configured, then Pollinations.ai, then Hugging Face
@@ -57,6 +68,7 @@ All settings live in `.env`:
 | `CLOUDFLARE_ACCOUNT_ID` | no | – | Cloudflare account ID; when set, Cloudflare is the main `/imagine` service |
 | `CLOUDFLARE_API_TOKEN` | no | – | Cloudflare API token with *Workers AI* permission |
 | `HF_TOKEN` | no | – | Hugging Face access token, the last `/imagine` fallback |
+| `TIMEZONE` | no | `Asia/Kolkata` | Default time zone for reminders and the 9am posts (each group can change it with `/timezone`) |
 | `GEMINI_TIMEOUT` | no | `25` | Seconds to wait for a model before moving on to the next one (doubled with a picture or video); a model that times out is skipped for 5 minutes |
 | `BOT_NAMES` | no | `Laden` | Names the bot answers to in groups (comma-separated, whole word); it always answers to Meowsama, Mewsama, Meosama and Meowsama bin Laden too |
 | `SERPER_API_KEY` | no | – | Serper key (free 2,500 searches at serper.dev) for Google Images in `/fetch` |

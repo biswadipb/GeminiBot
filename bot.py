@@ -17,6 +17,7 @@ import os
 import platform
 import random
 import re
+import secrets
 import shutil
 import tarfile
 import time
@@ -24,9 +25,11 @@ import zlib
 from decimal import Decimal, getcontext
 from fractions import Fraction
 from urllib.parse import parse_qsl, quote, urlparse
+from zoneinfo import ZoneInfo
 
 import chess
 import chess.engine
+import chess.pgn
 from boardgames import GAMES, OTHER, PARTY_GAMES
 import gameimages
 import httpx
@@ -647,6 +650,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ring or /ring [@a @b] – Laden marries two people off 💍 (/noring to opt out)\n"
         "/nick [name] – a fresh nickname (or reply to someone with /nick)\n"
         "/calc 2+2*3 – exact arithmetic (or just ask: Laden what's 15% of 80)\n"
+        "/recap [3h] – what the group talked about · \"Laden what did I miss?\"\n"
+        "/remind me in 2h to call mum · /remind everyone friday 8pm match · /reminders · /timezone\n"
+        "/poll Pizza or burgers? · /pick a, b, c (or \"Laden pick one: a, b or c\")\n"
+        "\"Laden translate\" as a reply (or \"translate to French\") · /autotranslate Bengali\n"
+        "Voice notes: reply \"Laden\" to one, or reply to Laden with one\n"
+        "Links: ask Laden about an article or YouTube link (\"Laden tldr\" as a reply)\n"
+        "/leaderboard · /stats – game ratings, wins against Laden, puzzles solved, trivia\n"
+        "puzzle – a chess puzzle (reply with your move) · /dailypuzzle on – one every morning · /trivia\n"
+        "/birthday 14 March · /birthdays\n"
+        "/paid 1200 dinner for me, Ann and Bob · /tab · /settle @name – split bills\n"
         "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
         "leave the slot open, or play Laden\n"
         "/snakesandladders · /ludo [@people] [bot 1-3] – dice games for several players, with bots if you like\n"
@@ -710,6 +723,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message_text = update.message.text or update.message.caption or ""
     question = NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text
+    if await group_tool(update, context, question.replace(f"@{context.bot.username}", "")):
+        return  # a reminder, recap, poll pick, translation, bill, puzzle answer...
     maths = calculate(question.replace(f"@{context.bot.username}", "").strip(" ,:"))
     if maths and not media_file(update.message):  # exact answer from code: no Gemini call, no quota used
         await update.message.reply_text(f"🧮 {maths[0]} = {maths[1]}", do_quote=group)
@@ -746,9 +761,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
         if media and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
                 f"@{context.bot.username}", "").strip(" ,:?!."):
-            text += f"\nWhat's in {'these' if kind[0].isdigit() else 'this'} {kind.split(' ', 1)[-1]}?"  # just the picture(s) or video (or "Laden" in reply)
+            if "voice" in kind or "audio" in kind:
+                text += "\nTranscribe it word for word (in its own language, with an English translation if it isn't " \
+                        "English), then answer it if it's said to you."
+            else:
+                text += f"\nWhat's in {'these' if kind[0].isdigit() else 'this'} {kind.split(' ', 1)[-1]}?"  # just the picture(s) or video (or "Laden" in reply)
         text = speaker(update, text)
-        await answer_or_retry(update, context, quota, text, media=media, do_quote=group)
+        links, link_media = await link_context(update)  # articles are read for Gemini; YouTube videos it watches
+        await answer_or_retry(update, context, quota, text, gemini_text=f"{text}\n\n{links}" if links else None,
+                              media=media + link_media, do_quote=group)
 
 
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # Telegram won't let bots download bigger files
@@ -768,6 +789,9 @@ def media_file(msg):
         return document.file_id, document.mime_type, kind, document.file_size or 0
     if msg.sticker and not (msg.sticker.is_animated or msg.sticker.is_video):
         return msg.sticker.file_id, "image/webp", "picture", msg.sticker.file_size or 0
+    if msg.voice or msg.audio:  # Gemini listens to these
+        audio = msg.voice or msg.audio
+        return audio.file_id, audio.mime_type or "audio/ogg", "voice message" if msg.voice else "audio file", audio.file_size or 0
     video = msg.video or msg.video_note or msg.animation  # GIFs arrive as silent MP4s
     if video:
         return video.file_id, getattr(video, "mime_type", None) or "video/mp4", "video", video.file_size or 0
@@ -1338,7 +1362,7 @@ def log_key(chat_id):
 
 async def log_message(chat_id, user, text):
     """Keep today's group messages (last LOG_MAX, deleted after 2 days) so /criticize has material."""
-    entry = {"uid": user.id, "name": user.first_name, "text": text[:500]}
+    entry = {"uid": user.id, "name": user.first_name, "text": text[:500], "t": int(time.time())}
     key = log_key(chat_id)
     entries = chat_logs.setdefault(key, [])
     entries.append(entry)
@@ -2637,6 +2661,7 @@ async def finish_game(game, winner, reason):
         await post_result(game, picture, summary, notation)
         await edit_game_message(game, f"{rules.emoji} {versus(game)}: game over. The result is below.")
     in_background(announce())
+    in_background(record_board_result(game))
 
 
 def check_init_data(init_data):
@@ -3008,6 +3033,7 @@ async def finish_party(game):
         await post_result(game, picture, summary, f"<blockquote expandable>{detail}</blockquote>")
         await edit_game_message(game, f"{rules.emoji} {rules.title}: {joined}. Game over – the result is below.")
     in_background(announce())
+    in_background(record_party_result(game))
 
 
 async def party_turn_timeout(game):
@@ -3240,9 +3266,1448 @@ async def run_web(app, public_url):
             await app.stop()
 
 
+# ---------- Group helpers: recaps, reminders, polls, translation, leaderboards, puzzles, trivia, birthdays, tabs ----------
+
+DEFAULT_TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")  # for reminders and the 9am posts; /timezone changes it per group
+MORNING_HOUR = 9  # daily puzzle, birthday wishes and the weekly trivia champion go out at 9:00 local time
+
+# Small JSON documents in Redis (one key each), cached in RAM and written through on every change. Reads that fail
+# raise, so a Redis hiccup can't make the bot overwrite real data with an empty default.
+store_cache, store_locks = {}, {}
+
+
+async def load_store(key, default):
+    if key not in store_cache:
+        value = None
+        if use_redis:
+            raw = await redis("GET", key)
+            value = json.loads(raw) if raw else None
+        store_cache[key] = default if value is None else value
+    return store_cache[key]
+
+
+async def save_store(key):
+    if use_redis:
+        try:
+            await redis("SET", key, json.dumps(store_cache[key]))
+        except Exception:
+            log.exception("Could not save %s", key)
+
+
+def store_lock(key):
+    return store_locks.setdefault(key, asyncio.Lock())
+
+
+async def ready(update, context, group_only=False):
+    """The usual checks before a command: switched on, not muted, allowed here (and in a group, if needed)."""
+    if await ignored_while_off(update) or await muted(update, context):
+        return False
+    if not is_allowed(update):
+        await update.message.reply_text("Sorry, this bot is private.")
+        return False
+    if group_only and not is_group(update):
+        await update.message.reply_text("That one works in groups. Add me to one!")
+        return False
+    return True
+
+
+def mention(uid, name):
+    """A clickable name that notifies the person (for user ids); plain bold text for names we only know as text."""
+    if isinstance(uid, int) or str(uid).isdigit():
+        return f'<a href="tg://user?id={uid}">{html.escape(name)}</a>'
+    return f"<b>{html.escape(name)}</b>"
+
+
+async def chat_zone(chat_id):
+    zones = await load_store("timezones", {})
+    try:
+        return ZoneInfo(zones.get(str(chat_id), DEFAULT_TIMEZONE))
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+async def timezone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context):
+        return
+    chat_id, zone = update.effective_chat.id, await chat_zone(update.effective_chat.id)
+    if not context.args:
+        now = datetime.datetime.now(zone).strftime("%a %d %b, %H:%M")
+        await update.message.reply_text(f"🕰️ This chat uses {zone.key} (it's {now} there). "
+                                        "Change it with /timezone Area/City, e.g. /timezone Asia/Dhaka", do_quote=True)
+        return
+    name = context.args[0]
+    try:
+        ZoneInfo(name)
+    except Exception:
+        await update.message.reply_text("I don't know that one. Use a name like Asia/Kolkata, Asia/Dhaka, "
+                                        "Europe/London or America/New_York.", do_quote=True)
+        return
+    async with store_lock("timezones"):
+        (await load_store("timezones", {}))[str(chat_id)] = name
+        await save_store("timezones")
+    await update.message.reply_text(f"🕰️ Done: reminders and morning posts here now follow {name}.", do_quote=True)
+
+
+# ----- 1. Recaps
+
+async def recap_messages(chat_id, since):
+    """Logged messages since this time (today's and yesterday's logs; older entries have no time and count as today)."""
+    entries = []
+    yesterday = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    for key in (f"log:{chat_id}:{yesterday}", log_key(chat_id)):
+        try:
+            found = [json.loads(e) for e in await redis("LRANGE", key, 0, -1) or []] if use_redis else chat_logs.get(key, [])
+        except Exception:
+            log.exception("Could not read message log")
+            found = chat_logs.get(key, [])
+        entries += [e for e in found if e.get("t", time.time()) >= since]
+    return entries
+
+
+async def recap_reply(update, context, since, who=None):
+    """Summarise the chat since a time with Gemini; `who` is the person catching up, if any."""
+    msg = update.message
+    entries = [e for e in await recap_messages(update.effective_chat.id, since) if not e["text"].startswith("/")]
+    if who:
+        entries = [e for e in entries if e["uid"] != update.effective_user.id]
+    if len(entries) < 3:
+        await msg.reply_text("Not much happened, honestly. You didn't miss anything. 😴" if who else
+                             "The chat's been too quiet to recap.", do_quote=True)
+        return
+    quota, refusal = await use_quota(update.effective_user.id, "chat")
+    if refusal:
+        await msg.reply_text(refusal, do_quote=True)
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    transcript = "\n".join(f"{e['name']}: {e['text']}" for e in entries[-300:])
+    prompt = (f"Recap this group chat{f' for {who}, who was away' if who else ''}: the main topics, any plans or "
+              "decisions (with times), questions left unanswered, and the funniest moments, saying who said what. "
+              "Short bullet points, under 180 words, no preamble.\n\n" + transcript)
+    try:
+        answer, _ = await ask_gemini([{"role": "user", "text": prompt}])
+    except Exception:
+        log.exception("Recap failed")
+        answer = None
+    if not answer:
+        await refund(quota)
+        await msg.reply_text("I couldn't put the recap together right now. Try again in a minute.", do_quote=True)
+        return
+    head = f"📋 **What you missed, {who}** ({len(entries)} messages)" if who else f"📋 **Recap** ({len(entries)} messages)"
+    await send_formatted(msg, f"{head}\n\n{answer.strip()}", do_quote=True)
+
+
+async def recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/recap: the last 24 hours, or /recap 3h for the last 3 hours."""
+    if not await ready(update, context, group_only=True):
+        return
+    hours = 24
+    if context.args:
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(h|hours?|m|min|minutes?)?", " ".join(context.args).lower())
+        if m:
+            hours = float(m[1]) / (60 if (m[2] or "h").startswith("m") else 1)
+    await recap_reply(update, context, time.time() - min(hours, 48) * 3600)
+
+
+async def what_did_i_miss(update, context):
+    """Everything since the asker's previous message (or the last 24 hours)."""
+    uid, asked = update.effective_user.id, update.message.date.timestamp()
+    entries = await recap_messages(update.effective_chat.id, time.time() - 86400)
+    mine = [e["t"] for e in entries if e["uid"] == uid and e.get("t") and e["t"] < asked - 1]  # before this question
+    since = max(mine) if mine else time.time() - 86400
+    await recap_reply(update, context, since, who=update.effective_user.first_name)
+
+
+# ----- 2. Reminders
+
+DURATION_UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1, "m": 60, "min": 60, "mins": 60, "minute": 60,
+                  "minutes": 60, "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "d": 86400,
+                  "day": 86400, "days": 86400, "w": 604800, "week": 604800, "weeks": 604800}
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+          "november", "december"]
+CLOCK = r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>am|pm|a\.m\.|p\.m\.)?"
+MONTH_RE = r"(?P<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+
+
+def month_number(word):
+    return next(i for i, m in enumerate(MONTHS, 1) if m.startswith(word.lower()[:3]))
+
+
+def clock_time(m, default=(9, 0)):
+    if not m or not m.group("h"):
+        return default
+    h, minute, ap = int(m.group("h")), int(m.group("min") or 0), (m.group("ap") or "").replace(".", "")
+    if ap == "pm" and h < 12:
+        h += 12
+    if ap == "am" and h == 12:
+        h = 0
+    if h > 23 or minute > 59:
+        raise ValueError
+    return h, minute
+
+
+def parse_when(text, zone):
+    """Find a time in text like "in 2 hours", "tomorrow at 9", "friday 8pm", "at 20:30", "on 14 march".
+    Returns (utc timestamp, text without the time phrase) or None."""
+    now = datetime.datetime.now(zone)
+    low = text.lower()
+    m = re.search(r"\bin\s+((?:(?:\d+(?:\.\d+)?|an?|half an?)\s*(?:%s)\b[\s,]*(?:and\s+)?)+)" % "|".join(
+        sorted(DURATION_UNITS, key=len, reverse=True)), low)
+    if m:
+        seconds = 0
+        for amount, unit in re.findall(r"(\d+(?:\.\d+)?|half an?|an?)\s*([a-z]+)", m[1]):
+            amount = 0.5 if amount.startswith("half") else 1 if amount in ("a", "an") else float(amount)
+            seconds += amount * DURATION_UNITS.get(unit, 0)
+        if seconds:
+            return time.time() + seconds, text[:m.start()] + text[m.end():]
+    patterns = [
+        (rf"\b(?:on\s+)?(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?{MONTH_RE}\b(?:\s+(?:at\s+)?{CLOCK})?", "date"),
+        (rf"\b(?:on\s+)?{MONTH_RE}\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s+(?:at\s+)?{CLOCK})?", "date"),
+        (rf"\b(?:on\s+)?(?P<d>\d{{1,2}})[/.-](?P<mo>\d{{1,2}})\b(?:\s+(?:at\s+)?{CLOCK})?", "date"),
+        (rf"\b(?P<rel>today|tonight|tomorrow|tmrw|tmr)\b(?:\s+(?:at\s+)?{CLOCK})?", "rel"),
+        (rf"\b(?:at\s+)?{CLOCK}\s+(?P<rel>today|tonight|tomorrow|tmrw|tmr)\b", "rel"),
+        (rf"\b(?:on\s+|next\s+|this\s+)?(?P<wd>mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day|nesday|sday|urday)?\b(?:\s+(?:at\s+)?{CLOCK})?", "weekday"),
+        (rf"\bat\s+{CLOCK}", "clock"),
+    ]
+    for pattern, kind in patterns:
+        m = re.search(pattern, low)
+        if not m:
+            continue
+        try:
+            if kind == "date":
+                month = month_number(m["mon"]) if "mon" in m.groupdict() and m["mon"] else int(m["mo"])
+                day = int(m["d"])
+                h, minute = clock_time(m)
+                when = now.replace(month=month, day=day, hour=h, minute=minute, second=0, microsecond=0)
+                if when <= now:
+                    when = when.replace(year=now.year + 1)
+            elif kind == "rel":
+                h, minute = clock_time(m, (20, 0) if m["rel"] == "tonight" else (9, 0))
+                if m["rel"] == "tonight" and h < 12:
+                    h += 12
+                when = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+                if m["rel"] in ("tomorrow", "tmrw", "tmr"):
+                    when += datetime.timedelta(days=1)
+            elif kind == "weekday":
+                target = next(i for i, d in enumerate(WEEKDAYS) if d.startswith(m["wd"][:3]))
+                h, minute = clock_time(m)
+                when = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+                when += datetime.timedelta(days=(target - now.weekday()) % 7)
+                if when <= now:
+                    when += datetime.timedelta(days=7)
+            else:
+                if not (m["ap"] or m["min"]):
+                    continue  # "at 5" alone is too vague to be sure it's a time
+                h, minute = clock_time(m)
+                when = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+                if when <= now:
+                    when += datetime.timedelta(days=1)
+        except (ValueError, StopIteration):
+            continue
+        return when.timestamp(), text[:m.start()] + text[m.end():]
+    return None
+
+
+async def parse_when_with_gemini(text, zone):
+    """For times the rules above miss ("next weekend", "end of the month"): ask the light model."""
+    now = datetime.datetime.now(zone)
+    try:
+        response = await asyncio.wait_for(client.aio.models.generate_content(
+            model=REACTION_MODEL,
+            contents=(f"It is {now:%A %d %B %Y, %H:%M}. When does this reminder want to fire? Reply with only "
+                      f"YYYY-MM-DD HH:MM in the same time zone, or NONE.\n\nReminder: {text[:300]}")), 15)
+        found = re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", response.text or "")
+        if found:
+            when = datetime.datetime.strptime(found[0], "%Y-%m-%d %H:%M").replace(tzinfo=zone)
+            if when > now:
+                return when.timestamp()
+    except Exception as e:
+        log.info("Gemini couldn't read the reminder time: %s", e)
+    return None
+
+
+def tidy_task(text):
+    text = re.sub(r"\s+", " ", text).strip(" ,.:;-")
+    text = re.sub(r"^(?:to|that|about|of|for|on)\s+", "", text, flags=re.I)
+    return re.sub(r"\s+(?:to|that|about)$", "", text, flags=re.I).strip(" ,.:;-")
+
+
+async def add_reminder(update, context, text, asked_in_words=False):
+    """text: e.g. "me in 2 hours to call mum", "everyone friday 8pm match", "@ann tomorrow pay rent".
+    Returns False (saying nothing) if a request in plain words has no time, so it's answered as chat instead."""
+    msg, user = update.message, update.effective_user
+    zone = await chat_zone(update.effective_chat.id)
+    who = [("me", user.id, user.first_name)]
+    target = re.match(r"\s*(me|us|everyone|everybody|all|the group|@\w+)\b\s*", text, re.I)
+    if target:
+        text = text[target.end():]
+        word = target[1].lower()
+        if word in ("us", "everyone", "everybody", "all", "the group"):
+            who = [("everyone", None, "everyone")]
+        elif word.startswith("@"):
+            group_members = await load_members(update.effective_chat.id)
+            by_username = {m["username"].lower(): (uid, m["name"]) for uid, m in group_members.items() if m["username"]}
+            uid, name = by_username.get(word[1:], (word, word))
+            who = [("person", uid, name)]
+    for entity in msg.parse_entities(["text_mention"]):
+        who = [("person", entity.user.id, entity.user.first_name)]
+    found = parse_when(text, zone)
+    if found:
+        when, task = found
+    else:
+        when, task = await parse_when_with_gemini(text, zone), text
+        task = re.sub(r"\b(in|on|at|next|this)\b.*$", "", task, flags=re.I) if when and len(task) > 60 else task
+    task = tidy_task(task)
+    if not when and asked_in_words:
+        return False
+    if not when:
+        await msg.reply_text("⏰ When should I remind you? Try something like:\n"
+                             "/remind me in 2 hours to call mum\n/remind everyone friday 8pm match\n"
+                             "/remind @ann tomorrow at 9am pay the rent", do_quote=True)
+        return
+    if when - time.time() > 366 * 86400:
+        await msg.reply_text("That's more than a year away. I'll have forgotten by then. 😅", do_quote=True)
+        return True
+    async with store_lock("reminders"):
+        reminders = await load_store("reminders", [])
+        if sum(r["chat"] == update.effective_chat.id for r in reminders) >= 50:
+            await msg.reply_text("This chat already has 50 reminders waiting. Cancel some with /reminders first.", do_quote=True)
+            return True
+        kind, uid, name = who[0]
+        reminders.append({"id": base64.urlsafe_b64encode(os.urandom(4)).decode().rstrip("="), "chat": update.effective_chat.id,
+                          "by": user.id, "by_name": user.first_name, "who": kind, "uid": uid, "name": name,
+                          "task": task or "this", "at": when, "msg": msg.message_id})
+        await save_store("reminders")
+    local = datetime.datetime.fromtimestamp(when, zone)
+    whom = "you" if kind == "me" else "everyone" if kind == "everyone" else name
+    await msg.reply_text(f"⏰ Got it. I'll remind {whom} {friendly_time(local)}: {task or 'this'}", do_quote=True)
+    return True
+
+
+def friendly_time(local):
+    now = datetime.datetime.now(local.tzinfo)
+    clock = local.strftime("%-I:%M %p").replace(":00 ", " ").lower()
+    days = (local.date() - now.date()).days
+    if days == 0:
+        return f"today at {clock}" if local - now > datetime.timedelta(hours=1) else f"at {clock}"
+    if days == 1:
+        return f"tomorrow at {clock}"
+    if days < 7:
+        return f"on {local:%A} at {clock}"
+    return f"on {local:%a %-d %b %Y} at {clock}" if local.year != now.year else f"on {local:%a %-d %b} at {clock}"
+
+
+async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context):
+        return
+    await add_reminder(update, context, " ".join(context.args))
+
+
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reminders lists what's coming; /reminders cancel 2 removes one."""
+    if not await ready(update, context):
+        return
+    chat_id, zone = update.effective_chat.id, await chat_zone(update.effective_chat.id)
+    async with store_lock("reminders"):
+        reminders = await load_store("reminders", [])
+        mine = sorted((r for r in reminders if r["chat"] == chat_id), key=lambda r: r["at"])
+        if len(context.args) >= 2 and context.args[0].lower() in ("cancel", "delete", "remove") and context.args[1].isdigit():
+            n = int(context.args[1])
+            if not 1 <= n <= len(mine):
+                await update.message.reply_text("There's no reminder with that number.", do_quote=True)
+                return
+            r = mine[n - 1]
+            if r["by"] != update.effective_user.id and update.effective_user.id not in ADMIN_USERS:
+                await update.message.reply_text(f"Only {r['by_name']} can cancel that one.", do_quote=True)
+                return
+            reminders.remove(r)
+            await save_store("reminders")
+            await update.message.reply_text(f"🗑️ Cancelled: {r['task']}", do_quote=True)
+            return
+    if not mine:
+        await update.message.reply_text("No reminders waiting. Set one with /remind me in 2 hours to stretch", do_quote=True)
+        return
+    lines = [f"{i}. {friendly_time(datetime.datetime.fromtimestamp(r['at'], zone))} – "
+             f"{html.escape(r['task'])} (for {html.escape('everyone' if r['who'] == 'everyone' else r['name'])})"
+             for i, r in enumerate(mine, 1)]
+    await update.message.reply_text("⏰ <b>Coming up</b>\n" + "\n".join(lines) + "\n\nCancel one with /reminders cancel 2",
+                                    parse_mode=ParseMode.HTML, do_quote=True)
+
+
+async def fire_reminders():
+    async with store_lock("reminders"):
+        reminders = await load_store("reminders", [])
+        due = [r for r in reminders if r["at"] <= time.time()]
+        if not due:
+            return
+        for r in due:
+            reminders.remove(r)
+        await save_store("reminders")
+    for r in due:
+        if r["who"] == "everyone":
+            head = "📢 <b>Reminder for everyone</b>"
+        else:
+            head = f"⏰ {mention(r['uid'], r['name'])}, reminder"
+        set_by = "" if r["who"] == "me" else f"\n<i>(set by {html.escape(r['by_name'])})</i>"
+        try:
+            await game_bot.send_message(r["chat"], f"{head}: {html.escape(r['task'])}{set_by}", parse_mode=ParseMode.HTML,
+                                        reply_parameters=ReplyParameters(r["msg"], allow_sending_without_reply=True))
+        except Exception:
+            log.exception("Could not send a reminder")
+
+
+# ----- 3. Polls and picking
+
+async def poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/poll Pizza or burgers?  ·  /poll Where to? Goa, Manali, Ooty  ·  or a question line then one option per line."""
+    if not await ready(update, context):
+        return
+    text = update.message.text.split(None, 1)[1] if len(update.message.text.split(None, 1)) > 1 else ""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) > 2:
+        question, options = lines[0], lines[1:]
+    elif "?" in text and text.split("?", 1)[1].strip():
+        question, rest = text.split("?", 1)
+        question, options = question.strip() + "?", re.split(r"\s*(?:,|/|\bor\b|\|)\s*", rest.strip())
+    else:  # "pizza or burgers?": the options are the question
+        question = text.strip()
+        options = re.split(r"\s*(?:,|/|\bor\b|\|)\s*", text.strip().rstrip("?"))
+    options = [o.strip(" ?.") for o in options if o.strip(" ?.")][:10]
+    if not question or len(options) < 2:
+        await update.message.reply_text("Give me a question and at least two options, e.g.\n"
+                                        "/poll Pizza or burgers?\n/poll Where to? Goa, Manali, Ooty", do_quote=True)
+        return
+    await context.bot.send_poll(update.effective_chat.id, question[:300], [o[:100] for o in options], is_anonymous=False,
+                                reply_parameters=ReplyParameters(update.message.message_id, allow_sending_without_reply=True))
+
+
+async def pick_reply(update, text):
+    options = [o.strip(" ?.!") for o in re.split(r"\s*(?:,|/|\bor\b|\|)\s*", text) if o.strip(" ?.!")]
+    if len(options) < 2:
+        await update.message.reply_text("Give me at least two things to pick from, e.g. pick one: pizza, burgers, tacos", do_quote=True)
+        return
+    choice = options[secrets.randbelow(len(options))]
+    await update.message.reply_text(f"🎲 I pick: <b>{html.escape(choice)}</b>", parse_mode=ParseMode.HTML, do_quote=True)
+
+
+async def pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context):
+        return
+    await pick_reply(update, " ".join(context.args))
+
+
+# ----- 4. Translation
+
+async def translate_text(text, language, model=None):
+    prompt = (f"Translate this message into {language}. Reply with only the translation, keeping the tone, slang and "
+              f"emoji.\n\n{text}")
+    if model:
+        response = await asyncio.wait_for(client.aio.models.generate_content(model=model, contents=prompt), 20)
+        return (response.text or "").strip()
+    answer, _ = await ask_gemini([{"role": "user", "text": prompt}])
+    return (answer or "").strip()
+
+
+async def translate_reply(update, context, request):
+    """"translate" / "translate to French" (as a reply), or "translate hello to French"."""
+    msg = update.message
+    m = re.search(r"\b(?:to|into|in)\s+([A-Za-z][A-Za-z ()-]{1,30})\s*[?.!]*$", request)
+    language = m[1].strip().title() if m else "English"
+    rest = (request[:m.start()] if m else request).strip()
+    rest = re.sub(r"^\W*(?:translate|tl)\b\W*(?:(?:this|it|that|pls|please)\b\W*)*", "", rest, flags=re.I).strip()
+    quoted = msg.reply_to_message
+    source = rest or (quoted and (quoted.text or quoted.caption)) or ""
+    if not source:
+        await msg.reply_text("Reply to a message with \"Laden translate\" (or \"translate to French\").", do_quote=True)
+        return
+    quota, refusal = await use_quota(update.effective_user.id, "chat")
+    if refusal:
+        await msg.reply_text(refusal, do_quote=True)
+        return
+    try:
+        answer = await translate_text(source[:3000], language)
+    except Exception:
+        log.exception("Translation failed")
+        answer = ""
+    if not answer:
+        await refund(quota)
+        await msg.reply_text("I couldn't translate that right now. Try again in a minute.", do_quote=True)
+        return
+    target = quoted if quoted and not rest else msg
+    await target.reply_text(f"🌐 {answer}", do_quote=True)
+
+
+AUTO_TRANSLATE_DAILY = 300  # auto-translations per group per day, to spare the free allowance
+
+
+async def autotranslate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotranslate Bengali (into English) · /autotranslate Hindi into Bengali · /autotranslate off"""
+    if not await ready(update, context, group_only=True):
+        return
+    chat = str(update.effective_chat.id)
+    words = " ".join(context.args).strip()
+    async with store_lock("autotranslate"):
+        settings = await load_store("autotranslate", {})
+        if not words:
+            current = settings.get(chat)
+            await update.message.reply_text(
+                f"🌐 I translate messages written in {current['from']} into {current['to']}. Stop with /autotranslate off"
+                if current else "🌐 Auto-translate is off. Turn it on with e.g. /autotranslate Bengali "
+                                "(or /autotranslate Hindi into Bengali).", do_quote=True)
+            return
+        if words.lower() in ("off", "stop", "none"):
+            settings.pop(chat, None)
+            await save_store("autotranslate")
+            await update.message.reply_text("🌐 Auto-translate is off.", do_quote=True)
+            return
+        m = re.fullmatch(r"([A-Za-z][A-Za-z ()-]*?)(?:\s+(?:to|into)\s+([A-Za-z][A-Za-z ()-]*))?", words)
+        if not m:
+            await update.message.reply_text("Tell me the language, e.g. /autotranslate Bengali", do_quote=True)
+            return
+        settings[chat] = {"from": m[1].strip().title(), "to": (m[2] or "English").strip().title()}
+        await save_store("autotranslate")
+    s = settings[chat]
+    await update.message.reply_text(f"🌐 From now on I'll translate messages written in {s['from']} into {s['to']}. "
+                                    "Turn it off with /autotranslate off", do_quote=True)
+
+
+auto_translated = {}  # (chat, date) -> count
+
+
+async def auto_translate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text or msg.text.startswith("/") or not msg.from_user or msg.from_user.is_bot:
+        return
+    if len(re.findall(r"\w+", msg.text)) < 2 or not is_group(update) or not is_allowed(update):
+        return
+    try:
+        setting = (await load_store("autotranslate", {})).get(str(update.effective_chat.id))
+    except Exception:
+        return
+    if not setting or await ignored_while_off(update):
+        return
+    day = (update.effective_chat.id, period_key("day"))
+    if auto_translated.get(day, 0) >= AUTO_TRANSLATE_DAILY:
+        return
+    prompt = (f"If this message is written in {setting['from']} (in any script, including romanised), reply with only its "
+              f"translation into {setting['to']}. Otherwise reply with exactly SKIP.\n\nMessage: {msg.text[:1500]}")
+    try:
+        response = await asyncio.wait_for(client.aio.models.generate_content(model=REACTION_MODEL, contents=prompt), 20)
+        answer = (response.text or "").strip()
+    except Exception as e:
+        log.info("Auto-translate unavailable: %s", str(e)[:80])
+        return
+    if not answer or answer.upper().startswith("SKIP") or answer.strip().lower() == msg.text.strip().lower():
+        return
+    auto_translated[day] = auto_translated.get(day, 0) + 1
+    if not await muted(update, context):
+        await msg.reply_text(f"🌐 {answer}", do_quote=True)
+
+
+# ----- 6. Leaderboards and stats
+
+START_RATING, RATING_K = 1200, 32
+
+
+def player_entry(stats, uid, name):
+    entry = stats.setdefault(str(uid), {"name": name, "rating": START_RATING, "w": 0, "l": 0, "d": 0, "games": {},
+                                        "laden": {}, "party": {}, "puzzles": 0, "daily": 0, "trivia": 0})
+    entry["name"] = name
+    for k, v in (("games", {}), ("laden", {}), ("party", {}), ("puzzles", 0), ("daily", 0), ("trivia", 0)):
+        entry.setdefault(k, v)
+    return entry
+
+
+def tally(record, key, outcome):
+    """record[key] is [wins, losses, draws]."""
+    row = record.setdefault(key, [0, 0, 0])
+    row["wld".index(outcome)] += 1
+
+
+async def record_board_result(game):
+    """Count a finished two-player game: ratings and records between people, per-level records against Laden."""
+    if game.get("result") not in ("white", "black", "draw") or not game.get("white") or not game.get("black"):
+        return
+    if not game["moves"]:
+        return  # nobody played a move
+    key = f"stats:{game['chat_id']}"
+    async with store_lock(key):
+        stats = await load_store(key, {})
+        sides = {c: game[c] for c in ("white", "black")}
+        outcome = {c: "d" if game["result"] == "draw" else "w" if game["result"] == c else "l" for c in sides}
+        people = [c for c in sides if not sides[c].get("bot")]
+        if game.get("bot_level"):
+            for c in people:
+                entry = player_entry(stats, sides[c]["id"], sides[c]["name"])
+                tally(entry["laden"], f"{game['kind']}:{game['bot_level']}", outcome[c])
+        elif len(people) == 2:
+            a, b = (player_entry(stats, sides[c]["id"], sides[c]["name"]) for c in ("white", "black"))
+            expected = 1 / (1 + 10 ** ((b["rating"] - a["rating"]) / 400))
+            score = {"w": 1, "d": 0.5, "l": 0}[outcome["white"]]
+            change = RATING_K * (score - expected)
+            a["rating"], b["rating"] = round(a["rating"] + change), round(b["rating"] - change)
+            for c, entry in (("white", a), ("black", b)):
+                entry[outcome[c]] += 1
+                tally(entry["games"], game["kind"], outcome[c])
+        await save_store(key)
+
+
+async def record_party_result(game):
+    standings = game["state"].get("standings") or []
+    key = f"stats:{game['chat_id']}"
+    async with store_lock(key):
+        stats = await load_store(key, {})
+        for place, i in enumerate(standings, 1):
+            p = game["players"][i]
+            if p.get("bot"):
+                continue
+            row = player_entry(stats, p["id"], p["name"])["party"].setdefault(game["kind"], [0, 0])
+            row[0] += place == 1
+            row[1] += 1
+        await save_store(key)
+
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context, group_only=True):
+        return
+    try:
+        stats = await load_store(f"stats:{update.effective_chat.id}", {})
+    except Exception:
+        await update.message.reply_text("I couldn't read the scores right now. Try again in a minute.", do_quote=True)
+        return
+    people = list(stats.values())
+    sections = []
+    rated = sorted((p for p in people if p["w"] + p["l"] + p["d"]), key=lambda p: -p["rating"])[:10]
+    if rated:
+        sections.append("<b>♟ Board games</b> (rating · wins-losses-draws)\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {p['rating']} · {p['w']}-{p['l']}-{p['d']}" for i, p in enumerate(rated, 1)))
+    beat = sorted(((sum(r[0] for r in p["laden"].values()), p) for p in people), key=lambda x: -x[0])
+    beat = [(n, p) for n, p in beat if n][:5]
+    if beat:
+        sections.append("<b>🤖 Wins against Laden</b>\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {n}" for i, (n, p) in enumerate(beat, 1)))
+    dice = sorted(((sum(r[0] for r in p["party"].values()), sum(r[1] for r in p["party"].values()), p) for p in people),
+                  key=lambda x: (-x[0], x[1]))
+    dice = [x for x in dice if x[1]][:5]
+    if dice:
+        sections.append("<b>🎲 Ludo and Snakes and Ladders</b> (wins of games)\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {w} of {n}" for i, (w, n, p) in enumerate(dice, 1)))
+    daily = sorted((p for p in people if p["daily"]), key=lambda p: -p["daily"])[:5]
+    if daily:
+        sections.append("<b>🧩 Daily puzzle points</b>\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {p['daily']}" for i, p in enumerate(daily, 1)))
+    trivia = sorted((p for p in people if p["trivia"]), key=lambda p: -p["trivia"])[:5]
+    if trivia:
+        sections.append("<b>❓ Trivia (all time)</b>\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {p['trivia']}" for i, p in enumerate(trivia, 1)))
+    solved = sorted((p for p in people if p["puzzles"]), key=lambda p: -p["puzzles"])[:10]
+    if solved:
+        sections.append("<b>✅ Puzzles solved (all time)</b>\n" + "\n".join(
+            f"{medal(i)} {html.escape(p['name'])} – {p['puzzles']}" for i, p in enumerate(solved, 1)))
+    if not sections:
+        await update.message.reply_text("No scores yet. Play a game, solve a puzzle or try /trivia!", do_quote=True)
+        return
+    await update.message.reply_text("🏆 <b>Leaderboard</b>\n\n" + "\n\n".join(sections), parse_mode=ParseMode.HTML, do_quote=True)
+
+
+def medal(place):
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(place, f"{place}.")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stats for yourself, /stats @name, or as a reply."""
+    if not await ready(update, context, group_only=True):
+        return
+    msg = update.message
+    uid, name = update.effective_user.id, update.effective_user.first_name
+    if msg.reply_to_message and msg.reply_to_message.from_user and not msg.reply_to_message.from_user.is_bot:
+        uid, name = msg.reply_to_message.from_user.id, msg.reply_to_message.from_user.first_name
+    elif context.args:
+        found = await resolve_ship_targets(update, await load_members(update.effective_chat.id))
+        if found:
+            uid, name = found[0]
+    try:
+        stats = await load_store(f"stats:{update.effective_chat.id}", {})
+    except Exception:
+        await msg.reply_text("I couldn't read the scores right now. Try again in a minute.", do_quote=True)
+        return
+    p = stats.get(str(uid)) or next((e for e in stats.values() if e["name"].lower() == str(name).lower()), None)
+    if not p:
+        await msg.reply_text(f"{name} hasn't played anything yet.", do_quote=True)
+        return
+    p = player_entry({"x": p}, "x", p["name"])
+    lines = [f"📊 <b>{html.escape(p['name'])}</b>"]
+    if p["w"] + p["l"] + p["d"]:
+        lines.append(f"Rating {p['rating']} · {p['w']} wins, {p['l']} losses, {p['d']} draws against people")
+        lines += [f"  {GAMES[k].title}: {w}-{l}-{d}" for k, (w, l, d) in sorted(p["games"].items()) if k in GAMES]
+    if p["laden"]:
+        lines.append("Against Laden (wins-losses-draws):")
+        for key, (w, l, d) in sorted(p["laden"].items()):
+            kind, level = key.split(":")
+            lines.append(f"  {GAMES[kind].title if kind in GAMES else kind} level {level}: {w}-{l}-{d}")
+    for kind, (w, n) in sorted(p["party"].items()):
+        lines.append(f"{PARTY_GAMES[kind].title if kind in PARTY_GAMES else kind}: won {w} of {n}")
+    if p["puzzles"] or p["daily"]:
+        lines.append(f"Puzzles solved: {p['puzzles']} (daily puzzle points: {p['daily']})")
+    if p["trivia"]:
+        lines.append(f"Trivia answers: {p['trivia']}")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, do_quote=True)
+
+
+async def note_morning_chat(chat_id):
+    async with store_lock("morning_chats"):
+        chats = await load_store("morning_chats", [])
+        if chat_id not in chats:
+            chats.append(chat_id)
+            await save_store("morning_chats")
+
+
+async def credit(chat_id, uid, name, field):
+    key = f"stats:{chat_id}"
+    async with store_lock(key):
+        stats = await load_store(key, {})
+        player_entry(stats, uid, name)[field] += 1
+        await save_store(key)
+
+
+# ----- 7. Chess puzzles (from Lichess): "puzzle" for one now, /dailypuzzle on for one every morning
+
+PUZZLE_TRIGGER = r"(?i)^\s*puzzle\s*[!.?]*\s*$"
+PUZZLE_OPEN_HOURS = 24  # an unsolved puzzle gets its answer posted after this
+
+
+async def fetch_puzzle(daily):
+    r = await http.get("https://lichess.org/api/puzzle/" + ("daily" if daily else "next"), timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    game = chess.pgn.read_game(io.StringIO(data["game"]["pgn"]))
+    board = game.end().board()
+    last = board.peek().uci() if board.move_stack else None
+    p = data["puzzle"]
+    return {"id": p["id"], "rating": p.get("rating"), "themes": p.get("themes", []), "fen": board.fen(), "last": last,
+            "solution": p["solution"], "daily": daily, "posted": time.time(), "solved_by": None, "solvers": []}
+
+
+async def post_puzzle(chat_id, daily, reply_to=None):
+    puzzle = await fetch_puzzle(daily)
+    board = chess.Board(puzzle["fen"])
+    side = "White" if board.turn else "Black"
+    title = "Daily puzzle" if daily else "Puzzle"
+    mate = next((t for t in puzzle["themes"] if t.startswith("mateIn")), None)
+    goal = f"mate in {mate[6:]}" if mate else "find the best move"
+    picture = await asyncio.to_thread(gameimages.puzzle_picture, board.board_fen(), puzzle["last"], title,
+                                      f"{side} to move: {goal}", f"{side} to move", False, not board.turn)
+    caption = (f"🧩 <b>{title}</b> · rated {puzzle['rating']}\n{side} to move: {goal}.\n"
+               f"Reply to this with your first move (like Nf3, Qxh7+ or e2e4). "
+               + ("The first to solve it gets a point on the /leaderboard." if daily else "Just for fun."))
+    sent = await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
+                                     reply_parameters=ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None)
+    puzzle["msg"] = sent.message_id
+    key = f"puzzles:{chat_id}"
+    async with store_lock(key):
+        puzzles = await load_store(key, [])
+        puzzles.append(puzzle)
+        del puzzles[:-10]  # keep the last few, so late answers to them still work
+        await save_store(key)
+
+
+async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The word "puzzle" (or "Laden post a puzzle"): a fresh puzzle just for fun."""
+    if await ignored_while_off(update) or not is_allowed(update):
+        return  # stay quiet outside allowed chats, like "kitty"
+    try:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+        await post_puzzle(update.effective_chat.id, daily=False, reply_to=update.message.message_id)
+    except Exception:
+        log.exception("Could not post a puzzle")
+        await update.message.reply_text("Lichess didn't send me a puzzle just now. Try again in a minute.", do_quote=True)
+
+
+def read_move(board, text):
+    """The first thing in the text that's a legal move here, in SAN (Nf3, O-O) or UCI (g1f3)."""
+    for word in re.findall(r"[A-Za-z0-9=+#\-]+", text.replace("×", "x")):
+        word = word.strip("+#!?")
+        for attempt in (word, word[0].upper() + word[1:] if word[:1] in "nbrqk" and len(word) > 2 else None):
+            if not attempt:
+                continue
+            try:
+                return board.parse_san(attempt)
+            except ValueError:
+                pass
+            try:
+                move = chess.Move.from_uci(attempt.lower())
+                if move in board.legal_moves:
+                    return move
+            except ValueError:
+                pass
+    return None
+
+
+def solution_line(puzzle):
+    board, parts = chess.Board(puzzle["fen"]), []
+    for i, uci in enumerate(puzzle["solution"]):
+        move = chess.Move.from_uci(uci)
+        number = board.fullmove_number
+        if board.turn or i == 0:
+            parts.append(f"{number}." if board.turn else f"{number}…")
+        parts.append(board.san(move))
+        board.push(move)
+    return " ".join(parts), board
+
+
+async def puzzle_answer(update, context, puzzle, key):
+    """A reply to a puzzle post. The first right answer is credited with a solved copy, like a game result."""
+    msg, user = update.message, update.effective_user
+    if puzzle.get("closed"):
+        await msg.reply_text("This puzzle is closed; its answer has been posted. Send \"puzzle\" for a new one!", do_quote=True)
+        return
+    board = chess.Board(puzzle["fen"])
+    move = read_move(board, msg.text or "")
+    if not move:
+        await msg.reply_text("That's not a legal move in this position. Reply with a move like Nf3 or e2e4.", do_quote=True)
+        return
+    right = move.uci() == puzzle["solution"][0]
+    if not right and len(puzzle["solution"]) == 1:
+        board.push(move)
+        right = board.is_checkmate()  # any mate in one counts
+    if not right:
+        await msg.reply_text("❌ Not that one. Keep looking!", do_quote=True)
+        return
+    async with store_lock(key):
+        first = puzzle["solved_by"] is None
+        if user.id in puzzle["solvers"]:
+            await msg.reply_text("✅ You already solved this one!", do_quote=True)
+            return
+        puzzle["solvers"].append(user.id)
+        if first:
+            puzzle["solved_by"] = {"id": user.id, "name": user.first_name}
+        await save_store(key)
+    await credit(update.effective_chat.id, user.id, user.first_name, "puzzles")
+    if not first:
+        await msg.reply_text(f"✅ Right too! ({puzzle['solved_by']['name']} got there first.)", do_quote=True)
+        return
+    if puzzle["daily"]:
+        await credit(update.effective_chat.id, user.id, user.first_name, "daily")
+    await post_puzzle_solution(update.effective_chat.id, puzzle, user.first_name, reply_to=msg.message_id)
+
+
+async def post_puzzle_solution(chat_id, puzzle, solver, reply_to=None):
+    line, final = solution_line(puzzle)
+    title = "Daily puzzle" if puzzle["daily"] else "Puzzle"
+    flip = not chess.Board(puzzle["fen"]).turn
+    label = f"Solved first by {solver}" if solver else "Nobody solved it"
+    picture = await asyncio.to_thread(gameimages.puzzle_picture, final.board_fen(), puzzle["solution"][-1],
+                                      f"{title} - solved", f"Solution: {line}", label, bool(solver), flip)
+    head = (f"🏆 <b>{html.escape(solver)}</b> solved the {title.lower()}!" if solver else
+            f"⌛ Nobody solved the {title.lower()}. Here's the answer.")
+    caption = (f"🧩 <b>{title} result</b>\n{head}\n\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>"
+               f"\n<a href=\"https://lichess.org/training/{puzzle['id']}\">Puzzle on Lichess</a>")
+    await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
+                              reply_parameters=ReplyParameters(reply_to or puzzle["msg"], allow_sending_without_reply=True))
+
+
+async def open_puzzle_for(update):
+    """The puzzle this message replies to, if any: (puzzle, store key)."""
+    quoted = update.message.reply_to_message
+    if not quoted or not quoted.from_user or quoted.from_user.id != update.get_bot().id:
+        return None, None
+    key = f"puzzles:{update.effective_chat.id}"
+    try:
+        puzzles = await load_store(key, [])
+    except Exception:
+        return None, None
+    return next((p for p in puzzles if p["msg"] == quoted.message_id), None), key
+
+
+async def daily_puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/dailypuzzle on|off: a chess puzzle every morning at 9."""
+    if not await ready(update, context, group_only=True):
+        return
+    chat = update.effective_chat.id
+    choice = (context.args[0].lower() if context.args else "")
+    async with store_lock("puzzle_chats"):
+        chats = await load_store("puzzle_chats", [])
+        if choice in ("on", "off"):
+            if choice == "on" and chat not in chats:
+                chats.append(chat)
+            if choice == "off" and chat in chats:
+                chats.remove(chat)
+            await save_store("puzzle_chats")
+    on = chat in chats
+    await update.message.reply_text(
+        (f"🧩 Daily puzzle is on: a chess puzzle here every morning at {MORNING_HOUR}:00. The first to solve it gets a point "
+         "on the /leaderboard. Turn it off with /dailypuzzle off" if on else
+         "🧩 Daily puzzle is off. Turn it on with /dailypuzzle on") +
+        "\n\nSend \"puzzle\" any time for an extra one, just for fun.", do_quote=True)
+
+
+async def morning_puzzle(chat_id):
+    key = f"puzzles:{chat_id}"
+    async with store_lock(key):
+        puzzles = await load_store(key, [])
+        unsolved = [p for p in puzzles if p["daily"] and p["solved_by"] is None and not p.get("closed")]
+        for p in unsolved:
+            p["closed"] = True
+        await save_store(key)
+    for p in unsolved:
+        await post_puzzle_solution(chat_id, p, None)
+    await post_puzzle(chat_id, daily=True)
+
+
+async def close_old_puzzles():
+    """Post the answer to any unsolved for-fun puzzle that has been open for a day."""
+    for key in [k for k in store_cache if k.startswith("puzzles:")]:
+        chat_id = int(key.split(":", 1)[1])
+        async with store_lock(key):
+            stale = [p for p in store_cache[key] if not p["daily"] and p["solved_by"] is None and not p.get("closed")
+                     and time.time() - p["posted"] > PUZZLE_OPEN_HOURS * 3600]
+            for p in stale:
+                p["closed"] = True
+            if stale:
+                await save_store(key)
+        for p in stale:
+            await post_puzzle_solution(chat_id, p, None)
+
+
+# ----- 8. Trivia: first right tap scores, weekly champion on Mondays
+
+TRIVIA_SECONDS = 90
+trivia_rounds = {}  # round id -> {"chat", "msg", "question", "options", "answer", "out": set(), "done"}
+
+
+def week_key(when=None):
+    year, week, _ = (when or datetime.date.today()).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+async def trivia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/trivia for a question, /trivia top for this week's scores."""
+    if not await ready(update, context, group_only=True):
+        return
+    chat_id = update.effective_chat.id
+    if context.args and context.args[0].lower() in ("top", "scores", "week", "leaderboard"):
+        scores = await load_store(f"trivia:{chat_id}:{week_key()}", {})
+        if not scores:
+            await update.message.reply_text("No trivia points this week yet. Start with /trivia", do_quote=True)
+            return
+        ranked = sorted(scores.values(), key=lambda s: -s["pts"])[:10]
+        await update.message.reply_text("❓ <b>Trivia this week</b>\n" + "\n".join(
+            f"{medal(i)} {html.escape(s['name'])} – {s['pts']}" for i, s in enumerate(ranked, 1)) +
+            "\n\nThe champion is crowned on Monday morning.", parse_mode=ParseMode.HTML, do_quote=True)
+        return
+    if any(r["chat"] == chat_id and not r["done"] for r in trivia_rounds.values()):
+        await update.message.reply_text("There's a question still open. Answer that one first!", do_quote=True)
+        return
+    try:
+        r = await http.get("https://opentdb.com/api.php", params={"amount": 1, "type": "multiple"}, timeout=15)
+        q = r.json()["results"][0]
+    except Exception:
+        log.exception("Trivia question failed")
+        await update.message.reply_text("My quiz book is stuck. Try again in a minute.", do_quote=True)
+        return
+    options = [html.unescape(o) for o in q["incorrect_answers"]] + [html.unescape(q["correct_answer"])]
+    random.shuffle(options)
+    round_id = base64.urlsafe_b64encode(os.urandom(6)).decode()
+    question = html.unescape(q["question"])
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton(o[:60], callback_data=f"trivia|{round_id}|{i}")] for i, o in enumerate(options)])
+    text = (f"❓ <b>Trivia</b> · {html.escape(html.unescape(q['category']))} · {q['difficulty']}\n\n{html.escape(question)}\n\n"
+            f"<i>First right answer scores. One guess each, {TRIVIA_SECONDS} seconds.</i>")
+    sent = await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=buttons, do_quote=False)
+    trivia_rounds[round_id] = {"chat": chat_id, "msg": sent.message_id, "question": question, "options": options,
+                               "answer": options.index(html.unescape(q["correct_answer"])), "out": set(), "done": False,
+                               "category": html.unescape(q["category"]), "difficulty": q["difficulty"]}
+    asyncio.create_task(trivia_timeout(round_id))
+
+
+async def trivia_timeout(round_id):
+    await asyncio.sleep(TRIVIA_SECONDS)
+    r = trivia_rounds.get(round_id)
+    if not r or r["done"]:
+        return
+    r["done"] = True
+    try:
+        await game_bot.edit_message_text(
+            f"❓ <b>Trivia</b>\n\n{html.escape(r['question'])}\n\n⌛ Time's up! It was <b>{html.escape(r['options'][r['answer']])}</b>.",
+            chat_id=r["chat"], message_id=r["msg"], parse_mode=ParseMode.HTML)
+    except Exception:
+        log.exception("Could not close a trivia question")
+
+
+async def trivia_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, round_id, choice = query.data.split("|")
+    r, user = trivia_rounds.get(round_id), query.from_user
+    if not r or r["done"]:
+        await query.answer("This question is over.")
+        return
+    if user.id in r["out"]:
+        await query.answer("You've had your guess on this one!")
+        return
+    if int(choice) != r["answer"]:
+        r["out"].add(user.id)
+        await query.answer("❌ Wrong! You're out for this question.")
+        return
+    r["done"] = True
+    await query.answer("✅ Correct! +1 point")
+    key = f"trivia:{r['chat']}:{week_key()}"
+    async with store_lock(key):
+        scores = await load_store(key, {})
+        entry = scores.setdefault(str(user.id), {"name": user.first_name, "pts": 0})
+        entry["name"], entry["pts"] = user.first_name, entry["pts"] + 1
+        await save_store(key)
+    await credit(r["chat"], user.id, user.first_name, "trivia")
+    await note_morning_chat(r["chat"])
+    await query.edit_message_text(
+        f"❓ <b>Trivia</b>\n\n{html.escape(r['question'])}\n\n✅ {mention(user.id, user.first_name)} got it: "
+        f"<b>{html.escape(r['options'][r['answer']])}</b> (+1, {entry['pts']} this week)", parse_mode=ParseMode.HTML)
+
+
+async def crown_trivia_champion(chat_id):
+    last_week = week_key(datetime.date.today() - datetime.timedelta(days=7))
+    scores = await load_store(f"trivia:{chat_id}:{last_week}", {})
+    if not scores:
+        return
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1]["pts"])
+    uid, best = ranked[0]
+    podium = "\n".join(f"{medal(i)} {html.escape(s['name'])} – {s['pts']}" for i, (_, s) in enumerate(ranked[:3], 1))
+    await game_bot.send_message(chat_id, f"👑 <b>Trivia champion of the week:</b> {mention(uid, best['name'])} with "
+                                         f"{best['pts']} point{'s' * (best['pts'] != 1)}!\n\n{podium}\n\nNew week, new scores. /trivia",
+                                parse_mode=ParseMode.HTML)
+
+
+# ----- 9. Birthdays
+
+def read_birthday(text):
+    """(day, month) from "14 March", "March 14", "14/03", "14-3"."""
+    low = text.lower()
+    m = re.search(rf"(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\s*(?:of\s+)?{MONTH_RE}", low) or \
+        re.search(rf"{MONTH_RE}\s*(?P<d>\d{{1,2}})", low)
+    if m:
+        day, month = int(m["d"]), month_number(m["mon"])
+    else:
+        m = re.search(r"(\d{1,2})[/.-](\d{1,2})", low)
+        if not m:
+            return None
+        day, month = int(m[1]), int(m[2])
+    try:
+        datetime.date(2000, month, day)  # a leap year, so 29 February is allowed
+    except ValueError:
+        return None
+    return day, month
+
+
+async def birthday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/birthday 14 March saves yours; /birthday forget removes it; /birthday alone shows what I have."""
+    if not await ready(update, context, group_only=True):
+        return
+    user, key = update.effective_user, f"birthdays:{update.effective_chat.id}"
+    words = " ".join(context.args)
+    async with store_lock(key):
+        days = await load_store(key, {})
+        if words.lower() in ("forget", "remove", "delete", "off"):
+            days.pop(str(user.id), None)
+            await save_store(key)
+            await update.message.reply_text("🎂 Forgotten. No birthday wishes for you. 🥲", do_quote=True)
+            return
+        if not words:
+            mine = days.get(str(user.id))
+            await update.message.reply_text(
+                f"🎂 I have yours down as {mine['day']} {MONTHS[mine['month'] - 1].title()}." if mine else
+                "🎂 Tell me yours with /birthday 14 March, and I'll wish you here on the day.", do_quote=True)
+            return
+        found = read_birthday(words)
+        if not found:
+            await update.message.reply_text("I couldn't read that date. Try /birthday 14 March or /birthday 14/03", do_quote=True)
+            return
+        days[str(user.id)] = {"name": user.first_name, "day": found[0], "month": found[1], "wished": 0}
+        await save_store(key)
+    await note_morning_chat(update.effective_chat.id)
+    await update.message.reply_text(f"🎂 Saved: {found[0]} {MONTHS[found[1] - 1].title()}. I'll wish you here on the day!", do_quote=True)
+
+
+async def birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context, group_only=True):
+        return
+    days = await load_store(f"birthdays:{update.effective_chat.id}", {})
+    if not days:
+        await update.message.reply_text("No birthdays saved yet. Add yours with /birthday 14 March", do_quote=True)
+        return
+    today = datetime.datetime.now(await chat_zone(update.effective_chat.id)).date()
+
+    def until(b):
+        day = min(b["day"], 28) if b["month"] == 2 and b["day"] == 29 else b["day"]
+        nxt = datetime.date(today.year, b["month"], day)
+        return ((nxt if nxt >= today else datetime.date(today.year + 1, b["month"], day)) - today).days
+    lines = [f"{'🎉 today!' if until(b) == 0 else f'in {until(b)} days'} – {html.escape(b['name'])} "
+             f"({b['day']} {MONTHS[b['month'] - 1][:3].title()})" for b in sorted(days.values(), key=until)]
+    await update.message.reply_text("🎂 <b>Coming birthdays</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML, do_quote=True)
+
+
+async def wish_birthdays(chat_id, today):
+    key = f"birthdays:{chat_id}"
+    leap = today.year % 4 == 0 and (today.year % 100 != 0 or today.year % 400 == 0)
+    async with store_lock(key):
+        days = await load_store(key, {})
+        due = [(uid, b) for uid, b in days.items() if b.get("wished") != today.year and b["month"] == today.month and
+               (b["day"] == today.day or (b["day"] == 29 and b["month"] == 2 and not leap and today.day == 28))]
+        for _, b in due:
+            b["wished"] = today.year
+        if due:
+            await save_store(key)
+    for uid, b in due:
+        wish = ""
+        try:
+            response = await asyncio.wait_for(client.aio.models.generate_content(
+                model=REACTION_MODEL, contents=f"Write a short, warm, funny birthday wish (2 sentences, a couple of emoji) "
+                                               f"for {b['name']} from their group chat. Don't guess their gender."), 20)
+            wish = (response.text or "").strip()
+        except Exception as e:
+            log.info("Birthday wish fell back to the template: %s", e)
+        wish = wish or random.choice(["May your day be full of cake and zero responsibilities! 🍰🎈",
+                                      "Another lap around the sun, and still our favourite! 🌞🎁"])
+        await game_bot.send_message(chat_id, f"🎂🎉 <b>Happy birthday, {mention(uid, b['name'])}!</b>\n\n{html.escape(wish)}",
+                                    parse_mode=ParseMode.HTML)
+
+
+# ----- 10. Links: what Gemini sees when someone asks about a link
+
+YOUTUBE = re.compile(r"(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)[\w-]{6,}")
+
+
+def message_links(msg):
+    if not msg:
+        return []
+    links = []
+    for entity, text in {**msg.parse_entities(["url", "text_link"]), **msg.parse_caption_entities(["url", "text_link"])}.items():
+        url = entity.url if entity.type == "text_link" else text
+        links.append(url if url.startswith("http") else "https://" + url)
+    return list(dict.fromkeys(links))
+
+
+async def page_text(url):
+    """A web page's title and readable text (trimmed), or None."""
+    try:
+        async with http.stream("GET", url, headers=BROWSER_HEADERS, follow_redirects=True, timeout=15) as r:
+            if r.status_code >= 400 or "html" not in r.headers.get("content-type", "html"):
+                return None
+            raw = b""
+            async for chunk in r.aiter_bytes():
+                raw += chunk
+                if len(raw) > 2_000_000:
+                    break
+    except Exception as e:
+        log.info("Could not read %s: %s", url, e)
+        return None
+    page = raw.decode("utf-8", "ignore")
+    title = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+    page = re.sub(r"(?is)<(script|style|noscript|svg|nav|footer|header|form)[^>]*>.*?</\1>", " ", page)
+    body = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))).strip()
+    return f"{html.unescape(title[1].strip()) if title else url}\n{body[:12000]}" if body else None
+
+
+async def link_context(update):
+    """(extra text for Gemini, extra media parts) for the links in this message and the one it replies to."""
+    links = (message_links(update.message) + message_links(update.message.reply_to_message))[:2]
+    extra, parts = [], []
+    for url in links:
+        if YOUTUBE.search(url):
+            parts.append(types.Part(file_data=types.FileData(file_uri=url)))  # Gemini watches YouTube videos itself
+            extra.append(f"[The YouTube video {url} is attached]")
+            continue
+        text = await page_text(url)
+        if text:
+            extra.append(f"[Contents of the link {url}]\n{text}")
+    return "\n\n".join(extra), parts
+
+
+# ----- 11. Splitting bills: /paid, /tab, /settle
+
+AMOUNT = re.compile(r"(?P<cur>[₹$€£৳¥]|rs\.?|inr|usd|tk)?\s*(?P<num>\d[\d,]*(?:\.\d+)?)\s*(?P<k>k\b)?\s*(?P<cur2>rupees?|rs|bucks|dollars?|taka|tk|inr|usd)?", re.I)
+ME_WORDS = {"me", "myself", "i", "mine"}
+
+
+def empty_tab():
+    return {"entries": [], "names": {}, "currency": ""}
+
+
+def money(amount, currency=""):
+    text = f"{amount:,.2f}".rstrip("0").rstrip(".")
+    return f"{currency}{text}" if currency in "₹$€£৳¥" and currency else f"{text} {currency}".strip()
+
+
+async def resolve_people(update, words, known=None):
+    """Turn names, @usernames and tagged people into [(key, name)]; "me" is the sender. known: {key: name} of
+    people already on the tab, so a name typed again means the same person."""
+    msg, user = update.message, update.effective_user
+    group_members = await load_members(update.effective_chat.id)
+    by_username = {m["username"].lower(): (uid, m["name"]) for uid, m in group_members.items() if m["username"]}
+    by_name = {}
+    for key, name in (known or {}).items():
+        if key.startswith("u") and key[1:].isdigit():
+            by_name.setdefault(name.lower(), (int(key[1:]), name))
+    for uid, m in group_members.items():
+        by_name.setdefault(m["name"].lower(), (uid, m["name"]))
+    people = [(f"u{e.user.id}", e.user.first_name) for e in msg.parse_entities(["text_mention"])]
+    tagged = {e.user.first_name.lower() for e in msg.parse_entities(["text_mention"])}
+    for word in words:
+        w = word.strip(" ,.&").lower()
+        if not w or w in ("and", "for", "with", "split", "between", "among", "the", "us", "of") or w in tagged:
+            continue
+        if w in ME_WORDS:
+            people.append((f"u{user.id}", user.first_name))
+        elif w.startswith("@"):
+            uid, name = by_username.get(w[1:]) or by_name.get(w[1:]) or (None, word.strip(" ,.&"))
+            people.append((f"u{uid}" if uid else f"n{w[1:]}", name))
+        elif w in by_name:
+            uid, name = by_name[w]
+            people.append((f"u{uid}", name))
+        else:
+            name = word.strip(" ,.&")
+            people.append((f"n{name.lower()}", name.title() if name.islower() else name))
+    return list(dict(people).items())
+
+
+async def add_expense(update, context, text):
+    """"1200 dinner for me, Ann and Bob" / "600 taxi for @ann" (Ann owes it all) / "900 snacks with Ann" (split)."""
+    msg, user = update.message, update.effective_user
+    m = AMOUNT.search(text)
+    if not m:
+        await msg.reply_text("How much? Try /paid 1200 dinner for me, Ann and Bob", do_quote=True)
+        return
+    amount = float(m["num"].replace(",", "")) * (1000 if m["k"] else 1)
+    cur = (m["cur"] or m["cur2"] or "").lower().rstrip(".")
+    currency = {"rs": "₹", "rupee": "₹", "rupees": "₹", "inr": "₹", "usd": "$", "dollar": "$", "dollars": "$",
+                "bucks": "$", "taka": "৳", "tk": "৳"}.get(cur, m["cur"] or "")
+    rest = text[m.end():]
+    split = ([None] + list(re.finditer(r"\b(for|with|between|among|split)\b", rest, re.I)))[-1]  # the last one names people
+    what = tidy_task(rest[:split.start()] if split else rest) or "something"
+    if not split:
+        await msg.reply_text("Who was it for? Try /paid 1200 dinner for me, Ann and Bob", do_quote=True)
+        return
+    names = re.split(r"[\s,&]+", rest[split.end():])
+    key = f"tab:{update.effective_chat.id}"
+    people = await resolve_people(update, names, (await load_store(key, empty_tab())).get("names"))
+    if split[1].lower() != "for":  # "with Ann": the payer shares too
+        people = list(dict([(f"u{user.id}", user.first_name)] + people).items())
+    if not people:
+        await msg.reply_text("Who was it for? Try /paid 1200 dinner for me, Ann and Bob", do_quote=True)
+        return
+    async with store_lock(key):
+        tab = await load_store(key, empty_tab())
+        tab["names"][f"u{user.id}"] = user.first_name
+        tab["names"].update(dict(people))
+        tab["currency"] = tab.get("currency") or currency
+        tab["entries"].append({"by": f"u{user.id}", "amount": amount, "for": [k for k, _ in people], "what": what,
+                               "t": time.time(), "uid": user.id})
+        await save_store(key)
+    share, cur = amount / len(people), tab["currency"]
+    if len(people) == 1 and people[0][0] != f"u{user.id}":
+        split_text = f"so {people[0][1]} owes it all"
+    else:
+        split_text = f"split between {', '.join(n if k != f'u{user.id}' else 'you' for k, n in people)} ({money(share, cur)} each)"
+    await msg.reply_text(f"🧾 Added: {user.first_name} paid {money(amount, cur)} for {what}, {split_text}.\n"
+                         "See who owes what with /tab", do_quote=True)
+
+
+def settle_up(tab):
+    """Balances (key -> amount, positive = owed money) and the fewest payments that clear them."""
+    balance = {}
+    for e in tab["entries"]:
+        balance[e["by"]] = balance.get(e["by"], 0) + e["amount"]
+        for k in e["for"]:
+            balance[k] = balance.get(k, 0) - e["amount"] / len(e["for"])
+    owed = sorted([[k, v] for k, v in balance.items() if v > 0.005], key=lambda x: -x[1])
+    owes = sorted([[k, -v] for k, v in balance.items() if v < -0.005], key=lambda x: -x[1])
+    payments = []
+    while owed and owes:
+        amount = min(owed[0][1], owes[0][1])
+        payments.append((owes[0][0], owed[0][0], amount))
+        owed[0][1] -= amount
+        owes[0][1] -= amount
+        if owed[0][1] < 0.005:
+            owed.pop(0)
+        if owes[0][1] < 0.005:
+            owes.pop(0)
+    return balance, payments
+
+
+async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ready(update, context, group_only=True):
+        return
+    await add_expense(update, context, " ".join(context.args))
+
+
+async def tab_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tab shows who owes whom; /tab undo removes your last entry; /tab clear starts over (group admins)."""
+    if not await ready(update, context, group_only=True):
+        return
+    key, action = f"tab:{update.effective_chat.id}", (context.args[0].lower() if context.args else "")
+    async with store_lock(key):
+        tab = await load_store(key, empty_tab())
+        if action == "undo":
+            mine = [e for e in tab["entries"] if e.get("uid") == update.effective_user.id]
+            if not mine:
+                await update.message.reply_text("You haven't added anything to undo.", do_quote=True)
+                return
+            tab["entries"].remove(mine[-1])
+            await save_store(key)
+            await update.message.reply_text(f"↩️ Removed: {mine[-1]['what']} ({money(mine[-1]['amount'], tab['currency'])})", do_quote=True)
+            return
+        if action == "clear":
+            if not await is_chat_admin(update, context):
+                await update.message.reply_text("Only group admins can clear the tab.", do_quote=True)
+                return
+            store_cache[key] = {"entries": [], "names": {}, "currency": tab.get("currency", "")}
+            await save_store(key)
+            await update.message.reply_text("🧹 The tab is cleared. Everyone's square!", do_quote=True)
+            return
+    if not tab["entries"]:
+        await update.message.reply_text("The tab is empty. Add something with /paid 1200 dinner for me, Ann and Bob", do_quote=True)
+        return
+    _, payments = settle_up(tab)
+    names, cur = tab["names"], tab.get("currency", "")
+    lines = [f"• {html.escape(names.get(a, a))} owes {html.escape(names.get(b, b))} <b>{money(x, cur)}</b>" for a, b, x in payments]
+    recent = [f"• {html.escape(names.get(e['by'], '?'))}: {money(e['amount'], cur)} for {html.escape(e['what'])}"
+              for e in tab["entries"][-5:]]
+    await update.message.reply_text(
+        "🧾 <b>Who owes whom</b>\n" + ("\n".join(lines) or "Everyone's square! 🎉") + "\n\n<b>Latest</b>\n" + "\n".join(recent) +
+        "\n\nPaid someone back? /settle @name (or /settle @name 200)", parse_mode=ParseMode.HTML, do_quote=True)
+
+
+async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settle @ann [amount]: you paid Ann back (all you owe her, or that much)."""
+    if not await ready(update, context, group_only=True):
+        return
+    user, key = update.effective_user, f"tab:{update.effective_chat.id}"
+    words = [w for w in context.args if not AMOUNT.fullmatch(w)]
+    known = (await load_store(key, empty_tab())).get("names")
+    people = [p for p in await resolve_people(update, words, known) if p[0] != f"u{user.id}"]
+    if not people:
+        await update.message.reply_text("Who did you pay back? /settle @name (or /settle @name 200)", do_quote=True)
+        return
+    other, other_name = people[0]
+    me = f"u{user.id}"
+    async with store_lock(key):
+        tab = await load_store(key, empty_tab())
+        typed = next((AMOUNT.fullmatch(w) for w in context.args if AMOUNT.fullmatch(w)), None)
+        if typed:
+            amount = float(typed["num"].replace(",", "")) * (1000 if typed["k"] else 1)
+        else:
+            _, payments = settle_up(tab)
+            amount = sum(x for a, b, x in payments if a == me and b == other)
+        if amount <= 0:
+            await update.message.reply_text(f"You don't owe {other_name} anything. 👍", do_quote=True)
+            return
+        tab["names"][me], tab["names"][other] = user.first_name, other_name
+        tab["entries"].append({"by": me, "amount": amount, "for": [other], "what": f"paying back {other_name}",
+                               "t": time.time(), "uid": user.id})
+        await save_store(key)
+    await update.message.reply_text(f"💸 Noted: {user.first_name} paid {other_name} {money(amount, tab.get('currency', ''))}.", do_quote=True)
+
+
+async def is_chat_admin(update, context):
+    if update.effective_user.id in ADMIN_USERS:
+        return True
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+# ----- Plain-language requests ("Laden remind me…", "Meowsama post a puzzle") routed to the tools above
+
+ASK_PUZZLE = re.compile(r"(?i)^\W*(?:(?:can you|could you|pls|please)\s+)?(?:post|send|give|show|drop|share)(?:\s+(?:me|us))?\s+(?:a|an|another|one|the)?\s*(puzzle|kitty|kitten|cat(?:\s+pic(?:ture)?)?)\b")
+
+
+async def group_tool(update, context, question):
+    """Handle requests that a tool answers better than chat. Returns True if handled."""
+    q = question.strip(" ,:")
+    puzzle, key = await open_puzzle_for(update)
+    if puzzle:
+        await puzzle_answer(update, context, puzzle, key)
+        return True
+    m = ASK_PUZZLE.match(q)
+    if m:
+        if m[1].lower() == "puzzle":
+            await puzzle_word(update, context)
+        else:
+            await send_cat(update, context)
+        return True
+    m = re.match(r"(?i)^\W*(?:pls |please )?remind\s+(.*)", q, re.S)
+    if m and await add_reminder(update, context, m[1], asked_in_words=True):
+        return True
+    if re.search(r"(?i)\bwhat (?:did|have) i miss(?:ed)?\b|\bcatch me up\b", q) and is_group(update):
+        await what_did_i_miss(update, context)
+        return True
+    m = re.match(r"(?i)^\W*(?:pick|choose)(?:\s+(?:one|for me|between|from|among))*\s*[:\-]?\s*(.+)", q, re.S)
+    if m and re.search(r",|\bor\b|/", m[1]):
+        await pick_reply(update, m[1])
+        return True
+    if re.match(r"(?i)^\W*(?:translate|tl)\b", q):
+        await translate_reply(update, context, q)
+        return True
+    m = re.match(r"(?i)^\W*i\s+(?:just\s+)?(?:paid|spent)\s+(.+)", q, re.S)
+    if m and AMOUNT.search(m[1]) and is_group(update):
+        await add_expense(update, context, m[1])
+        return True
+    return False
+
+
+async def run_morning_jobs():
+    """Once a day per group, at 9:00 local time (or as soon after as the bot is up): puzzle, birthdays, trivia crown."""
+    try:
+        chats = set(await load_store("puzzle_chats", []))
+        known = set(await load_store("morning_chats", []))  # groups with birthdays or trivia scores
+        done = await load_store("morning_done", {})
+    except Exception:
+        return
+    for chat_id in chats | known:
+        local = datetime.datetime.now(await chat_zone(chat_id))
+        today = local.date().isoformat()
+        if local.hour < MORNING_HOUR or done.get(str(chat_id)) == today:
+            continue
+        done[str(chat_id)] = today
+        await save_store("morning_done")
+        jobs = [("birthdays", wish_birthdays(chat_id, local.date()))]
+        if chat_id in chats:
+            jobs.append(("daily puzzle", morning_puzzle(chat_id)))
+        if local.weekday() == 0:
+            jobs.append(("trivia champion", crown_trivia_champion(chat_id)))
+        for name, job in jobs:
+            try:
+                await job
+            except Exception:
+                log.exception("Morning %s failed in %s", name, chat_id)
+
+
+async def send_cat(update, context):
+    if await ignored_while_off(update) or not is_allowed(update):
+        return
+    await send_web_photo(update, context, "", candidates=await cat_photos())
+
+
+async def watch_schedule():
+    """Reminders every 15 seconds; morning posts and stale puzzles once a minute."""
+    tick = 0
+    while True:
+        await asyncio.sleep(15)
+        tick += 1
+        if game_bot is None:
+            continue
+        try:
+            await fire_reminders()
+            if tick % 4 == 0:
+                await run_morning_jobs()
+                await close_old_puzzles()
+        except Exception:
+            log.exception("Scheduled job failed")
+
+
 async def on_startup(app):
     await register_commands(app)
     asyncio.create_task(watch_game_clocks())
+    asyncio.create_task(watch_schedule())  # reminders, daily puzzle, birthdays, trivia champion
     asyncio.create_task(asyncio.to_thread(gameimages.download_fonts))  # fonts for names in result pictures
     asyncio.create_task(find_stockfish())  # fetch the chess engine now, so the first game against Laden is quick
     public_url = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
@@ -3265,6 +4730,22 @@ async def register_commands(app):
         ("ring", "Laden marries two people off 💍 (or @ two people)"),
         ("nick", "Give someone a nickname (you, a name, or reply to someone)"),
         ("calc", "Exact arithmetic: /calc 2+2*3, 15% of 80"),
+        ("recap", "What the group talked about (or /recap 3h)"),
+        ("remind", "Remind me/everyone/@someone: /remind me in 2h call mum"),
+        ("reminders", "Upcoming reminders (and cancel one)"),
+        ("poll", "Make a poll: /poll Pizza or burgers?"),
+        ("pick", "Laden picks one: /pick pizza, burgers, tacos"),
+        ("autotranslate", "Translate one language automatically (/autotranslate Bengali)"),
+        ("leaderboard", "Game ratings, wins vs Laden, puzzles, trivia"),
+        ("stats", "Your record (or @someone / reply)"),
+        ("trivia", "A trivia question, first right tap scores (/trivia top)"),
+        ("dailypuzzle", "A chess puzzle every morning (on/off)"),
+        ("birthday", "Save your birthday: /birthday 14 March"),
+        ("birthdays", "Coming birthdays"),
+        ("paid", "Split a bill: /paid 1200 dinner for me, Ann and Bob"),
+        ("tab", "Who owes whom (/tab undo, /tab clear)"),
+        ("settle", "You paid someone back: /settle @name [amount]"),
+        ("timezone", "This group's time zone for reminders"),
         ("chessmatch", "Play chess (long-press to add @name)"),
         ("othello", "Play othello (long-press to add @name)"),
         ("checkers", "Play checkers (long-press to add @name)"),
@@ -3463,16 +4944,36 @@ def main():
     app.add_handler(CommandHandler("snakes", party_command("snakes")))
     app.add_handler(CallbackQueryHandler(game_menu, pattern=r"^game\|"))
     app.add_handler(CallbackQueryHandler(party_menu, pattern=r"^party\|"))
+    app.add_handler(CommandHandler("recap", recap))
+    app.add_handler(CommandHandler("remind", remind))
+    app.add_handler(CommandHandler("reminders", list_reminders))
+    app.add_handler(CommandHandler("timezone", timezone_cmd))
+    app.add_handler(CommandHandler("poll", poll))
+    app.add_handler(CommandHandler("pick", pick))
+    app.add_handler(CommandHandler("autotranslate", autotranslate))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("dailypuzzle", daily_puzzle_cmd))
+    app.add_handler(CommandHandler("trivia", trivia))
+    app.add_handler(CallbackQueryHandler(trivia_button, pattern=r"^trivia\|"))
+    app.add_handler(CommandHandler("birthday", birthday))
+    app.add_handler(CommandHandler("birthdays", birthdays))
+    app.add_handler(CommandHandler("paid", paid))
+    app.add_handler(CommandHandler("tab", tab_cmd))
+    app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("imitate", imitate))
     app.add_handler(CommandHandler("stopimitate", stop_imitate))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, imitate_message), group=1)  # alongside normal replies
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, react_randomly), group=2)  # occasional emoji reactions
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, emoji_reply_randomly), group=3)  # rarer emoji replies
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_translate_message), group=4)  # /autotranslate
     app.add_handler(CommandHandler("yesring", yesring))
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^\s*ring\s*[!.]*\s*$"), ring))  # plain "ring"
     app.add_handler(MessageHandler(filters.Regex(KEYWORD_PATTERN), keyword_photo))  # kitty / foodporn / carporn
+    app.add_handler(MessageHandler(filters.Regex(PUZZLE_TRIGGER), puzzle_word))  # plain "puzzle"
     # stickers and GIFs are only looked at when someone replies to one
-    pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO
+    pictures = filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO | \
+        filters.VOICE | filters.AUDIO  # voice notes count when they reply to Laden
     app.add_handler(MessageHandler((filters.TEXT | pictures) & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.ALL, remember_album), group=-2)  # note album pictures as they arrive
     app.add_handler(MessageHandler(filters.ALL, record_activity), group=-1)  # runs before everything else

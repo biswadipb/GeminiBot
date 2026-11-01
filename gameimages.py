@@ -265,15 +265,18 @@ def text(draw, x, y, words, size, colour=INK):
 
 # ---------------------------------------------------------------- boards (each draws into a box: x, y, width)
 
-def chess_board(img, draw, x0, y0, size, snapshot, last):
+def chess_board(img, draw, x0, y0, size, snapshot, last, flip=False):
+    """flip: Black at the bottom (for puzzles with Black to move)."""
     sq = size / 8
     rows = snapshot.split("/")
     lit = {last[:2], last[2:4]} if last else set()
+    at = lambda r, c: (7 - r, 7 - c) if flip else (r, c)  # where board row/column r, c is drawn
     for r, row in enumerate(rows):
         for c in range(8):
             name = "abcdefgh"[c] + str(8 - r)
             colour = LAST if name in lit else (LIGHT if (r + c) % 2 == 0 else DARK)
-            draw.rectangle([s(x0 + c * sq), s(y0 + r * sq), s(x0 + (c + 1) * sq), s(y0 + (r + 1) * sq)], fill=colour)
+            dr, dc = at(r, c)
+            draw.rectangle([s(x0 + dc * sq), s(y0 + dr * sq), s(x0 + (dc + 1) * sq), s(y0 + (dr + 1) * sq)], fill=colour)
         c = 0
         for ch in row:
             if ch.isdigit():
@@ -281,9 +284,18 @@ def chess_board(img, draw, x0, y0, size, snapshot, last):
                 continue
             code = ("w" if ch.isupper() else "b") + ch.upper()
             piece = piece_image(code, int(sq))
-            img.paste(piece, (int(s(x0 + c * sq)), int(s(y0 + r * sq))), piece)
+            dr, dc = at(r, c)
+            img.paste(piece, (int(s(x0 + dc * sq)), int(s(y0 + dr * sq))), piece)
             c += 1
     return size
+
+
+def puzzle_picture(snapshot, last, title, headline, label, solved, flip=False):
+    """A chess puzzle: the position (or the solved one), with who is to move or who solved it."""
+    board_w = WIDTH - 2 * PAD
+    swatch = BLACK_DISC[0] if flip else WHITE_DISC[0]
+    return compose(clean(title), clean(headline), [(swatch, clean(label), solved)],
+                   lambda img, d, x, y, w: chess_board(img, d, x, y, w, snapshot, last, flip), board_w)
 
 
 def frame(img, draw, x0, y0, w, h, wood=((107, 68, 40), (59, 36, 20)), border=.034, radius=12):
