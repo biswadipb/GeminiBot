@@ -287,15 +287,36 @@ def chess_board(img, draw, x0, y0, size, snapshot, last, flip=False):
             dr, dc = at(r, c)
             img.paste(piece, (int(s(x0 + dc * sq)), int(s(y0 + dr * sq))), piece)
             c += 1
+    label = max(10, sq * .17)  # letters along the bottom row and numbers down the left column, as on the board page
+    for i in range(8):
+        file, rank = "abcdefgh"[7 - i if flip else i], str(i + 1 if flip else 8 - i)
+        file_on_light, rank_on_light = (7 + i) % 2 == 0, i % 2 == 0
+        text(draw, x0 + (i + 1) * sq - text_width(file, label) - 3, y0 + 8 * sq - label - 4, file, label,
+             DARK if file_on_light else LIGHT)
+        text(draw, x0 + 3, y0 + i * sq + 2, rank, label, DARK if rank_on_light else LIGHT)
     return size
 
 
-def puzzle_picture(snapshot, last, title, headline, label, solved, flip=False):
-    """A chess puzzle: the position (or the solved one), with who is to move or who solved it."""
+def frame_labels(draw, bx, by, bw, files, ranks):
+    """Letters under the columns and numbers beside the rows, written on a wooden frame."""
+    sq, size = bw / 8, max(10, bw * .026)
+    for i in range(8):
+        text(draw, bx + (i + .5) * sq - text_width(files[i], size) / 2, by + bw + bw * .0355 / 2 - size * .62, files[i],
+             size, (238, 220, 190))
+        text(draw, bx - bw * .0355 / 2 - text_width(ranks[i], size) / 2, by + (i + .5) * sq - size * .62, ranks[i],
+             size, (238, 220, 190))
+
+
+def puzzle_picture(snapshot, last, title, headline, label, solved, flip=False, kind="chess", black=None):
+    """A puzzle: the position (or the solved one), with who is to move or who solved it.
+    black: whether the side named in the label plays Black (defaults to flip, as Black is drawn at the bottom)."""
     board_w = WIDTH - 2 * PAD
-    swatch = BLACK_DISC[0] if flip else WHITE_DISC[0]
-    return compose(clean(title), clean(headline), [(swatch, clean(label), solved)],
-                   lambda img, d, x, y, w: chess_board(img, d, x, y, w, snapshot, last, flip), board_w)
+    swatch = BLACK_DISC[0] if (flip if black is None else black) else WHITE_DISC[0]
+    if kind == "othello":
+        draw_board = lambda img, d, x, y, w: square_board(img, d, x, y, w, snapshot, "othello")
+    else:
+        draw_board = lambda img, d, x, y, w: chess_board(img, d, x, y, w, snapshot, last, flip)
+    return compose(clean(title), clean(headline), [(swatch, clean(label), solved)], draw_board, board_w)
 
 
 def frame(img, draw, x0, y0, w, h, wood=((107, 68, 40), (59, 36, 20)), border=.034, radius=12):
@@ -322,6 +343,7 @@ def square_board(img, draw, x0, y0, size, snapshot, kind):
             if piece != ".":
                 r, c = divmod(i, 8)
                 marble(draw, bx + (c + .5) * sq, by + (r + .5) * sq, sq * .41, piece)
+        frame_labels(draw, bx, by, bw, "abcdefgh", [str(n) for n in range(1, 9)])  # othello: a1 is top left
         return size
     bx, by, bw, _ = frame(img, draw, x0, y0, size, size, wood=((90, 52, 27), (45, 25, 11)))
     sq = bw / 8
@@ -339,6 +361,14 @@ def square_board(img, draw, x0, y0, size, snapshot, kind):
         if piece != ".":
             r, c = divmod(i, 8)
             ridged(draw, bx + (c + .5) * sq, by + (r + .5) * sq, sq * .4, piece)
+    if kind == "checkers":  # checkers moves are written with the numbers of the dark squares
+        for r in range(8):
+            for c in range(8):
+                if (r + c) % 2:
+                    n = str(r * 4 + c // 2 + 1)
+                    text(draw, bx + c * sq + 3, by + r * sq + 2, n, max(9, sq * .17), (238, 220, 190))
+    else:
+        frame_labels(draw, bx, by, bw, "abcdefgh", [str(8 - n) for n in range(8)])
     return size
 
 

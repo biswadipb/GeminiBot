@@ -1539,3 +1539,95 @@ class Ludo(PartyGame):
 
 
 PARTY_GAMES = {rules.kind: rules for rules in (SnakesAndLadders(), Ludo())}
+
+
+# ---------------------------------------------------------------- othello puzzles: endgames solved exactly
+
+PUZZLE_EMPTIES = 9  # squares left: about four moves for the solver, and still quick to work out perfect play
+
+
+class OthelloEndgame:
+    """Perfect play near the end of an othello game. Values are the final disc difference for the side to move
+    (empty squares go to the winner, as in tournament scoring)."""
+
+    def __init__(self):
+        self.rules = Othello()
+
+    def final(self, board, disc):
+        mine, theirs = board.count(disc), board.count("w" if disc == "b" else "b")
+        empty = 64 - mine - theirs
+        return mine - theirs + (empty if mine > theirs else -empty if theirs > mine else 0)
+
+    def moves(self, board, disc):
+        return [(i, f) for i in range(64) if board[i] == "." for f in [self.rules.flips(board, i, disc)] if f]
+
+    def value(self, board, disc, alpha=-65, beta=65, passed=False):
+        moves = self.moves(board, disc)
+        other = "w" if disc == "b" else "b"
+        if not moves:
+            if passed:
+                return self.final(board, disc)
+            return -self.value(board, other, -beta, -alpha, True)
+        best = -65
+        for i, flipped in moves:
+            board[i] = disc
+            for f in flipped:
+                board[f] = disc
+            score = -self.value(board, other, -beta, -alpha)
+            board[i] = "."
+            for f in flipped:
+                board[f] = other
+            best = max(best, score)
+            alpha = max(alpha, score)
+            if alpha >= beta:
+                break
+        return best
+
+    def move_values(self, board, color):
+        """{square name: exact value} for each legal move of `color` (a list board, left unchanged)."""
+        disc, other = color[0], OTHER[color][0]
+        values = {}
+        for i, flipped in self.moves(board, disc):
+            child = board[:]
+            child[i] = disc
+            for f in flipped:
+                child[f] = disc
+            values[othello_square(i)] = -self.value(child, other)
+        return values
+
+    def best_line(self, state):
+        """Perfect play from here to the end, as moves (with "pass" where needed)."""
+        line = []
+        while not self.rules.outcome(state):
+            legal = self.rules.legal(state)
+            if legal == ["pass"]:
+                move = "pass"
+            else:
+                values = self.move_values(state.board, state.turn)
+                move = max(values, key=values.get)
+            line.append(move)
+            state = self.rules.play(state, move)
+        return line
+
+    def make_puzzle(self, seconds=20.0):
+        """A position where the side to move has one clearly best move and can win with perfect play."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            state = self.rules.new()
+            while state.board.count(".") > PUZZLE_EMPTIES and not self.rules.outcome(state):
+                moves = self.rules.legal(state)
+                move = self.rules.bot_move(state, 2) if random.random() < .7 else random.choice(moves)
+                state = self.rules.play(state, move)
+            if self.rules.outcome(state) or state.board.count(".") != PUZZLE_EMPTIES:
+                continue
+            values = self.move_values(state.board, state.turn)
+            if len(values) < 3:
+                continue
+            ranked = sorted(values.values(), reverse=True)
+            if ranked[0] > 0 and ranked[0] - ranked[1] >= 4:
+                return {"board": "".join(state.board), "turn": state.turn, "best": ranked[0],
+                        "solution": self.best_line(state)}
+        return None
+
+
+ENDGAME = OthelloEndgame()

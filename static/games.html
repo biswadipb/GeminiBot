@@ -73,6 +73,8 @@
   .coord.rank { left: 3px; top: 1px; }
   .sq.l .coord { color: var(--dark); }
   .sq.d .coord { color: var(--light); }
+  .board.othello .coord, .board.draughts .coord, .board.checkers .coord { text-shadow: 0 0 2px rgba(0,0,0,.85), 0 0 1px rgba(0,0,0,.85); }
+  .board.othello .coord { color: #fff; }
   .piece { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
   .piece svg { display: block; width: 100%; height: 100%; }
 
@@ -388,6 +390,9 @@ function render() {
   if (reviewing) {
     status.innerHTML = `<span class="review">${viewPly ? `After ${esc(moveLabel(viewPly))}` : "Starting position"}` +
       ` · <a onclick="goLive()">back to the game</a></span>`;
+  } else if (s.puzzle) {
+    status.textContent = s.puzzle.message;
+    status.classList.add("strong");
   } else if (s.status === "over") {
     const winner = s.result === "white" || s.result === "black" ? s[s.result] : null;
     status.textContent = winner ? `${winner} won by ${s.reason}.` : `Draw by ${s.reason}.`;
@@ -409,7 +414,10 @@ function render() {
   tickClocks();
 
   const actions = document.getElementById("actions");
-  if (s.status !== "playing") actions.innerHTML = "";
+  if (s.puzzle) actions.innerHTML =
+    (s.puzzle.restart ? `<button onclick="act('restart')">Start again</button>` : "") +
+    (s.status === "over" && tg ? `<button class="primary" onclick="tg.close()">Back to the chat</button>` : "");
+  else if (s.status !== "playing") actions.innerHTML = "";
   else if (s.draw_offer === "them") actions.innerHTML =
     `<button class="primary" onclick="act('accept_draw')">Accept draw</button><button onclick="act('decline_draw')">Decline</button>`;
   else if (s.kind === "fanorona" && fpath.length > 1) actions.innerHTML =
@@ -465,6 +473,12 @@ function drawGrid(board, kind, snapshot, last, legal) {
       if (kind !== "othello" && name !== null && name === selected) el.classList.add("sel");
       if (name !== null && targets.includes(name)) el.classList.add("target");
       if (p !== ".") el.innerHTML = `<span class="disc ${p.toLowerCase()}">${p === "B" || p === "W" ? CROWN : ""}</span>`;
+      if (kind === "checkers") {  // checkers moves are written with square numbers
+        if (name) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${name}</span>`);
+      } else {  // othello (a1 top left) and Turkish draughts: letters along the bottom, numbers down the side
+        if (rr === 7) el.insertAdjacentHTML("beforeend", `<span class="coord file">${name[0]}</span>`);
+        if (cc === 0) el.insertAdjacentHTML("beforeend", `<span class="coord rank">${name.slice(1)}</span>`);
+      }
       el.onclick = () => kind === "othello" ? tapPlace(name, legal) : tapCheckers(name, p, legal);
       board.appendChild(el);
     }

@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 import chess
 import chess.engine
 import chess.pgn
-from boardgames import GAMES, OTHER, PARTY_GAMES
+from boardgames import ENDGAME, GAMES, OTHER, PARTY_GAMES, OthelloState
 import gameimages
 import httpx
 import tornado.web
@@ -657,7 +657,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Voice notes: reply \"Laden\" to one, or reply to Laden with one\n"
         "Links: ask Laden about an article or YouTube link (\"Laden tldr\" as a reply)\n"
         "/leaderboard · /stats – game ratings, wins against Laden, puzzles solved, trivia\n"
-        "puzzle – a chess puzzle (reply with your move) · /puzzle top · /dailypuzzle on – one every morning · /trivia\n"
+        "puzzle or othello puzzle – solve it on the board or move by move in the chat · /puzzle top · /dailypuzzle on · /trivia\n"
         "/birthday 14 March · /birthdays\n"
         "/paid 1200 dinner for me, Ann and Bob · /tab · /settle @name – split bills\n"
         "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
@@ -2729,6 +2729,8 @@ async def game_action(body):
     user = check_init_data(body.get("initData"))
     if not user:
         return 401, {"error": "Please open the board from the button in Telegram."}
+    if str(body.get("game", "")).startswith("pz"):
+        return await puzzle_action(body, user)  # a puzzle, played on the same board page
     game = await load_game(str(body.get("game", "")))
     if not game:
         return 404, {"error": "This game doesn't exist (games are kept for 7 days)."}
@@ -3970,63 +3972,168 @@ async def credit(chat_id, uid, name, field):
         await save_store(key)
 
 
-# ----- 7. Chess puzzles (from Lichess): "puzzle" for one now, /dailypuzzle on for one every morning
+# ----- 7. Puzzles: chess (from Lichess) and othello (endgames Laden works out exactly). They're played move by move,
+# with Laden answering, either on the board ("▶️ Solve on the board") or by replying in the chat, until mate or the
+# end of the best line. "puzzle" / "othello puzzle" for one now, /dailypuzzle on for a chess one every morning.
 
-PUZZLE_TRIGGER = r"(?i)^\s*puzzle\s*[!.?]*\s*$"
+PUZZLE_TRIGGER = r"(?i)^\s*(?:(chess|othello)\s+)?puzzle(?:\s+(chess|othello))?\s*[!.?]*\s*$"
 PUZZLE_OPEN_HOURS = 24  # an unsolved puzzle gets its answer posted after this
 
 
-async def fetch_puzzle(daily):
+async def fetch_chess_puzzle(daily):
     r = await http.get("https://lichess.org/api/puzzle/" + ("daily" if daily else "next"), timeout=20)
     r.raise_for_status()
     data = r.json()
-    game = chess.pgn.read_game(io.StringIO(data["game"]["pgn"]))
-    board = game.end().board()
-    last = board.peek().uci() if board.move_stack else None
+    board = chess.pgn.read_game(io.StringIO(data["game"]["pgn"])).end().board()
     p = data["puzzle"]
-    return {"id": p["id"], "rating": p.get("rating"), "themes": p.get("themes", []), "fen": board.fen(), "last": last,
-            "solution": p["solution"], "daily": daily, "posted": time.time(), "solved_by": None, "solvers": []}
+    return {"game": "chess", "id": p["id"], "rating": p.get("rating"), "themes": p.get("themes", []), "fen": board.fen(),
+            "last": board.peek().uci() if board.move_stack else None, "solution": p["solution"]}
 
 
-async def post_puzzle(chat_id, daily, reply_to=None):
-    puzzle = await fetch_puzzle(daily)
-    board = chess.Board(puzzle["fen"])
-    side = "White" if board.turn else "Black"
-    title = "Daily puzzle" if daily else "Puzzle"
-    mate = next((t for t in puzzle["themes"] if t.startswith("mateIn")), None)
-    goal = f"mate in {mate[6:]}" if mate else "find the best move"
-    picture = await asyncio.to_thread(gameimages.puzzle_picture, board.board_fen(), puzzle["last"], title,
-                                      f"{side} to move: {goal}", f"{side} to move", False, not board.turn)
-    caption = (f"🧩 <b>{title}</b> · rated {puzzle['rating']}\n{side} to move: {goal}.\n"
-               f"Reply to this with your first move (like Nf3, Qxh7+ or e2e4). "
-               + ("The first to solve it gets a point on the /leaderboard." if daily else "Just for fun."))
-    sent = await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
+async def make_othello_puzzle():
+    made = await asyncio.to_thread(ENDGAME.make_puzzle)
+    if not made:
+        raise RuntimeError("no othello puzzle found in time")
+    return {"game": "othello", **made}
+
+
+def puzzle_start(p):
+    return chess.Board(p["fen"]) if p["game"] == "chess" else OthelloState(list(p["board"]), p["turn"])
+
+
+def puzzle_side(p):
+    """The colour the solver plays."""
+    return ("white" if chess.Board(p["fen"]).turn else "black") if p["game"] == "chess" else p["turn"]
+
+
+def puzzle_steps(p):
+    """How many moves the solver makes in the full line."""
+    if p["game"] == "chess":
+        return (len(p["solution"]) + 1) // 2
+    state, side, steps = puzzle_start(p), puzzle_side(p), 0
+    for move in p["solution"]:
+        steps += GAMES["othello"].turn(state) == side and move != "pass"
+        state = GAMES["othello"].play(state, move)
+    return steps
+
+
+def puzzle_goal(p):
+    side, steps = puzzle_side(p).capitalize(), puzzle_steps(p)
+    if p["game"] == "othello":
+        return f"{side} to move: play perfectly to the end and win by {p['best']} discs ({steps} moves)"
+    mate = next((t for t in p.get("themes", []) if t.startswith("mateIn")), None)
+    if mate:
+        return f"{side} to move: mate in {mate[6:]}"
+    return f"{side} to move: find the best move" if steps == 1 else f"{side} to move: find the best {steps} moves"
+
+
+def puzzle_line(p, moves):
+    """The moves in notation, e.g. "38. Rxe7 Qxe7 39. Qxh5" or "a1 h5 b5 (pass) c5"."""
+    rules, state, parts = GAMES[p["game"]], puzzle_start(p), []
+    for i, move in enumerate(moves):
+        if p["game"] == "chess":
+            if state.turn or i == 0:
+                parts.append(f"{state.fullmove_number}." if state.turn else f"{state.fullmove_number}…")
+            parts.append(state.san(chess.Move.from_uci(move)))
+        else:
+            parts.append("(pass)" if move == "pass" else move)
+        state = rules.play(state, move)
+    return " ".join(parts), state
+
+
+def puzzle_try(p, moves, move):
+    """The solver (who has played `moves` so far, Laden's answers included) tries `move`.
+    Returns (verdict, moves): "illegal", "wrong", "ok" (Laden has answered; play on) or "done"."""
+    rules, side = GAMES[p["game"]], puzzle_side(p)
+    state = puzzle_start(p)
+    for m in moves:
+        state = rules.play(state, m)
+    try:
+        after = rules.play(state, move)
+    except ValueError:
+        return "illegal", moves
+    if p["game"] == "chess":
+        line, i = p["solution"], len(moves)
+        if i >= len(line) or not (move == line[i] or (i == len(line) - 1 and after.is_checkmate())):
+            return "wrong", moves  # the last move may be any mate; before that, the line's move
+        moves = moves + [move]
+        if len(moves) < len(line):
+            moves.append(line[len(moves)])  # Laden answers
+        return ("done" if len(moves) >= len(line) else "ok"), moves
+    values = ENDGAME.move_values(state.board, state.turn)
+    if values.get(move, -99) < max(values.values()):
+        return "wrong", moves  # any move that keeps the best result counts
+    moves, state = moves + [move], after
+    while not rules.outcome(state):  # Laden answers (and anyone with no move passes) until it's the solver's turn
+        legal = rules.legal(state)
+        if rules.turn(state) == side and legal != ["pass"]:
+            break
+        if legal == ["pass"]:
+            reply = "pass"
+        else:
+            values = ENDGAME.move_values(state.board, state.turn)
+            reply = max(values, key=values.get)
+        moves.append(reply)
+        state = rules.play(state, reply)
+    return ("done" if rules.outcome(state) else "ok"), moves
+
+
+async def post_puzzle(chat_id, daily, game="chess", reply_to=None):
+    p = await (fetch_chess_puzzle(daily) if game == "chess" else make_othello_puzzle())
+    p.update(pid="pz" + base64.urlsafe_b64encode(os.urandom(6)).decode(), daily=daily, posted=time.time(), chat=chat_id,
+             solved_by=None, solvers=[], progress={}, msgs=[])
+    side = puzzle_side(p)
+    start = puzzle_start(p)
+    title = ("Daily " if daily else "") + ("chess puzzle" if game == "chess" else "othello puzzle")
+    title = title[0].upper() + title[1:]
+    snapshot = start.board_fen() if game == "chess" else "".join(start.board)
+    picture = await asyncio.to_thread(gameimages.puzzle_picture, snapshot, p.get("last"), title, puzzle_goal(p),
+                                      f"{side.capitalize()} to move", False, game == "chess" and side == "black",
+                                      game, side == "black")
+    rated = f" · rated {p['rating']}" if p.get("rating") else ""
+    example = "Nf3, Qxh7+ or e2e4" if game == "chess" else "c4 or h8"
+    caption = (f"🧩 <b>{title}</b>{rated}\n{html.escape(puzzle_goal(p))}.\n\n"
+               f"Play it on the board, or reply here with your move ({example}) and I'll answer move by move. "
+               + ("The first to solve it gets a point on the /leaderboard." if daily else "Every solve counts in /puzzle top."))
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Solve on the board", url=game_link(game_bot.username, p["pid"]))]])
+    sent = await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML, reply_markup=button,
                                      reply_parameters=ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None)
-    puzzle["msg"] = sent.message_id
+    p["msg"] = sent.message_id
     key = f"puzzles:{chat_id}"
     async with store_lock(key):
         puzzles = await load_store(key, [])
-        puzzles.append(puzzle)
+        puzzles.append(p)
         del puzzles[:-10]  # keep the last few, so late answers to them still work
         await save_store(key)
+    async with store_lock("puzzle_index"):
+        index = await load_store("puzzle_index", {})
+        index[p["pid"]] = chat_id
+        for old in list(index)[:-500]:
+            index.pop(old)
+        await save_store("puzzle_index")
 
 
-async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The word "puzzle" (or "Laden post a puzzle"): a fresh puzzle just for fun."""
+async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE, game=None):
+    """The word "puzzle" ("othello puzzle", or "Laden post a puzzle"): a fresh puzzle just for fun."""
     if await ignored_while_off(update) or not is_allowed(update):
         return  # stay quiet outside allowed chats, like "kitty"
+    if game is None and getattr(context, "matches", None):
+        game = (context.matches[0].group(1) or context.matches[0].group(2) or "chess").lower()
+    game = game or "chess"
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
-        await post_puzzle(update.effective_chat.id, daily=False, reply_to=update.message.message_id)
+        await post_puzzle(update.effective_chat.id, daily=False, game=game, reply_to=update.message.message_id)
     except Exception:
         log.exception("Could not post a puzzle")
-        await update.message.reply_text("Lichess didn't send me a puzzle just now. Try again in a minute.", do_quote=True)
+        where = "Lichess didn't send me a puzzle" if game == "chess" else "I couldn't set up an othello puzzle"
+        await update.message.reply_text(f"{where} just now. Try again in a minute.", do_quote=True)
 
 
 async def puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/puzzle top: who has solved the most puzzles; /puzzle alone posts one, like the word "puzzle"."""
-    if not context.args or context.args[0].lower() not in ("top", "scores", "leaderboard"):
-        await puzzle_word(update, context)
+    """/puzzle top: who has solved the most puzzles; /puzzle (or /puzzle othello) posts one, like the word "puzzle"."""
+    words = [w.lower() for w in context.args]
+    if not words or words[0] not in ("top", "scores", "leaderboard"):
+        await puzzle_word(update, context, game="othello" if "othello" in words else "chess")
         return
     if not await ready(update, context, group_only=True):
         return
@@ -4046,91 +4153,148 @@ async def puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     parse_mode=ParseMode.HTML, do_quote=True)
 
 
-def read_move(board, text):
-    """The first thing in the text that's a legal move here, in SAN (Nf3, O-O) or UCI (g1f3)."""
+def read_move(p, state, text):
+    """The first thing in the text that's a legal move here: SAN (Nf3, O-O) or UCI (g1f3) in chess, c4 in othello.
+    Returns the move as the rules write it, or None."""
+    if p["game"] == "othello":
+        legal = GAMES["othello"].legal(state)
+        return next((w.lower() for w in re.findall(r"\b[a-hA-H][1-8]\b", text) if w.lower() in legal), None)
     for word in re.findall(r"[A-Za-z0-9=+#\-]+", text.replace("×", "x")):
         word = word.strip("+#!?")
         for attempt in (word, word[0].upper() + word[1:] if word[:1] in "nbrqk" and len(word) > 2 else None):
             if not attempt:
                 continue
             try:
-                return board.parse_san(attempt)
+                return state.parse_san(attempt).uci()
             except ValueError:
                 pass
             try:
                 move = chess.Move.from_uci(attempt.lower())
-                if move in board.legal_moves:
-                    return move
+                if move in state.legal_moves:
+                    return move.uci()
             except ValueError:
                 pass
     return None
 
 
-def solution_line(puzzle):
-    board, parts = chess.Board(puzzle["fen"]), []
-    for i, uci in enumerate(puzzle["solution"]):
-        move = chess.Move.from_uci(uci)
-        number = board.fullmove_number
-        if board.turn or i == 0:
-            parts.append(f"{number}." if board.turn else f"{number}…")
-        parts.append(board.san(move))
-        board.push(move)
-    return " ".join(parts), board
+async def puzzle_move(chat_id, key, p, uid, name, move):
+    """Play one move for this solver and save their progress. Returns (verdict, moves, first_solver)."""
+    async with store_lock(key):
+        moves = p["progress"].get(str(uid), [])
+        verdict, moves = await asyncio.to_thread(puzzle_try, p, moves, move)
+        first = False
+        if verdict in ("ok", "done"):
+            p["progress"][str(uid)] = moves
+        if verdict == "done" and uid not in p["solvers"]:
+            p["solvers"].append(uid)
+            if p["solved_by"] is None:
+                p["solved_by"], first = {"id": uid, "name": name}, True
+        await save_store(key)
+    if verdict == "done":
+        await credit(chat_id, uid, name, "puzzles")
+        if first and p["daily"]:
+            await credit(chat_id, uid, name, "daily")
+    return verdict, moves, first
 
 
-async def puzzle_answer(update, context, puzzle, key):
-    """A reply to a puzzle post. The first right answer is credited with a solved copy, like a game result."""
+async def puzzle_answer(update, context, p, key):
+    """A reply in the chat to a puzzle (or to Laden's answer in one): play the move(s) in it."""
     msg, user = update.message, update.effective_user
-    if puzzle.get("closed"):
+    if p.get("closed"):
         await msg.reply_text("This puzzle is closed; its answer has been posted. Send \"puzzle\" for a new one!", do_quote=True)
         return
-    board = chess.Board(puzzle["fen"])
-    move = read_move(board, msg.text or "")
-    if not move:
-        await msg.reply_text("That's not a legal move in this position. Reply with a move like Nf3 or e2e4.", do_quote=True)
+    if user.id in p["solvers"]:
+        await msg.reply_text("✅ You've already solved this one!", do_quote=True)
         return
-    right = move.uci() == puzzle["solution"][0]
-    if not right and len(puzzle["solution"]) == 1:
-        board.push(move)
-        right = board.is_checkmate()  # any mate in one counts
-    if not right:
-        await msg.reply_text("❌ Not that one. Keep looking!", do_quote=True)
+    rules, side = GAMES[p["game"]], puzzle_side(p)
+    moves, played, verdict = p["progress"].get(str(user.id), []), 0, None
+    for word in (msg.text or "").replace(",", " ").split():  # several moves at once work ("Rh8+ Kg5 Rh5+")
+        state = puzzle_start(p)
+        for m in moves:
+            state = rules.play(state, m)
+        if rules.turn(state) != side:
+            break
+        move = read_move(p, state, word)
+        if not move:
+            continue  # chatter, or Laden's own moves typed along
+        verdict, moves, first = await puzzle_move(update.effective_chat.id, key, p, user.id, user.first_name, move)
+        played += 1
+        if verdict != "ok":
+            break
+    if not played:
+        await msg.reply_text("That's not a legal move in this position. " +
+                             ("Reply with a move like Nf3 or e2e4." if p["game"] == "chess" else "Reply with a square like c4."),
+                             do_quote=True)
         return
-    async with store_lock(key):
-        first = puzzle["solved_by"] is None
-        if user.id in puzzle["solvers"]:
-            await msg.reply_text("✅ You already solved this one!", do_quote=True)
-            return
-        puzzle["solvers"].append(user.id)
+    if verdict == "wrong":
+        await msg.reply_text("❌ Not that one. Keep looking! (Your moves so far still count.)", do_quote=True)
+        return
+    if verdict == "done":
         if first:
-            puzzle["solved_by"] = {"id": user.id, "name": user.first_name}
-        await save_store(key)
-    await credit(update.effective_chat.id, user.id, user.first_name, "puzzles")
-    if not first:
-        await msg.reply_text(f"✅ Right too! ({puzzle['solved_by']['name']} got there first.)", do_quote=True)
+            await post_puzzle_solution(update.effective_chat.id, p, user.first_name, moves, reply_to=msg.message_id)
+        else:
+            await msg.reply_text(f"✅ Solved! ({p['solved_by']['name']} got there first.)", do_quote=True)
         return
-    if puzzle["daily"]:
-        await credit(update.effective_chat.id, user.id, user.first_name, "daily")
-    await post_puzzle_solution(update.effective_chat.id, puzzle, user.first_name, reply_to=msg.message_id)
+    line, _ = puzzle_line(p, moves)
+    step = sum(1 for i, m in enumerate(moves) if m != "pass" and puzzle_turn_at(p, moves, i) == side)
+    answer = puzzle_answer_text(p, moves)
+    sent = await msg.reply_text(f"✅ Good! {answer}\nYour move ({step + 1} of {puzzle_steps(p)}): reply to this with it.\n"
+                                f"So far: {line}", do_quote=True)
+    async with store_lock(key):
+        p["msgs"] = (p.get("msgs") or [])[-49:] + [sent.message_id]
+        await save_store(key)
 
 
-async def post_puzzle_solution(chat_id, puzzle, solver, reply_to=None):
-    line, final = solution_line(puzzle)
-    title = "Daily puzzle" if puzzle["daily"] else "Puzzle"
-    flip = not chess.Board(puzzle["fen"]).turn
+def puzzle_turn_at(p, moves, i):
+    rules, state = GAMES[p["game"]], puzzle_start(p)
+    for m in moves[:i]:
+        state = rules.play(state, m)
+    return rules.turn(state)
+
+
+def puzzle_answer_text(p, moves):
+    """What Laden just played in reply, in words."""
+    side, replies = puzzle_side(p), []
+    for i in range(len(moves) - 1, -1, -1):
+        if puzzle_turn_at(p, moves, i) == side:
+            break
+        replies.insert(0, moves[i])
+    if not replies:
+        return ""
+    if p["game"] == "chess":
+        state = puzzle_start(p)
+        for m in moves[:-len(replies)]:
+            state = GAMES["chess"].play(state, m)
+        return f"Laden plays {state.san(chess.Move.from_uci(replies[0]))}."
+    said = ["has to pass" if m == "pass" else f"plays {m}" for m in replies]
+    return f"Laden {', then '.join(said)}."
+
+
+async def post_puzzle_solution(chat_id, p, solver, moves=None, reply_to=None):
+    """The solved board, credited to the first solver (like a game result), or the answer if nobody solved it."""
+    moves = moves or p["solution"]
+    line, final = puzzle_line(p, moves)
+    game, side = p["game"], puzzle_side(p)
+    title = ("Daily " if p["daily"] else "") + f"{game} puzzle"
+    title = title[0].upper() + title[1:]
     label = f"Solved first by {solver}" if solver else "Nobody solved it"
-    picture = await asyncio.to_thread(gameimages.puzzle_picture, final.board_fen(), puzzle["solution"][-1],
-                                      f"{title} - solved", f"Solution: {line}", label, bool(solver), flip)
+    snapshot = final.board_fen() if game == "chess" else "".join(final.board)
+    picture = await asyncio.to_thread(gameimages.puzzle_picture, snapshot, moves[-1] if game == "chess" else None,
+                                      f"{title} - solved", f"Solution: {line}", label, bool(solver),
+                                      game == "chess" and side == "black", game, side == "black")
     head = (f"🏆 <b>{html.escape(solver)}</b> solved the {title.lower()}!" if solver else
             f"⌛ Nobody solved the {title.lower()}. Here's the answer.")
-    caption = (f"🧩 <b>{title} result</b>\n{head}\n\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>"
-               f"\n<a href=\"https://lichess.org/training/{puzzle['id']}\">Puzzle on Lichess</a>")
+    if game == "othello":
+        score = GAMES["othello"].score(final)
+        head += f"\nFinal discs: {score['black']} black, {score['white']} white."
+    link = f"\n<a href=\"https://lichess.org/training/{p['id']}\">Puzzle on Lichess</a>" if game == "chess" else ""
+    caption = f"🧩 <b>{title} result</b>\n{head}\n\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>{link}"
     await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
-                              reply_parameters=ReplyParameters(reply_to or puzzle["msg"], allow_sending_without_reply=True))
+                              reply_parameters=ReplyParameters(reply_to or p["msg"], allow_sending_without_reply=True))
 
 
 async def open_puzzle_for(update):
-    """The puzzle this message replies to, if any: (puzzle, store key)."""
+    """The puzzle this message replies to (its post or one of Laden's answers in it), if any: (puzzle, store key)."""
     quoted = update.message.reply_to_message
     if not quoted or not quoted.from_user or quoted.from_user.id != update.get_bot().id:
         return None, None
@@ -4139,7 +4303,68 @@ async def open_puzzle_for(update):
         puzzles = await load_store(key, [])
     except Exception:
         return None, None
-    return next((p for p in puzzles if p["msg"] == quoted.message_id), None), key
+    return next((p for p in puzzles if quoted.message_id == p["msg"] or quoted.message_id in (p.get("msgs") or [])), None), key
+
+
+async def find_puzzle(pid):
+    chat_id = (await load_store("puzzle_index", {})).get(pid)
+    if chat_id is None:
+        return None, None
+    key = f"puzzles:{chat_id}"
+    return next((p for p in await load_store(key, []) if p.get("pid") == pid), None), key
+
+
+def puzzle_view(p, uid, name):
+    """The puzzle as the board page shows it, shaped like a game."""
+    rules, side = GAMES[p["game"]], puzzle_side(p)
+    moves = p["progress"].get(str(uid), [])
+    done = uid in p["solvers"]
+    state = puzzle_start(p)
+    first = rules.turn(state)
+    snapshots, labels = [rules.snapshot(state)], []
+    for m in moves:
+        labels.append(rules.label(state, m))
+        state = rules.play(state, m)
+        snapshots.append(rules.snapshot(state))
+    step = sum(1 for i, m in enumerate(moves) if m != "pass" and puzzle_turn_at(p, moves, i) == side)
+    if done:
+        message = "✅ Solved! " + ("You got there first. 🏆" if (p["solved_by"] or {}).get("id") == uid else
+                                  f"{p['solved_by']['name']} got there first.")
+    elif p.get("closed"):
+        message = "This puzzle is closed; its answer has been posted in the chat."
+    else:
+        answer = puzzle_answer_text(p, moves)
+        message = (f"{answer} " if answer else "") + f"{puzzle_goal(p)}. Move {step + 1} of {puzzle_steps(p)}."
+    over = done or p.get("closed")
+    view = {"kind": p["game"], "title": "Puzzle", "first": first, "status": "over" if over else "playing",
+            "version": len(moves) * 2 + bool(over), "you": side, "bot": False,
+            side: name, OTHER[side]: "Laden", "board": snapshots[-1], "positions": snapshots, "labels": labels,
+            "moves": moves, "turn": rules.turn(state), "result": side if done else None, "reason": "solving the puzzle",
+            "score": rules.score(state), "check": rules.check_square(state) if p["game"] == "chess" else None,
+            "legal": [] if over or rules.turn(state) != side else rules.legal(state),
+            "puzzle": {"message": message, "done": done, "restart": bool(moves) and not over}}
+    return view
+
+
+async def puzzle_action(body, user):
+    """The board page for a puzzle: "state", "move" or "restart"."""
+    p, key = await find_puzzle(str(body.get("game", "")))
+    if not p:
+        return 404, {"error": "This puzzle has expired. Send \"puzzle\" in the group for a new one."}
+    uid, name = user["id"], user.get("first_name") or "You"
+    action = body.get("action", "state")
+    if action == "restart" and uid not in p["solvers"] and not p.get("closed"):
+        async with store_lock(key):
+            p["progress"].pop(str(uid), None)
+            await save_store(key)
+    elif action == "move" and uid not in p["solvers"] and not p.get("closed"):
+        verdict, moves, first = await puzzle_move(p["chat"], key, p, uid, name, str(body.get("move", "")))
+        if verdict in ("wrong", "illegal"):
+            return 200, {"error": "❌ Not that one. Try again!" if verdict == "wrong" else "That move isn't allowed.",
+                         **puzzle_view(p, uid, name)}
+        if verdict == "done" and first:
+            in_background(post_puzzle_solution(p["chat"], p, name, moves))
+    return 200, puzzle_view(p, uid, name)
 
 
 async def daily_puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4161,7 +4386,7 @@ async def daily_puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (f"🧩 Daily puzzle is on: a chess puzzle here every morning at {MORNING_HOUR}:00. The first to solve it gets a point "
          "on the /leaderboard. Turn it off with /dailypuzzle off" if on else
          "🧩 Daily puzzle is off. Turn it on with /dailypuzzle on") +
-        "\n\nSend \"puzzle\" any time for an extra one, just for fun.", do_quote=True)
+        "\n\nSend \"puzzle\" (or \"othello puzzle\") any time for an extra one.", do_quote=True)
 
 
 async def morning_puzzle(chat_id):
@@ -4640,7 +4865,7 @@ async def is_chat_admin(update, context):
 
 # ----- Plain-language requests ("Laden remind me…", "Meowsama post a puzzle") routed to the tools above
 
-ASK_PUZZLE = re.compile(r"(?i)^\W*(?:(?:can you|could you|pls|please)\s+)?(?:post|send|give|show|drop|share)(?:\s+(?:me|us))?\s+(?:a|an|another|one|the)?\s*(puzzle|kitty|kitten|cat(?:\s+pic(?:ture)?)?)\b")
+ASK_PUZZLE = re.compile(r"(?i)^\W*(?:(?:can you|could you|pls|please)\s+)?(?:post|send|give|show|drop|share)(?:\s+(?:me|us))?\s+(?:a|an|another|one|the)?\s*(?:(chess|othello)\s+)?(puzzle|kitty|kitten|cat(?:\s+pic(?:ture)?)?)\b")
 
 
 async def group_tool(update, context, question):
@@ -4652,8 +4877,8 @@ async def group_tool(update, context, question):
         return True
     m = ASK_PUZZLE.match(q)
     if m:
-        if m[1].lower() == "puzzle":
-            await puzzle_word(update, context)
+        if m[2].lower() == "puzzle":
+            await puzzle_word(update, context, game=(m[1] or "chess").lower())
         else:
             await send_cat(update, context)
         return True
@@ -4762,7 +4987,7 @@ async def register_commands(app):
         ("leaderboard", "Game ratings, wins vs Laden, puzzles, trivia"),
         ("stats", "Your record (or @someone / reply)"),
         ("trivia", "A trivia question, first right tap scores (/trivia top)"),
-        ("puzzle", "A chess puzzle (/puzzle top: most solved)"),
+        ("puzzle", "A chess puzzle (/puzzle othello, /puzzle top)"),
         ("dailypuzzle", "A chess puzzle every morning (on/off)"),
         ("birthday", "Save your birthday: /birthday 14 March"),
         ("birthdays", "Coming birthdays"),
