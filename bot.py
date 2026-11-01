@@ -4185,6 +4185,9 @@ async def puzzle_move(chat_id, key, p, uid, name, move):
         first = False
         if verdict in ("ok", "done"):
             p["progress"][str(uid)] = moves
+        if verdict == "wrong":  # remembered for the result post
+            miss = p.setdefault("mistakes", {}).setdefault(str(uid), {"name": name, "count": 0})
+            miss["name"], miss["count"] = name, miss["count"] + 1
         if verdict == "done" and uid not in p["solvers"]:
             p["solvers"].append(uid)
             if p["solved_by"] is None:
@@ -4288,9 +4291,26 @@ async def post_puzzle_solution(chat_id, p, solver, moves=None, reply_to=None):
         score = GAMES["othello"].score(final)
         head += f"\nFinal discs: {score['black']} black, {score['white']} white."
     link = f"\n<a href=\"https://lichess.org/training/{p['id']}\">Puzzle on Lichess</a>" if game == "chess" else ""
-    caption = f"🧩 <b>{title} result</b>\n{head}\n\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>{link}"
+    caption = f"🧩 <b>{title} result</b>\n{head}\n{puzzle_attempts(p)}\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>{link}"
     await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
                               reply_parameters=ReplyParameters(reply_to or p["msg"], allow_sending_without_reply=True))
+
+
+def puzzle_attempts(p):
+    """Who else solved it, and who went wrong (and how often), for the result post."""
+    misses = p.get("mistakes") or {}
+    wrong = lambda n: f"{n} wrong move{'s' * (n != 1)}"
+    lines = []
+    first = (p.get("solved_by") or {}).get("id")
+    if first is not None and str(first) in misses:
+        lines.append(f"{html.escape(p['solved_by']['name'])} got there after {wrong(misses[str(first)]['count'])}.")
+    elif first is not None:
+        lines.append(f"{html.escape(p['solved_by']['name'])} didn't put a foot wrong. 🎯")
+    failed = [m for uid, m in misses.items() if int(uid) not in p["solvers"]]
+    if failed:
+        lines.append("❌ Didn't solve it: " + ", ".join(
+            f"{html.escape(m['name'])} ({wrong(m['count'])})" for m in sorted(failed, key=lambda m: -m["count"])))
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 async def open_puzzle_for(update):
