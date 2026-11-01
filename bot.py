@@ -657,7 +657,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Voice notes: reply \"Laden\" to one, or reply to Laden with one\n"
         "Links: ask Laden about an article or YouTube link (\"Laden tldr\" as a reply)\n"
         "/leaderboard · /stats – game ratings, wins against Laden, puzzles solved, trivia\n"
-        "puzzle – a chess puzzle (reply with your move) · /dailypuzzle on – one every morning · /trivia\n"
+        "puzzle – a chess puzzle (reply with your move) · /puzzle top · /dailypuzzle on – one every morning · /trivia\n"
         "/birthday 14 March · /birthdays\n"
         "/paid 1200 dinner for me, Ann and Bob · /tab · /settle @name – split bills\n"
         "/chessmatch · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
@@ -4023,6 +4023,29 @@ async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Lichess didn't send me a puzzle just now. Try again in a minute.", do_quote=True)
 
 
+async def puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/puzzle top: who has solved the most puzzles; /puzzle alone posts one, like the word "puzzle"."""
+    if not context.args or context.args[0].lower() not in ("top", "scores", "leaderboard"):
+        await puzzle_word(update, context)
+        return
+    if not await ready(update, context, group_only=True):
+        return
+    try:
+        stats = await load_store(f"stats:{update.effective_chat.id}", {})
+    except Exception:
+        await update.message.reply_text("I couldn't read the scores right now. Try again in a minute.", do_quote=True)
+        return
+    solved = sorted((p for p in stats.values() if p.get("puzzles")), key=lambda p: (-p["puzzles"], -p.get("daily", 0)))[:10]
+    if not solved:
+        await update.message.reply_text("Nobody has solved a puzzle yet. Send \"puzzle\" for one!", do_quote=True)
+        return
+    lines = [f"{medal(i)} {html.escape(p['name'])} – {p['puzzles']} solved"
+             + (f" · {p['daily']} daily point{'s' * (p['daily'] != 1)}" if p.get("daily") else "") for i, p in enumerate(solved, 1)]
+    await update.message.reply_text("🧩 <b>Puzzles solved (all time)</b>\n" + "\n".join(lines) +
+                                    "\n\nDaily points go to whoever solves the morning puzzle first.",
+                                    parse_mode=ParseMode.HTML, do_quote=True)
+
+
 def read_move(board, text):
     """The first thing in the text that's a legal move here, in SAN (Nf3, O-O) or UCI (g1f3)."""
     for word in re.findall(r"[A-Za-z0-9=+#\-]+", text.replace("×", "x")):
@@ -4739,6 +4762,7 @@ async def register_commands(app):
         ("leaderboard", "Game ratings, wins vs Laden, puzzles, trivia"),
         ("stats", "Your record (or @someone / reply)"),
         ("trivia", "A trivia question, first right tap scores (/trivia top)"),
+        ("puzzle", "A chess puzzle (/puzzle top: most solved)"),
         ("dailypuzzle", "A chess puzzle every morning (on/off)"),
         ("birthday", "Save your birthday: /birthday 14 March"),
         ("birthdays", "Coming birthdays"),
@@ -4954,6 +4978,7 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("dailypuzzle", daily_puzzle_cmd))
+    app.add_handler(CommandHandler("puzzle", puzzle_cmd))
     app.add_handler(CommandHandler("trivia", trivia))
     app.add_handler(CallbackQueryHandler(trivia_button, pattern=r"^trivia\|"))
     app.add_handler(CommandHandler("birthday", birthday))
