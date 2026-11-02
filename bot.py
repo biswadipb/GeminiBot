@@ -5260,6 +5260,7 @@ def main():
         if kind != "alquerque9" and not kind.startswith("checkerchess_"):  # reached through /alquerque, /chesswithcheckers
             app.add_handler(CommandHandler(command, game_command(kind)))
     app.add_handler(CommandHandler("beads", game_command("beads")))
+    app.add_handler(CommandHandler("chess", game_command("chess")))  # same as /chessmatch
     for kind, command in PARTY_COMMANDS.items():
         app.add_handler(CommandHandler(command, party_command(kind)))
     app.add_handler(CommandHandler("snakes", party_command("snakes")))
