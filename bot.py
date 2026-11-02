@@ -657,7 +657,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Voice notes: reply \"Laden\" to one, or reply to Laden with one\n"
         "Links: ask Laden about an article or YouTube link (\"Laden tldr\" as a reply)\n"
         "/leaderboard · /stats – game ratings, wins against Laden, puzzles solved, trivia\n"
-        "puzzle or othello puzzle – solve it on the board or move by move in the chat · /puzzle top · /dailypuzzle on · /trivia\n"
+        "puzzle, /othello puzzle – solve it on the board or move by move in the chat · /puzzle top · /dailypuzzle on · /trivia\n"
         "/birthday 14 March · /birthdays\n"
         "/paid 1200 dinner for me, Ann and Bob · /tab · /settle @name – split bills\n"
         "/chessmatch · /chesswithcheckers · /othello · /checkers · /draughts · /go · /16beads · /alquerque · /fanorona – board games: challenge someone, "
@@ -2470,6 +2470,9 @@ def game_command(kind):
             await update.message.reply_text("Sorry, this bot is private.")
             return
         msg, user, chat = update.message, update.effective_user, update.effective_chat
+        if kind in ("othello", "chess") and any(a.lower() in ("puzzle", "puzzles") for a in context.args):
+            await puzzle_word(update, context, game=kind)  # /othello puzzle, /chessmatch puzzle
+            return
         refusal = too_many_games(user.id)
         if refusal:
             await msg.reply_text(refusal, do_quote=True)
@@ -5064,7 +5067,7 @@ async def register_commands(app):
         ("settle", "You paid someone back: /settle @name [amount]"),
         ("timezone", "This group's time zone for reminders"),
         ("chessmatch", "Play chess (long-press to add @name)"),
-        ("othello", "Play othello (long-press to add @name)"),
+        ("othello", "Play othello, or /othello puzzle (long-press to add @name)"),
         ("checkers", "Play checkers (long-press to add @name)"),
         ("go", "Play go 9×9 (long-press to add @name)"),
         ("16beads", "Play 16 beads (long-press to add @name)"),
