@@ -2780,8 +2780,10 @@ async def game_action(body):
     user = check_init_data(body.get("initData"))
     if not user:
         return 401, {"error": "Please open the board from the button in Telegram."}
-    if str(body.get("game", "")).startswith("pz"):
-        return await puzzle_action(body, user)  # a puzzle, played on the same board page
+    if str(body.get("game", "")).startswith("pz"):  # a puzzle, played on the same board page
+        result = await puzzle_action(body, user)
+        if result[0] != 404 or not await load_game(str(body["game"])):  # (a game's random id can start with pz too)
+            return result
     game = await load_game(str(body.get("game", "")))
     if not game:
         return 404, {"error": "This game doesn't exist (games are kept for 7 days)."}
@@ -3335,7 +3337,7 @@ async def load_store(key, default):
         if use_redis:
             raw = await redis("GET", key)
             value = json.loads(raw) if raw else None
-        store_cache[key] = default if value is None else value
+        store_cache.setdefault(key, default if value is None else value)  # someone may have loaded it meanwhile
     return store_cache[key]
 
 
@@ -4147,9 +4149,8 @@ async def post_puzzle(chat_id, daily, game="chess", reply_to=None):
                f"Play it on the board, or reply here with your move ({example}) and I'll answer move by move. "
                + ("The first to solve it gets a point on the /leaderboard." if daily else "Every solve counts in /puzzle top."))
     button = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Solve on the board", url=game_link(game_bot.username, p["pid"]))]])
-    sent = await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML, reply_markup=button,
-                                     reply_parameters=ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None)
-    p["msg"] = sent.message_id
+    # Saved before it's posted, so the button works from the moment anyone can tap it
+    p["msg"] = None
     key = f"puzzles:{chat_id}"
     async with store_lock(key):
         puzzles = await load_store(key, [])
@@ -4162,6 +4163,17 @@ async def post_puzzle(chat_id, daily, game="chess", reply_to=None):
         for old in list(index)[:-500]:
             index.pop(old)
         await save_store("puzzle_index")
+    try:
+        sent = await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML, reply_markup=button,
+                                         reply_parameters=ReplyParameters(reply_to, allow_sending_without_reply=True) if reply_to else None)
+    except Exception:
+        async with store_lock(key):  # nobody saw it: forget it, or its answer would turn up a day later
+            puzzles.remove(p)
+            await save_store(key)
+        raise
+    async with store_lock(key):
+        p["msg"] = sent.message_id
+        await save_store(key)
 
 
 async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE, game=None):
@@ -4343,8 +4355,9 @@ async def post_puzzle_solution(chat_id, p, solver, moves=None, reply_to=None):
         head += f"\nFinal discs: {score['black']} black, {score['white']} white."
     link = f"\n<a href=\"https://lichess.org/training/{p['id']}\">Puzzle on Lichess</a>" if game == "chess" else ""
     caption = f"🧩 <b>{title} result</b>\n{head}\n{puzzle_attempts(p)}\n<b>Solution</b>\n<blockquote>{html.escape(line)}</blockquote>{link}"
+    target = reply_to or p["msg"]
     await game_bot.send_photo(chat_id, picture, caption=caption, parse_mode=ParseMode.HTML,
-                              reply_parameters=ReplyParameters(reply_to or p["msg"], allow_sending_without_reply=True))
+                              reply_parameters=ReplyParameters(target, allow_sending_without_reply=True) if target else None)
 
 
 def puzzle_attempts(p):
@@ -4378,11 +4391,28 @@ async def open_puzzle_for(update):
 
 
 async def find_puzzle(pid):
-    chat_id = (await load_store("puzzle_index", {})).get(pid)
+    """A puzzle by id, and its store key. Anything not found is looked up in Redis again before giving up: during a
+    deploy two copies of the bot run side by side, and this one may not have seen a puzzle the other just posted."""
+    async def saved(key, default):
+        raw = await redis("GET", key) if use_redis else None
+        return json.loads(raw) if raw else default
+
+    index = await load_store("puzzle_index", {})
+    if pid not in index:
+        async with store_lock("puzzle_index"):
+            index.update(await saved("puzzle_index", {}))
+    chat_id = index.get(pid)
     if chat_id is None:
         return None, None
     key = f"puzzles:{chat_id}"
-    return next((p for p in await load_store(key, []) if p.get("pid") == pid), None), key
+    puzzles = await load_store(key, [])
+    found = next((p for p in puzzles if p.get("pid") == pid), None)
+    if not found:
+        async with store_lock(key):
+            known = {p.get("pid") for p in puzzles}
+            puzzles.extend(p for p in await saved(key, []) if p.get("pid") not in known)
+        found = next((p for p in puzzles if p.get("pid") == pid), None)
+    return found, key
 
 
 def puzzle_view(p, uid, name):
