@@ -6,6 +6,7 @@ import decimal
 import math
 import operator
 import base64
+import collections
 import datetime
 import hashlib
 import hmac
@@ -212,8 +213,10 @@ async def load_history(chat_id):
             try:
                 raw = await redis("GET", f"history:{chat_id}")
                 history = json.loads(raw) if raw else []
-                for turn in history:  # so Gemini can't copy a scrubbed line from what it said before
+                for turn in history:  # so Gemini can't copy a scrubbed line, or a loop of junk, from what it said before
                     turn["text"] = scrub(turn.get("text", ""))
+                    if looks_stuck(turn["text"]):
+                        turn["text"] = "(a garbled reply, left out)"
             except Exception:
                 log.exception("Could not load history for %s", chat_id)
         histories[chat_id] = history
@@ -539,6 +542,20 @@ def split_message(text, limit=TELEGRAM_LIMIT):
     return chunks
 
 
+MAX_OUTPUT_TOKENS = 4096  # a runaway answer stops here (thinking counts too, so not much lower)
+
+
+def looks_stuck(text):
+    """True for a reply that's mostly the same thing over and over: a model caught in a loop."""
+    if not text or len(text) < 600:
+        return False
+    raw = text.encode()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    repeats = max(collections.Counter(lines).values()) if lines else 0
+    # loops squeeze to about 4% of their size; real answers, even repetitive lists, stay above 10%
+    return len(zlib.compress(raw)) / len(raw) < 0.07 or (len(lines) >= 10 and repeats / len(lines) > 0.5)
+
+
 model_blocked_until = {}  # model -> time it can be tried again (its free allowance ran out, it doesn't exist, or it hung)
 # Gemini sometimes accepts a request and then just doesn't answer. Rather than wait on it, give up after this long,
 # move on to the next model and leave the stuck one alone for a few minutes.
@@ -609,8 +626,8 @@ async def ask_gemini(history, chat_id=None, search=False):
     search=True lets Gemini look things up on the web when the question needs fresh information."""
     contents = [types.Content(role=m["role"], parts=[*m.get("media", []), types.Part(text=m["text"])]) for m in history]
     instructions = await system_prompt(chat_id)
-    plain = types.GenerateContentConfig(system_instruction=instructions)
-    searching = types.GenerateContentConfig(system_instruction=instructions, tools=[SEARCH_TOOL],
+    plain = types.GenerateContentConfig(system_instruction=instructions, max_output_tokens=MAX_OUTPUT_TOKENS)
+    searching = types.GenerateContentConfig(system_instruction=instructions, tools=[SEARCH_TOOL], max_output_tokens=MAX_OUTPUT_TOKENS,
                                             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
     chain = [GEMINI_MODEL, *FALLBACK_MODELS]
     available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
@@ -625,6 +642,12 @@ async def ask_gemini(history, chat_id=None, search=False):
                     request = client.aio.models.generate_content(model=model, contents=contents, config=plain)
                 answer = await asyncio.wait_for(request, limit)
                 answer = answer if isinstance(answer, str) else answer.text
+                if looks_stuck(answer):  # the model got stuck repeating itself: don't send that, try the next one
+                    log.warning("%s answered with a loop of repeated text (%d characters); trying the next model",
+                                model, len(answer))
+                    last_error = errors.APIError(503, {"error": {"code": 503, "message": f"{model} repeated itself",
+                                                                 "status": "UNAVAILABLE"}})
+                    break
                 if model != chain[0]:
                     log.info("Answered with %s", model)
                 return answer, model
