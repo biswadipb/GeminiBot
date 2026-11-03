@@ -109,6 +109,25 @@ BOT_NAMES = [n.strip() for n in os.getenv("BOT_NAMES", "Laden").split(",") if n.
 NICKNAMES = ["Meowsama bin Laden", "Meowsama", "Mewsama", "Meosama"]  # always answered to as well
 CALLED_BY = sorted(set(BOT_NAMES + NICKNAMES), key=len, reverse=True)  # longest first, so the full name is matched whole
 NAME_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, CALLED_BY)) + r")\b", re.IGNORECASE)
+# Lines Laden must never say, kept only as fingerprints (sha256 of the sentence in lower case, letters and digits
+# only) so this public repo doesn't repeat them. They're dropped from lore, saved chat history and every reply.
+SCRUBBED_LINES = {
+    "5f3e32868520e5e15f6fb591bb421825152f45867c750c047556b6e90fc436c9",
+}
+
+
+def line_key(sentence):
+    return hashlib.sha256(re.sub(r"[\W_]", "", sentence.lower()).encode()).hexdigest()
+
+
+def scrub(text):
+    """The text without any sentence in SCRUBBED_LINES."""
+    if not text:
+        return text
+    kept = re.sub(r"[^.!?\n]+[.!?]*", lambda m: "" if line_key(m[0]) in SCRUBBED_LINES else m[0], text)
+    return re.sub(r"[ \t]{2,}", " ", re.sub(r"\n{3,}", "\n\n", kept)).strip()
+
+
 LORE_INSTRUCTIONS = (
     "Group lore (running in-jokes about people in this chat). When someone asks about one of these people, "
     "or asks you to check on them, play along with the lore in character, playfully and sarcastically. "
@@ -193,6 +212,8 @@ async def load_history(chat_id):
             try:
                 raw = await redis("GET", f"history:{chat_id}")
                 history = json.loads(raw) if raw else []
+                for turn in history:  # so Gemini can't copy a scrubbed line from what it said before
+                    turn["text"] = scrub(turn.get("text", ""))
             except Exception:
                 log.exception("Could not load history for %s", chat_id)
         histories[chat_id] = history
@@ -955,7 +976,7 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix="", media=())
     try:
         turn = {"role": "user", "text": gemini_text or text, "media": list(media)}
         answer, model = await ask_gemini(history + [turn], chat_id, search=True)
-        answer = answer or "(Gemini returned an empty response.)"
+        answer = scrub(answer) or ("😼" if answer else "(Gemini returned an empty response.)")
         speaker_name = re.match(r"(\w+): ", text)
         if speaker_name:  # Gemini sometimes echoes the "Name:" prefix group messages carry
             answer = re.sub(rf"^\s*\**{re.escape(speaker_name[1])}\**:\**\s*", "", answer)
@@ -5145,6 +5166,8 @@ async def load_lore():
             lore.update(json.loads(os.getenv("LORE_PRIVATE", "") or "{}"))
         except Exception:
             log.exception("LORE_PRIVATE is not valid JSON; ignoring it")
+        lore = {name: scrub(str(text)) for name, text in lore.items()}
+        lore = {name: text for name, text in lore.items() if text}
     return lore
 
 
