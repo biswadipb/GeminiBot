@@ -4077,8 +4077,9 @@ PUZZLE_TRIGGER = r"(?i)^\s*(?:(chess|othello)\s+)?puzzle(?:\s+(chess|othello))?\
 PUZZLE_OPEN_HOURS = 24  # an unsolved puzzle gets its answer posted after this
 
 
-async def fetch_chess_puzzle(daily):
-    r = await http.get("https://lichess.org/api/puzzle/" + ("daily" if daily else "next"), timeout=20)
+async def fetch_chess_puzzle():
+    # a random one, also for the daily: Lichess's own puzzle of the day is the same worldwide, so its answer is easy to look up
+    r = await http.get("https://lichess.org/api/puzzle/next", timeout=20)
     r.raise_for_status()
     data = r.json()
     board = chess.pgn.read_game(io.StringIO(data["game"]["pgn"])).end().board()
@@ -4176,7 +4177,7 @@ def puzzle_try(p, moves, move):
 
 
 async def post_puzzle(chat_id, daily, game="chess", reply_to=None):
-    p = await (fetch_chess_puzzle(daily) if game == "chess" else make_othello_puzzle())
+    p = await (fetch_chess_puzzle() if game == "chess" else make_othello_puzzle())
     p.update(pid="pz" + base64.urlsafe_b64encode(os.urandom(6)).decode(), daily=daily, posted=time.time(), chat=chat_id,
              solved_by=None, solvers=[], progress={}, msgs=[])
     side = puzzle_side(p)
@@ -4528,31 +4529,30 @@ async def daily_puzzle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await save_store("puzzle_chats")
     on = chat in chats
     await update.message.reply_text(
-        (f"🧩 Daily puzzle is on: a chess puzzle here every morning at {MORNING_HOUR}:00. The first to solve it gets a point "
-         "on the /leaderboard. Turn it off with /dailypuzzle off" if on else
+        (f"🧩 Daily puzzle is on: one random chess puzzle here every morning at {MORNING_HOUR}:00. The first to solve it gets "
+         f"a point on the /leaderboard; if nobody does, I post the answer after {PUZZLE_OPEN_HOURS} hours. "
+         "Turn it off with /dailypuzzle off" if on else
          "🧩 Daily puzzle is off. Turn it on with /dailypuzzle on") +
         "\n\nSend \"puzzle\" (or \"othello puzzle\") any time for an extra one.", do_quote=True)
 
 
-async def morning_puzzle(chat_id):
-    key = f"puzzles:{chat_id}"
-    async with store_lock(key):
-        puzzles = await load_store(key, [])
-        unsolved = [p for p in puzzles if p["daily"] and p["solved_by"] is None and not p.get("closed")]
-        for p in unsolved:
-            p["closed"] = True
-        await save_store(key)
-    for p in unsolved:
-        await post_puzzle_solution(chat_id, p, None)
+async def morning_puzzle(chat_id, today):
+    """The one daily puzzle. Yesterday's stays open until it's 24 hours old (close_old_puzzles posts its answer)."""
+    if use_redis:  # claimed in Redis too, so two copies of the bot (as during a deploy) can't both post one
+        if not await redis("SET", f"daily_puzzle:{chat_id}:{today}", "1", "NX", "EX", 2 * 86400):
+            return
     await post_puzzle(chat_id, daily=True)
 
 
 async def close_old_puzzles():
-    """Post the answer to any unsolved for-fun puzzle that has been open for a day."""
+    """Post the answer to any unsolved puzzle, daily or for fun, that has been open for a day."""
+    chats = set(await load_store("puzzle_chats", [])) | set((await load_store("puzzle_index", {})).values())
+    for chat_id in chats:  # loaded first, so puzzles from before a restart get their answers too
+        await load_store(f"puzzles:{chat_id}", [])
     for key in [k for k in store_cache if k.startswith("puzzles:")]:
         chat_id = int(key.split(":", 1)[1])
         async with store_lock(key):
-            stale = [p for p in store_cache[key] if not p["daily"] and p["solved_by"] is None and not p.get("closed")
+            stale = [p for p in store_cache[key] if p["solved_by"] is None and not p.get("closed")
                      and time.time() - p["posted"] > PUZZLE_OPEN_HOURS * 3600]
             for p in stale:
                 p["closed"] = True
@@ -5064,7 +5064,7 @@ async def run_morning_jobs():
         await save_store("morning_done")
         jobs = [("birthdays", wish_birthdays(chat_id, local.date()))]
         if chat_id in chats:
-            jobs.append(("daily puzzle", morning_puzzle(chat_id)))
+            jobs.append(("daily puzzle", morning_puzzle(chat_id, today)))
         if local.weekday() == 0:
             jobs.append(("trivia champion", crown_trivia_champion(chat_id)))
         for name, job in jobs:
@@ -5091,8 +5091,8 @@ async def watch_schedule():
         try:
             await fire_reminders()
             if tick % 4 == 0:
-                await run_morning_jobs()
                 await close_old_puzzles()
+                await run_morning_jobs()
         except Exception:
             log.exception("Scheduled job failed")
 
