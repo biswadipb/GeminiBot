@@ -4359,11 +4359,24 @@ async def puzzle_answer(update, context, p, key):
     line, _ = puzzle_line(p, moves)
     step = sum(1 for i, m in enumerate(moves) if m != "pass" and puzzle_turn_at(p, moves, i) == side)
     answer = puzzle_answer_text(p, moves)
-    sent = await msg.reply_text(f"✅ Good! {answer}\nYour move ({step + 1} of {puzzle_steps(p)}): reply to this with it.\n"
-                                f"So far: {line}", do_quote=True)
+    sent = await msg.reply_photo(await puzzle_board_now(p, moves, step), do_quote=True,
+                                 caption=f"✅ Good! {answer}\nYour move ({step + 1} of {puzzle_steps(p)}): reply to this with it.\n"
+                                         f"So far: {line}")
     async with store_lock(key):
         p["msgs"] = (p.get("msgs") or [])[-49:] + [sent.message_id]
         await save_store(key)
+
+
+async def puzzle_board_now(p, moves, step):
+    """A picture of the position after a solver's good move and Laden's answer, for the next move."""
+    _, state = puzzle_line(p, moves)
+    game, side = p["game"], puzzle_side(p)
+    snapshot = state.board_fen() if game == "chess" else "".join(state.board)
+    last = moves[-1] if game == "chess" and moves[-1] != "pass" else None
+    title = ("Daily " if p["daily"] else "") + f"{game} puzzle"
+    return await asyncio.to_thread(gameimages.puzzle_picture, snapshot, last, title[0].upper() + title[1:], puzzle_goal(p),
+                                   f"{side.capitalize()} to move ({step + 1} of {puzzle_steps(p)})", False,
+                                   game == "chess" and side == "black", game, side == "black")
 
 
 def puzzle_turn_at(p, moves, i):
@@ -4416,7 +4429,8 @@ async def post_puzzle_solution(chat_id, p, solver, moves=None, reply_to=None):
 
 
 def puzzle_attempts(p):
-    """Who else solved it, and who went wrong (and how often), for the result post."""
+    """How the first solver got on, and (othello only) who went wrong without finishing, for the result post.
+    In chess, only people who finished are mentioned."""
     misses = p.get("mistakes") or {}
     wrong = lambda n: f"{n} wrong move{'s' * (n != 1)}"
     lines = []
@@ -4426,7 +4440,7 @@ def puzzle_attempts(p):
     elif first is not None:
         lines.append(f"{html.escape(p['solved_by']['name'])} didn't put a foot wrong. 🎯")
     failed = [m for uid, m in misses.items() if int(uid) not in p["solvers"]]
-    if failed:
+    if failed and p["game"] != "chess":
         lines.append("❌ Didn't solve it: " + ", ".join(
             f"{html.escape(m['name'])} ({wrong(m['count'])})" for m in sorted(failed, key=lambda m: -m["count"])))
     return "\n".join(lines) + ("\n" if lines else "")
