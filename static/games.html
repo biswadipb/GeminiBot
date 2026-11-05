@@ -38,7 +38,8 @@
   .player .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .player .turn { font-size: 13px; font-weight: 500; color: var(--button); }
   .taken { display: flex; align-items: center; min-height: 20px; margin-top: 1px; font-size: 12px; font-weight: 600; color: var(--hint); }
-  .taken .cap { position: relative; width: 20px; height: 20px; margin-right: -6px; filter: drop-shadow(0 0 1px var(--hint)); }
+  .taken .cap { position: relative; width: 20px; height: 20px; margin-right: -6px;
+                filter: drop-shadow(0 0 .7px var(--hint)) drop-shadow(0 0 .7px var(--hint)) drop-shadow(0 0 .7px var(--hint)); }  /* an even outline on every piece */
   .taken .cap.gap { margin-left: 7px; }
   .taken .cap svg { display: block; width: 100%; height: 100%; }
   .taken .adv { margin-left: 9px; }
