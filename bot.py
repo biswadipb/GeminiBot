@@ -803,7 +803,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if quoted_media:
                     what = f"{quoted_kind.split(' ', 1)[-1]} (attached)" + (f' with the caption "{quoted_text}"' if quoted_text else "")
                 text = f"[Replying to {quoted.from_user.first_name}'s {what}]\n{text}"
-        if media and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
+        part = update.message.quote and update.message.quote.text  # Telegram lets you quote just a bit of a message
+        if quoted and part:
+            own = quoted.from_user.id == context.bot.id
+            whole = (quoted.text or quoted.caption or "")[:MAX_QUOTE]
+            asked = (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
+                f"@{context.bot.username}", "").strip(" ,:?!.")
+            text = (f'[They quoted just this part of {"your" if own else "the replied-to"} message: "{part[:MAX_QUOTE]}". '
+                    "Answer about that part specifically, using the rest of the message for context"
+                    + (f'. The whole message: "{whole}"' if own and whole else "") + "]\n" + text
+                    + ("" if asked else "\nExplain or respond to that part."))
+        if media and not (quoted and part) and not (NAME_PATTERN.sub("", message_text) if NAME_PATTERN else message_text).replace(
                 f"@{context.bot.username}", "").strip(" ,:?!."):
             if "voice" in kind or "audio" in kind:
                 text += "\nTranscribe it word for word (in its own language, with an English translation if it isn't " \
