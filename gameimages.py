@@ -606,13 +606,21 @@ def snakes_board(img, draw, x0, y0, size, state, players):
 def compose(title, headline, players, draw_board, board_height):
     """players: [(swatch colour, label, is_winner)]. draw_board(img, draw, x, y, width) -> height used."""
     board_w = WIDTH - 2 * PAD
-    height = int(PAD + 36 + 34 + 16 + board_height + 18 + 34 * len(players) + PAD)
+    lines = [""]  # a long headline (like a puzzle's whole solution) wraps instead of running off the edge
+    for word in headline.split():
+        if lines[-1] and text_width(f"{lines[-1]} {word}", 20) > board_w:
+            lines.append(word)
+        else:
+            lines[-1] = f"{lines[-1]} {word}".strip()
+    extra = 28 * (len(lines) - 1)
+    height = int(PAD + 36 + 34 + 16 + extra + board_height + 18 + 34 * len(players) + PAD)
     img = Image.new("RGB", (s(WIDTH), s(height)), PAPER)
     draw = ImageDraw.Draw(img, "RGBA")  # on an RGB canvas, see-through shadows and highlights blend in
     text(draw, PAD, PAD, title, 28)
-    text(draw, PAD, PAD + 40, headline, 20, HINT)
-    used = draw_board(img, draw, PAD, PAD + 86, board_w)
-    y = PAD + 86 + used + 18
+    for i, line in enumerate(lines):
+        text(draw, PAD, PAD + 40 + 28 * i, line, 20, HINT)
+    used = draw_board(img, draw, PAD, PAD + 86 + extra, board_w)
+    y = PAD + 86 + extra + used + 18
     for colour, label, winner in players:
         disc(draw, PAD + 10, y + 12, 10, colour, (60, 60, 60), 2)
         text(draw, PAD + 30, y + 1, label, 19)
