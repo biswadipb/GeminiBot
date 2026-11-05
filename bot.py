@@ -4084,7 +4084,8 @@ async def credit(chat_id, uid, name, field):
 # end of the best line. "puzzle" / "othello puzzle" for one now, /dailypuzzle on for a chess one every morning.
 
 PUZZLE_TRIGGER = r"(?i)^\s*(?:(chess|othello)\s+)?puzzle(?:\s+(chess|othello))?\s*[!.?]*\s*$"
-PUZZLE_OPEN_HOURS = 24  # an unsolved puzzle gets its answer posted after this
+PUZZLE_OPEN_HOURS = 24  # an unsolved daily puzzle gets its answer posted after this
+PUZZLE_OPEN_MINUTES = 30  # ...and one asked for just for fun, after this
 
 
 async def fetch_chess_puzzle():
@@ -4202,7 +4203,7 @@ async def post_puzzle(chat_id, daily, game="chess", reply_to=None):
     example = "Nf3, Qxh7+ or e2e4" if game == "chess" else "c4 or h8"
     caption = (f"🧩 <b>{title}</b>{rated}\n{html.escape(puzzle_goal(p))}.\n\n"
                f"Play it on the board, or reply here with your move ({example}) and I'll answer move by move. "
-               + ("The first to solve it gets a point on the /leaderboard." if daily else "Every solve counts in /puzzle top."))
+               + ("The first to solve it gets a point on the /leaderboard." if daily else f"Every solve counts in /puzzle top. Answer in {PUZZLE_OPEN_MINUTES} minutes if nobody gets it."))
     button = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Solve on the board", url=game_link(game_bot.username, p["pid"]))]])
     # Saved before it's posted, so the button works from the moment anyone can tap it
     p["msg"] = None
@@ -4569,7 +4570,7 @@ async def morning_puzzle(chat_id, today):
 
 
 async def close_old_puzzles():
-    """Post the answer to any unsolved puzzle, daily or for fun, that has been open for a day."""
+    """Post the answer to any unsolved puzzle that has been open long enough: a day if daily, 30 minutes if for fun."""
     chats = set(await load_store("puzzle_chats", [])) | set((await load_store("puzzle_index", {})).values())
     for chat_id in chats:  # loaded first, so puzzles from before a restart get their answers too
         await load_store(f"puzzles:{chat_id}", [])
@@ -4577,7 +4578,7 @@ async def close_old_puzzles():
         chat_id = int(key.split(":", 1)[1])
         async with store_lock(key):
             stale = [p for p in store_cache[key] if p["solved_by"] is None and not p.get("closed")
-                     and time.time() - p["posted"] > PUZZLE_OPEN_HOURS * 3600]
+                     and time.time() - p["posted"] > (PUZZLE_OPEN_HOURS * 3600 if p["daily"] else PUZZLE_OPEN_MINUTES * 60)]
             for p in stale:
                 p["closed"] = True
             if stale:
