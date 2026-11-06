@@ -63,7 +63,7 @@ FALLBACK_MODELS = [
     m.strip()
     for m in os.getenv("GEMINI_FALLBACK_MODELS", ",".join([
         "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest",
-        "gemini-3.1-flash-lite", "gemini-flash-lite-latest",  # each model has its own free daily allowance
+        "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest",  # each has its own free daily allowance
     ])).split(",")
     if m.strip()
 ]
@@ -658,9 +658,9 @@ async def ask_gemini(history, chat_id=None, search=False):
                 break
             except errors.APIError as e:
                 last_error = e
-                if e.code in SKIP_MODEL:  # model doesn't exist for this key
-                    model_blocked_until[model] = time.time() + 86400
-                    log.warning("%s not available (404); skipping it for a day", model)
+                if e.code in SKIP_MODEL:  # model missing for this key (Google's "-latest" names sometimes vanish for a while)
+                    model_blocked_until[model] = time.time() + 3600
+                    log.warning("%s not available (404); skipping it for an hour", model)
                     break
                 if e.code == 429:  # allowance used up: don't retry, go straight to the next model
                     wait, daily = quota_retry_seconds(e)
@@ -674,7 +674,8 @@ async def ask_gemini(history, chat_id=None, search=False):
                 log.warning("%s overloaded (%s), attempt %d/%d", model, e.code, attempt + 1, RETRIES_PER_MODEL)
                 if attempt < RETRIES_PER_MODEL - 1:
                     await asyncio.sleep(1)
-    if last_error is None:  # every model is cooling down right now
+    if last_error is None or (isinstance(last_error, errors.APIError) and last_error.code in SKIP_MODEL):
+        # every model is cooling down (or the only one left doesn't exist): that's "busy, try later", not an error
         soonest = min(model_blocked_until.get(m, 0) for m in chain) - time.time()
         log.warning("All models are out of allowance; the first frees up in %dm", max(0, soonest) // 60)
         raise errors.APIError(429, {"error": {"code": 429, "message": "all models cooling down", "status": "RESOURCE_EXHAUSTED"}})
@@ -1024,7 +1025,7 @@ async def chat_turn(chat_id, text, gemini_text=None, answer_suffix="", media=())
         log.exception("Gemini request failed")
         if isinstance(e, errors.APIError) and e.code in RETRYABLE:
             return BUSY_REPLY, False
-        return f"Error talking to Gemini: {e}", False
+        return "Something went wrong talking to Gemini, so I couldn't answer that. Try asking again.", False
 
 
 def speaker(update: Update, text):
