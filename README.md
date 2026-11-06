@@ -60,7 +60,7 @@ All settings live in `.env`:
 | `GEMINI_MODEL` | no | `gemini-3.8-flash` | Main model |
 | `GEMINI_FALLBACK_MODELS` | no | `gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-flash-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-flash-lite-latest` | Tried in order when the main model is busy. A model whose free allowance is used up is skipped until it resets |
 | `GROQ_API_KEY` | no | | Free key from console.groq.com: Groq models are tried after every Gemini model (text only) and can be picked with `/modelswitch` |
-| `GROQ_MODELS` | no | `openai/gpt-oss-120b,llama-3.3-70b-versatile` | Which Groq models to use |
+| `GROQ_MODELS` | no | `openai/gpt-oss-120b,openai/gpt-oss-20b` | Which Groq models to use |
 | `MISTRAL_API_KEY` | no | | Free key from console.mistral.ai: Mistral models come after Groq's (text only) |
 | `MISTRAL_MODELS` | no | `mistral-medium-latest,mistral-small-latest` | Which Mistral models to use |
 | `GEMINI_RETRIES` | no | `3` | Attempts per model before falling back |

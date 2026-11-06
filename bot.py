@@ -71,7 +71,7 @@ FALLBACK_MODELS = [
 # only when its key is set. Both speak OpenAI's chat format, and both have a free tier.
 OTHER_PROVIDERS = {
     "groq": {"name": "Groq", "key": os.getenv("GROQ_API_KEY", ""), "url": "https://api.groq.com/openai/v1",
-             "models": os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,llama-3.3-70b-versatile")},
+             "models": os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b")},
     "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
                 "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest")},
 }
@@ -584,13 +584,12 @@ def quota_retry_seconds(error):
 
 # Gemini's own Google Search tool has no free allowance, so Gemini gets our web search (Tavily/DuckDuckGo)
 # as a function it can call when a question needs fresh information
+SEARCH_DESCRIPTION = ("Search the web for current information: news, recent events, who currently holds a position, "
+                      "prices, scores, releases, latest versions, or any fact that may have changed recently.")
+SEARCH_PARAMETERS = {"type": "object", "properties": {"query": {"type": "string", "description": "The search query"}},
+                     "required": ["query"]}
 SEARCH_TOOL = types.Tool(function_declarations=[types.FunctionDeclaration(
-    name="web_search",
-    description="Search the web for current information: news, recent events, who currently holds a position, "
-                "prices, scores, releases, latest versions, or any fact that may have changed recently.",
-    parameters={"type": "object", "properties": {"query": {"type": "string", "description": "The search query"}},
-                "required": ["query"]},
-)])
+    name="web_search", description=SEARCH_DESCRIPTION, parameters=SEARCH_PARAMETERS)])
 MAX_SEARCH_ROUNDS = 2  # searches Gemini may run for one answer
 MAX_SOURCES = 3
 
@@ -644,13 +643,14 @@ async def ask_other_provider(model, history, instructions, search):
     conf = OTHER_PROVIDERS[MODEL_PROVIDER[model]]
     messages = [{"role": "system", "content": instructions}] + [
         {"role": "assistant" if m["role"] == "model" else "user", "content": m["text"]} for m in history]
-    tools = [{"type": "function", "function": {"name": "web_search", "description": SEARCH_TOOL.function_declarations[0].description,
-                                               "parameters": SEARCH_TOOL.function_declarations[0].parameters.model_dump(exclude_none=True, mode="json")}}]
+    tools = [{"type": "function", "function": {"name": "web_search", "description": SEARCH_DESCRIPTION, "parameters": SEARCH_PARAMETERS}}]
     sources = {}
     for round_ in range(MAX_SEARCH_ROUNDS + 1):
         body = {"model": model, "messages": messages, "max_tokens": MAX_OUTPUT_TOKENS}
         if search and round_ < MAX_SEARCH_ROUNDS:
             body["tools"] = tools
+        elif search:  # out of searches: some models still try one unless told plainly
+            body["messages"] = messages + [{"role": "user", "content": "(No more searches. Answer now with what you found.)"}]
         r = await http.post(f"{conf['url']}/chat/completions", json=body, timeout=GEMINI_TIMEOUT * 2,
                             headers={"Authorization": f"Bearer {conf['key']}"})
         if r.status_code >= 400:
