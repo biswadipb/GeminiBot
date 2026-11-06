@@ -68,10 +68,14 @@ FALLBACK_MODELS = [
     if m.strip()
 ]
 # Other providers, tried after every Gemini model (text only: pictures, voice and video stay with Gemini). Each is used
-# only when its key is set. Both speak OpenAI's chat format, and both have a free tier.
+# only when its key is set. All speak OpenAI's chat format. OpenRouter's ":free" models come and go; "openrouter/free"
+# picks whichever free model is up.
 OTHER_PROVIDERS = {
     "groq": {"name": "Groq", "key": os.getenv("GROQ_API_KEY", ""), "url": "https://api.groq.com/openai/v1",
              "models": os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b")},
+    "openrouter": {"name": "OpenRouter", "key": os.getenv("OPENROUTER_API_KEY", ""), "url": "https://openrouter.ai/api/v1",
+                   "models": os.getenv("OPENROUTER_MODELS", "nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-31b-it:free,"
+                                                            "openrouter/free")},
     "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
                 "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest")},
 }
@@ -632,8 +636,10 @@ async def generate_with_search(model, contents, config):
 
 def model_label(model):
     provider = MODEL_PROVIDER.get(model)
+    if model == "openrouter/free":
+        return "OpenRouter · any free model"
     if provider:
-        return f"{OTHER_PROVIDERS[provider]['name']} · {model.split('/')[-1].removeprefix(provider + '-')}"
+        return f"{OTHER_PROVIDERS[provider]['name']} · {model.split('/')[-1].removeprefix(provider + '-').removesuffix(':free')}"
     return f"Gemini · {model.removeprefix('gemini-')}"
 
 
@@ -652,7 +658,7 @@ async def ask_other_provider(model, history, instructions, search):
         elif search:  # out of searches: some models still try one unless told plainly
             body["messages"] = messages + [{"role": "user", "content": "(No more searches. Answer now with what you found.)"}]
         r = await http.post(f"{conf['url']}/chat/completions", json=body, timeout=GEMINI_TIMEOUT * 2,
-                            headers={"Authorization": f"Bearer {conf['key']}"})
+                            headers={"Authorization": f"Bearer {conf['key']}", "X-Title": "DaLadenBot"})
         if r.status_code >= 400:
             code = r.status_code if r.status_code in (404, 429) or r.status_code >= 500 else 503  # anything odd: next model
             raise errors.APIError(code, {"error": {"code": code, "message": f"{conf['name']} {r.status_code}: {r.text[:300]}",
@@ -816,7 +822,7 @@ async def model_menu(chat_id):
     text = ("🧠 <b>Model for this chat</b>: " + html.escape(model_label(picked) if picked else "automatic") +
             "\n\nTap one to use it. If it's used up or busy, I fall back to the others in order, so answers keep coming. "
             "⏳ = resting right now (used up or busy)." +
-            ("" if MODEL_PROVIDER else "\nGroq and Mistral appear here once their API keys are set.") +
+            ("" if MODEL_PROVIDER else "\nGroq and OpenRouter models appear here once their API keys are set.") +
             ("\nPictures, voice notes and videos always go to Gemini." if MODEL_PROVIDER else ""))
     return text, InlineKeyboardMarkup(rows)
 
@@ -5338,7 +5344,7 @@ async def register_commands(app):
     commands = [
         ("help", "What I can do"),
         ("search", "Answer from the web, with sources"),
-        ("modelswitch", "Choose which AI model answers (Gemini, Groq, Mistral)"),
+        ("modelswitch", "Choose which AI model answers (Gemini, Groq, OpenRouter)"),
         ("imagine", "Generate a picture"),
         ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
         ("serious", "Serious mode on: critical, logical answers"),
