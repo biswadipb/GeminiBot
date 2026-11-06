@@ -67,6 +67,17 @@ FALLBACK_MODELS = [
     ])).split(",")
     if m.strip()
 ]
+# Other providers, tried after every Gemini model (text only: pictures, voice and video stay with Gemini). Each is used
+# only when its key is set. Both speak OpenAI's chat format, and both have a free tier.
+OTHER_PROVIDERS = {
+    "groq": {"name": "Groq", "key": os.getenv("GROQ_API_KEY", ""), "url": "https://api.groq.com/openai/v1",
+             "models": os.getenv("GROQ_MODELS", "openai/gpt-oss-120b,llama-3.3-70b-versatile")},
+    "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
+                "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest")},
+}
+MODEL_PROVIDER = {m.strip(): p for p, conf in OTHER_PROVIDERS.items() if conf["key"]
+                  for m in conf["models"].split(",") if m.strip()}  # model -> provider, for the non-Gemini ones
+ALL_MODELS = list(dict.fromkeys([GEMINI_MODEL, *FALLBACK_MODELS, *MODEL_PROVIDER]))
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "2"))  # only for temporary overload (5xx), not used-up quota
 # Optional allowlists (comma-separated). If both are empty, anyone can use the bot.
 # ALLOWED_CHAT_IDS: group IDs whose members may use it (in that group); get one with /chatid.
@@ -620,6 +631,70 @@ async def generate_with_search(model, contents, config):
     return text
 
 
+def model_label(model):
+    provider = MODEL_PROVIDER.get(model)
+    if provider:
+        return f"{OTHER_PROVIDERS[provider]['name']} · {model.split('/')[-1].removeprefix(provider + '-')}"
+    return f"Gemini · {model.removeprefix('gemini-')}"
+
+
+async def ask_other_provider(model, history, instructions, search):
+    """Groq or Mistral, in OpenAI's chat format, with the same web search Gemini gets. Errors come back as Gemini-style
+    APIErrors (429 used up, 404 missing, 5xx busy) so the model chain treats every provider alike."""
+    conf = OTHER_PROVIDERS[MODEL_PROVIDER[model]]
+    messages = [{"role": "system", "content": instructions}] + [
+        {"role": "assistant" if m["role"] == "model" else "user", "content": m["text"]} for m in history]
+    tools = [{"type": "function", "function": {"name": "web_search", "description": SEARCH_TOOL.function_declarations[0].description,
+                                               "parameters": SEARCH_TOOL.function_declarations[0].parameters.model_dump(exclude_none=True, mode="json")}}]
+    sources = {}
+    for round_ in range(MAX_SEARCH_ROUNDS + 1):
+        body = {"model": model, "messages": messages, "max_tokens": MAX_OUTPUT_TOKENS}
+        if search and round_ < MAX_SEARCH_ROUNDS:
+            body["tools"] = tools
+        r = await http.post(f"{conf['url']}/chat/completions", json=body, timeout=GEMINI_TIMEOUT * 2,
+                            headers={"Authorization": f"Bearer {conf['key']}"})
+        if r.status_code >= 400:
+            code = r.status_code if r.status_code in (404, 429) or r.status_code >= 500 else 503  # anything odd: next model
+            raise errors.APIError(code, {"error": {"code": code, "message": f"{conf['name']} {r.status_code}: {r.text[:300]}",
+                                                   "status": "UNAVAILABLE"}})
+        message = r.json()["choices"][0]["message"]
+        calls = message.get("tool_calls") or []
+        if not calls:
+            break
+        messages.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": calls})
+        for call in calls:
+            try:
+                query = str(json.loads(call["function"].get("arguments") or "{}").get("query", ""))[:300]
+                results = await web_search(query)
+            except Exception as e:
+                log.warning("Web search for %s failed: %s", model, e)
+                query, results = "", []
+            log.info("%s searched the web for %r (%d results)", model, query, len(results))
+            for res in results[:MAX_SOURCES + 2]:
+                sources.setdefault(res["url"], res["title"])
+            messages.append({"role": "tool", "tool_call_id": call["id"], "name": "web_search", "content": json.dumps(
+                [{"title": res["title"], "url": res["url"], "content": res["content"][:1500]} for res in results]
+                or "No results found.")})
+    text = message.get("content") or ""
+    sites = {}
+    for url in sources:
+        sites.setdefault(urlparse(url).netloc.removeprefix("www."), url)
+    if text and sites:
+        text += "\n\n🔎 " + " · ".join(f"[{site}]({url})" for site, url in list(sites.items())[:MAX_SOURCES])
+    return text
+
+
+async def chosen_model(chat_id):
+    """The model picked for this chat with /modelswitch, or None for automatic."""
+    if chat_id is None:
+        return None
+    try:
+        model = (await load_store("model_choice", {})).get(str(chat_id))
+    except Exception:
+        return None
+    return model if model in ALL_MODELS else None
+
+
 async def ask_gemini(history, chat_id=None, search=False):
     """Send the conversation to Gemini. Models whose free allowance is used up are skipped instantly until
     it resets; temporarily overloaded models get one quick retry; then the next model in the chain is tried.
@@ -629,14 +704,22 @@ async def ask_gemini(history, chat_id=None, search=False):
     plain = types.GenerateContentConfig(system_instruction=instructions, max_output_tokens=MAX_OUTPUT_TOKENS)
     searching = types.GenerateContentConfig(system_instruction=instructions, tools=[SEARCH_TOOL], max_output_tokens=MAX_OUTPUT_TOKENS,
                                             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
-    chain = [GEMINI_MODEL, *FALLBACK_MODELS]
+    chain = list(ALL_MODELS)
+    picked = await chosen_model(chat_id)
+    if picked:  # /modelswitch: that model first, the usual order after it if it's used up
+        chain.remove(picked)
+        chain.insert(0, picked)
+    if any(m.get("media") for m in history):  # pictures, voice and video: Gemini only
+        chain = [m for m in chain if m not in MODEL_PROVIDER]
     available = [m for m in chain if model_blocked_until.get(m, 0) <= time.time()]
     last_error = None
     limit = GEMINI_TIMEOUT * (2 if any(m.get("media") for m in history) else 1)
     for model in available:
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                if search:
+                if model in MODEL_PROVIDER:
+                    request = ask_other_provider(model, history, instructions, search)
+                elif search:
                     request = generate_with_search(model, contents, searching)
                 else:
                     request = client.aio.models.generate_content(model=model, contents=contents, config=plain)
@@ -712,10 +795,68 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ppcheck [name] – 8===D (random member if no name)\n"
         "/imitate [text] – repeat text, or copy everyone (reply: one person) · /stopimitate\n"
         "kitty · foodporn · carporn – instant pictures\n"
+        "/modelswitch – choose which AI model answers here\n"
         "/usage – see how much of your daily allowance you've used\n"
         "/reset – forget the conversation\n"
         f"Model: {GEMINI_MODEL}"
     )
+
+
+async def model_menu(chat_id):
+    """The /modelswitch message: which model this chat uses, and a button for each one."""
+    picked = await chosen_model(chat_id)
+    now = time.time()
+
+    def button(label, data, on):
+        return [InlineKeyboardButton(("✅ " if on else "") + label, callback_data=data)]
+    rows = [button("Automatic (best available)", "model|auto", picked is None)]
+    for i, model in enumerate(ALL_MODELS):
+        resting = " ⏳" if model_blocked_until.get(model, 0) > now else ""
+        rows.append(button(model_label(model) + resting, f"model|{i}", model == picked))
+    text = ("🧠 <b>Model for this chat</b>: " + html.escape(model_label(picked) if picked else "automatic") +
+            "\n\nTap one to use it. If it's used up or busy, I fall back to the others in order, so answers keep coming. "
+            "⏳ = resting right now (used up or busy)." +
+            ("" if MODEL_PROVIDER else "\nGroq and Mistral appear here once their API keys are set.") +
+            ("\nPictures, voice notes and videos always go to Gemini." if MODEL_PROVIDER else ""))
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def modelswitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/modelswitch: pick which AI model answers in this chat."""
+    if not await ready(update, context):
+        return
+    text, buttons = await model_menu(update.effective_chat.id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=buttons, do_quote=is_group(update))
+
+
+async def model_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Sorry, this bot is private.")
+        return
+    choice, chat_id = query.data.split("|", 1)[1], query.message.chat.id
+    model = None if choice == "auto" else ALL_MODELS[int(choice)] if choice.isdigit() and int(choice) < len(ALL_MODELS) else False
+    if model is False:
+        await query.answer("That option isn't there any more; send /modelswitch again.")
+        return
+    async with store_lock("model_choice"):
+        choices = await load_store("model_choice", {})
+        if model:
+            choices[str(chat_id)] = model
+        else:
+            choices.pop(str(chat_id), None)
+        await save_store("model_choice")
+    log.info("%s switched chat %s to %s", query.from_user.first_name, chat_id, model or "automatic")
+    await query.answer(f"Now using {model_label(model) if model else 'automatic'}")
+    text, buttons = await model_menu(chat_id)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=buttons)
+    except Exception:
+        pass  # unchanged (tapped the one already picked)
+    if update.effective_chat.type != "private":
+        await context.bot.send_message(chat_id, f"🧠 {html.escape(query.from_user.first_name)} switched me to "
+                                       f"<b>{html.escape(model_label(model) if model else 'automatic')}</b>.",
+                                       parse_mode=ParseMode.HTML)
 
 
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5197,6 +5338,7 @@ async def register_commands(app):
     commands = [
         ("help", "What I can do"),
         ("search", "Answer from the web, with sources"),
+        ("modelswitch", "Choose which AI model answers (Gemini, Groq, Mistral)"),
         ("imagine", "Generate a picture"),
         ("fetch", "Fetch a picture or GIF from the web (add 'gif')"),
         ("serious", "Serious mode on: critical, logical answers"),
@@ -5438,6 +5580,8 @@ def main():
     app.add_handler(CommandHandler("puzzle", puzzle_cmd))
     app.add_handler(CommandHandler("trivia", trivia))
     app.add_handler(CallbackQueryHandler(trivia_button, pattern=r"^trivia\|"))
+    app.add_handler(CallbackQueryHandler(model_button, pattern=r"^model\|"))
+    app.add_handler(CommandHandler("modelswitch", modelswitch))
     app.add_handler(CommandHandler("birthday", birthday))
     app.add_handler(CommandHandler("birthdays", birthdays))
     app.add_handler(CommandHandler("paid", paid))
