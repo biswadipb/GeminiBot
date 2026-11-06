@@ -4088,11 +4088,25 @@ PUZZLE_OPEN_HOURS = 24  # an unsolved daily puzzle gets its answer posted after 
 PUZZLE_OPEN_MINUTES = 30  # ...and one asked for just for fun, after this
 
 
+class PuzzleSourceError(Exception):
+    """Lichess didn't hand over a puzzle (down, slow, or rate-limiting us)."""
+
+
 async def fetch_chess_puzzle():
     # a random one, also for the daily: Lichess's own puzzle of the day is the same worldwide, so its answer is easy to look up
-    r = await http.get("https://lichess.org/api/puzzle/next", timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    for wait in (2, 5, None):  # Lichess sometimes refuses or times out for a moment; try a couple more times
+        try:
+            r = await http.get("https://lichess.org/api/puzzle/next", timeout=20,
+                               headers={"User-Agent": "DaLadenBot (Telegram group bot)", "Accept": "application/json"})
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            log.warning("Lichess puzzle request failed (%s): %s", status or type(e).__name__, e)
+            if wait is None:
+                raise PuzzleSourceError(f"Lichess: {status or e}") from e
+            await asyncio.sleep(wait * (6 if status == 429 else 1))  # 429: Lichess asks for a pause before asking again
     board = chess.pgn.read_game(io.StringIO(data["game"]["pgn"])).end().board()
     p = data["puzzle"]
     return {"game": "chess", "id": p["id"], "rating": p.get("rating"), "themes": p.get("themes", []), "fen": board.fen(),
@@ -4242,9 +4256,10 @@ async def puzzle_word(update: Update, context: ContextTypes.DEFAULT_TYPE, game=N
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
         await post_puzzle(update.effective_chat.id, daily=False, game=game, reply_to=update.message.message_id)
-    except Exception:
+    except Exception as e:
         log.exception("Could not post a puzzle")
-        where = "Lichess didn't send me a puzzle" if game == "chess" else "I couldn't set up an othello puzzle"
+        where = ("Lichess didn't send me a puzzle" if game == "chess" and isinstance(e, PuzzleSourceError) else
+                 "I couldn't set up an othello puzzle" if game == "othello" else "Something went wrong posting the puzzle")
         await update.message.reply_text(f"{where} just now. Try again in a minute.", do_quote=True)
 
 
