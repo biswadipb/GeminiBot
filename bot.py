@@ -80,7 +80,7 @@ OTHER_PROVIDERS = {
     # MISTRAL_API_KEY is set, when it works like the others)
     "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
                 "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest"), "always_listed": True,
-                "missing": "Mistral isn't available: its free plan no longer gives out API keys, and this bot only uses free models."},
+                "missing": "Mistral isn't available."},
 }
 MODEL_PROVIDER = {m.strip(): p for p, conf in OTHER_PROVIDERS.items() if conf["key"]
                   for m in conf["models"].split(",") if m.strip()}  # model -> provider, for the non-Gemini ones
