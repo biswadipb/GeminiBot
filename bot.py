@@ -76,8 +76,6 @@ OTHER_PROVIDERS = {
     "openrouter": {"name": "OpenRouter", "key": os.getenv("OPENROUTER_API_KEY", ""), "url": "https://openrouter.ai/api/v1",
                    "models": os.getenv("OPENROUTER_MODELS", "nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-31b-it:free,"
                                                             "openrouter/free")},
-    "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
-                "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest")},
 }
 MODEL_PROVIDER = {m.strip(): p for p, conf in OTHER_PROVIDERS.items() if conf["key"]
                   for m in conf["models"].split(",") if m.strip()}  # model -> provider, for the non-Gemini ones
@@ -644,7 +642,7 @@ def model_label(model):
 
 
 async def ask_other_provider(model, history, instructions, search):
-    """Groq or Mistral, in OpenAI's chat format, with the same web search Gemini gets. Errors come back as Gemini-style
+    """Groq or OpenRouter, in OpenAI's chat format, with the same web search Gemini gets. Errors come back as Gemini-style
     APIErrors (429 used up, 404 missing, 5xx busy) so the model chain treats every provider alike."""
     conf = OTHER_PROVIDERS[MODEL_PROVIDER[model]]
     messages = [{"role": "system", "content": instructions}] + [
