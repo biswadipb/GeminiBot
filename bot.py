@@ -76,10 +76,17 @@ OTHER_PROVIDERS = {
     "openrouter": {"name": "OpenRouter", "key": os.getenv("OPENROUTER_API_KEY", ""), "url": "https://openrouter.ai/api/v1",
                    "models": os.getenv("OPENROUTER_MODELS", "nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-31b-it:free,"
                                                             "openrouter/free")},
+    # Mistral's free plan no longer hands out API keys: listed in /modelswitch, but picking it explains that (until a
+    # MISTRAL_API_KEY is set, when it works like the others)
+    "mistral": {"name": "Mistral", "key": os.getenv("MISTRAL_API_KEY", ""), "url": "https://api.mistral.ai/v1",
+                "models": os.getenv("MISTRAL_MODELS", "mistral-medium-latest,mistral-small-latest"), "always_listed": True,
+                "missing": "Mistral isn't available: its free plan no longer gives out API keys, and this bot only uses free models."},
 }
 MODEL_PROVIDER = {m.strip(): p for p, conf in OTHER_PROVIDERS.items() if conf["key"]
                   for m in conf["models"].split(",") if m.strip()}  # model -> provider, for the non-Gemini ones
 ALL_MODELS = list(dict.fromkeys([GEMINI_MODEL, *FALLBACK_MODELS, *MODEL_PROVIDER]))
+LOCKED_MODELS = [(m.strip(), p) for p, conf in OTHER_PROVIDERS.items() if conf.get("always_listed") and not conf["key"]
+                 for m in conf["models"].split(",") if m.strip()]  # shown in /modelswitch, but can't be picked
 RETRIES_PER_MODEL = int(os.getenv("GEMINI_RETRIES", "2"))  # only for temporary overload (5xx), not used-up quota
 # Optional allowlists (comma-separated). If both are empty, anyone can use the bot.
 # ALLOWED_CHAT_IDS: group IDs whose members may use it (in that group); get one with /chatid.
@@ -642,7 +649,7 @@ def model_label(model):
 
 
 async def ask_other_provider(model, history, instructions, search):
-    """Groq or OpenRouter, in OpenAI's chat format, with the same web search Gemini gets. Errors come back as Gemini-style
+    """Groq, OpenRouter or Mistral, in OpenAI's chat format, with the same web search Gemini gets. Errors come back as Gemini-style
     APIErrors (429 used up, 404 missing, 5xx busy) so the model chain treats every provider alike."""
     conf = OTHER_PROVIDERS[MODEL_PROVIDER[model]]
     messages = [{"role": "system", "content": instructions}] + [
@@ -817,9 +824,11 @@ async def model_menu(chat_id):
     for i, model in enumerate(ALL_MODELS):
         resting = " ⏳" if model_blocked_until.get(model, 0) > now else ""
         rows.append(button(model_label(model) + resting, f"model|{i}", model == picked))
+    for i, (model, provider) in enumerate(LOCKED_MODELS):
+        rows.append(button(f"{OTHER_PROVIDERS[provider]['name']} · {model.removeprefix(provider + '-')} 🔒", f"model|x{i}", False))
     text = ("🧠 <b>Model for this chat</b>: " + html.escape(model_label(picked) if picked else "automatic") +
             "\n\nTap one to use it. If it's used up or busy, I fall back to the others in order, so answers keep coming. "
-            "⏳ = resting right now (used up or busy)." +
+            "⏳ = resting right now (used up or busy)." + (" 🔒 = not available." if LOCKED_MODELS else "") +
             ("" if MODEL_PROVIDER else "\nGroq and OpenRouter models appear here once their API keys are set.") +
             ("\nPictures, voice notes and videos always go to Gemini." if MODEL_PROVIDER else ""))
     return text, InlineKeyboardMarkup(rows)
@@ -839,6 +848,15 @@ async def model_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Sorry, this bot is private.")
         return
     choice, chat_id = query.data.split("|", 1)[1], query.message.chat.id
+    if choice.startswith("x"):  # a provider that can't be used (Mistral)
+        provider = LOCKED_MODELS[int(choice[1:])][1] if choice[1:].isdigit() and int(choice[1:]) < len(LOCKED_MODELS) else None
+        why = OTHER_PROVIDERS[provider]["missing"] if provider else "That option isn't there any more."
+        picked = await chosen_model(chat_id)
+        await query.answer("Not available", show_alert=False)
+        await context.bot.send_message(chat_id, f"⚠️ {html.escape(why, quote=False)} Still using <b>"
+                                       f"{html.escape(model_label(picked) if picked else 'automatic')}</b>.",
+                                       parse_mode=ParseMode.HTML)
+        return
     model = None if choice == "auto" else ALL_MODELS[int(choice)] if choice.isdigit() and int(choice) < len(ALL_MODELS) else False
     if model is False:
         await query.answer("That option isn't there any more; send /modelswitch again.")
