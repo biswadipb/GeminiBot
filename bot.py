@@ -4092,25 +4092,65 @@ class PuzzleSourceError(Exception):
     """Lichess didn't hand over a puzzle (down, slow, or rate-limiting us)."""
 
 
-async def fetch_chess_puzzle():
-    # a random one, also for the daily: Lichess's own puzzle of the day is the same worldwide, so its answer is easy to look up
-    for wait in (2, 5, None):  # Lichess sometimes refuses or times out for a moment; try a couple more times
-        try:
-            r = await http.get("https://lichess.org/api/puzzle/next", timeout=20,
-                               headers={"User-Agent": "DaLadenBot (Telegram group bot)", "Accept": "application/json"})
-            r.raise_for_status()
-            data = r.json()
-            break
-        except Exception as e:
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            log.warning("Lichess puzzle request failed (%s): %s", status or type(e).__name__, e)
-            if wait is None:
-                raise PuzzleSourceError(f"Lichess: {status or e}") from e
-            await asyncio.sleep(wait * (6 if status == 429 else 1))  # 429: Lichess asks for a pause before asking again
+# Lichess asks for one request at a time and a full minute's pause after a 429, so puzzles aren't fetched when someone
+# asks: a small stock is kept topped up in the background, one request every couple of minutes, and handed out at once.
+PUZZLE_STOCK = 15
+lichess_paused_until = 0.0
+
+
+async def lichess_puzzle():
+    """One random puzzle straight from Lichess (one try; a 429 pauses all requests for a while)."""
+    global lichess_paused_until
+    if time.time() < lichess_paused_until:
+        raise PuzzleSourceError("Lichess asked us to wait")
+    try:
+        r = await http.get("https://lichess.org/api/puzzle/next", timeout=20,
+                           headers={"User-Agent": "DaLadenBot (Telegram group bot)", "Accept": "application/json"})
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 429:
+            lichess_paused_until = time.time() + 5 * 60  # they ask for at least a minute; give them more
+        log.warning("Lichess puzzle request failed (%s): %s", status or type(e).__name__, e)
+        raise PuzzleSourceError(f"Lichess: {status or e}") from e
     board = chess.pgn.read_game(io.StringIO(data["game"]["pgn"])).end().board()
     p = data["puzzle"]
     return {"game": "chess", "id": p["id"], "rating": p.get("rating"), "themes": p.get("themes", []), "fen": board.fen(),
             "last": board.peek().uci() if board.move_stack else None, "solution": p["solution"]}
+
+
+async def fetch_chess_puzzle():
+    """A random puzzle (also for the daily: Lichess's own puzzle of the day is the same worldwide, so its answer is easy
+    to look up). From the stock if there is one, else from Lichess, with one more try after a short wait."""
+    async with store_lock("chess_puzzle_stock"):
+        stock = await load_store("chess_puzzle_stock", [])
+        if stock:
+            p = stock.pop(0)
+            await save_store("chess_puzzle_stock")
+            return p
+    try:
+        return await lichess_puzzle()
+    except PuzzleSourceError:
+        if time.time() < lichess_paused_until:
+            raise
+        await asyncio.sleep(3)
+        return await lichess_puzzle()
+
+
+async def refill_puzzle_stock():
+    """Called every couple of minutes: add one puzzle to the stock if it's running low."""
+    stock = await load_store("chess_puzzle_stock", [])
+    if len(stock) >= PUZZLE_STOCK or time.time() < lichess_paused_until:
+        return
+    try:
+        p = await lichess_puzzle()
+    except PuzzleSourceError:
+        return
+    async with store_lock("chess_puzzle_stock"):
+        if p["id"] not in {q["id"] for q in stock}:
+            stock.append(p)
+            await save_store("chess_puzzle_stock")
 
 
 async def make_othello_puzzle():
@@ -5121,7 +5161,7 @@ async def send_cat(update, context):
 
 
 async def watch_schedule():
-    """Reminders every 15 seconds; morning posts and stale puzzles once a minute."""
+    """Reminders every 15 seconds; morning posts and stale puzzles once a minute; a puzzle for the stock every 2."""
     tick = 0
     while True:
         await asyncio.sleep(15)
@@ -5133,6 +5173,8 @@ async def watch_schedule():
             if tick % 4 == 0:
                 await close_old_puzzles()
                 await run_morning_jobs()
+            if tick % 8 == 0:
+                await refill_puzzle_stock()
         except Exception:
             log.exception("Scheduled job failed")
 
